@@ -11,6 +11,7 @@ from opensquilla.session.keys import canonicalize_session_key, normalize_agent_i
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
+    SessionContextState,
     SessionNode,
     SessionSummary,
     TranscriptEntry,
@@ -24,7 +25,10 @@ class StaleEpochError(Exception):
 # Bumped whenever the schema is widened or narrowed via migration.
 # Version 2 added the epoch column. Version 3 added transcript reasoning replay.
 # Version 4 added transcript turn usage metadata.
-SCHEMA_VERSION = 4
+# Version 5 added structured compaction summary metadata.
+# Version 6 added portable/provider context state records.
+# Version 7 added archived transcript rows for canonical recovery after compaction.
+SCHEMA_VERSION = 7
 
 # SQLite CREATE statements derived from SQLModel metadata
 _CREATE_SESSIONS = """
@@ -116,6 +120,43 @@ _CREATE_IDX_TRANSCRIPT_KEY = (
     "CREATE INDEX IF NOT EXISTS idx_transcript_session_key ON transcript_entries(session_key)"
 )
 
+_CREATE_COMPACTED_TRANSCRIPT = """
+CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    compaction_id TEXT,
+    compaction_index INTEGER,
+    original_entry_id INTEGER,
+    message_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_calls TEXT,
+    tool_call_id TEXT,
+    reasoning_content TEXT,
+    turn_usage TEXT,
+    created_at INTEGER NOT NULL,
+    token_count INTEGER,
+    provenance_kind TEXT,
+    provenance_origin_session_id TEXT,
+    provenance_source_session_key TEXT,
+    provenance_source_channel TEXT,
+    provenance_source_tool TEXT,
+    archived_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+_CREATE_IDX_COMPACTED_TRANSCRIPT_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_id
+ON compacted_transcript_entries(session_id)
+"""
+
+_CREATE_IDX_COMPACTED_TRANSCRIPT_KEY = """
+CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_key
+ON compacted_transcript_entries(session_key)
+"""
+
 # FTS5 full-text search on transcript content
 _CREATE_TRANSCRIPT_FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts
@@ -149,7 +190,21 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     session_id TEXT NOT NULL,
     session_key TEXT NOT NULL,
     compaction_index INTEGER NOT NULL DEFAULT 0,
+    compaction_id TEXT,
+    trigger_reason TEXT,
     summary_text TEXT NOT NULL,
+    summary_payload TEXT,
+    summary_format TEXT NOT NULL DEFAULT 'text',
+    summary_source TEXT NOT NULL DEFAULT 'unknown',
+    coverage_status TEXT NOT NULL DEFAULT 'unknown',
+    missing_obligations TEXT,
+    critical_carry_forward TEXT,
+    tokens_before INTEGER,
+    tokens_after INTEGER,
+    removed_count INTEGER NOT NULL DEFAULT 0,
+    kept_count INTEGER NOT NULL DEFAULT 0,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    flush_receipt_status TEXT NOT NULL DEFAULT 'unknown',
     covered_through_id INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -159,6 +214,36 @@ CREATE TABLE IF NOT EXISTS session_summaries (
 _CREATE_IDX_SUMMARIES = (
     "CREATE INDEX IF NOT EXISTS idx_summaries_session_id ON session_summaries(session_id)"
 )
+
+_CREATE_CONTEXT_STATES = """
+CREATE TABLE IF NOT EXISTS session_context_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'portable',
+    model TEXT,
+    state_kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    covered_through_id INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    portable INTEGER NOT NULL DEFAULT 0,
+    cacheable INTEGER NOT NULL DEFAULT 0,
+    valid INTEGER NOT NULL DEFAULT 1,
+    invalid_reason TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+_CREATE_IDX_CONTEXT_STATES_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_context_states_session_id
+ON session_context_states(session_id)
+"""
+
+_CREATE_IDX_CONTEXT_STATES_KEY_VALID = """
+CREATE INDEX IF NOT EXISTS idx_context_states_key_valid
+ON session_context_states(session_key, valid, state_kind, provider)
+"""
 
 _CREATE_AGENT_TASKS = """
 CREATE TABLE IF NOT EXISTS agent_tasks (
@@ -218,8 +303,25 @@ def _serialize(value: Any) -> Any:
 
 def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     """Deserialize JSON text fields back to Python objects."""
-    json_fields = {"delivery_context", "tool_calls", "turn_usage", "origin", "details"}
-    bool_fields = {"total_tokens_fresh", "forked_from_parent", "fast_mode"}
+    json_fields = {
+        "delivery_context",
+        "tool_calls",
+        "turn_usage",
+        "origin",
+        "details",
+        "summary_payload",
+        "missing_obligations",
+        "critical_carry_forward",
+        "payload",
+    }
+    bool_fields = {
+        "total_tokens_fresh",
+        "forked_from_parent",
+        "fast_mode",
+        "portable",
+        "cacheable",
+        "valid",
+    }
     result = {}
     for k, v in row.items():
         if k in json_fields and isinstance(v, str):
@@ -259,8 +361,14 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
+        await self._conn.execute(_CREATE_COMPACTED_TRANSCRIPT)
+        await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_SESSION)
+        await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_KEY)
         await self._conn.execute(_CREATE_SUMMARIES)
         await self._conn.execute(_CREATE_IDX_SUMMARIES)
+        await self._conn.execute(_CREATE_CONTEXT_STATES)
+        await self._conn.execute(_CREATE_IDX_CONTEXT_STATES_SESSION)
+        await self._conn.execute(_CREATE_IDX_CONTEXT_STATES_KEY_VALID)
         await self._conn.execute(_CREATE_AGENT_TASKS)
         await self._conn.execute(_CREATE_IDX_AGENT_TASKS_SESSION_STATUS)
         await self._conn.execute(_CREATE_IDX_AGENT_TASKS_STATUS_UPDATED)
@@ -276,6 +384,7 @@ class SessionStorage:
         await self._migrate_epoch_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
+        await self._migrate_summary_metadata_columns()
         await self.mark_abandoned_agent_tasks()
 
     async def _migrate_epoch_column(self) -> None:
@@ -325,6 +434,58 @@ class SessionStorage:
             await self._conn.execute(
                 "ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT"
             )
+            await self._conn.commit()
+
+    async def _migrate_summary_metadata_columns(self) -> None:
+        """Idempotently add structured compaction summary metadata columns."""
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(session_summaries)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        additions = {
+            "compaction_id": "ALTER TABLE session_summaries ADD COLUMN compaction_id TEXT",
+            "trigger_reason": "ALTER TABLE session_summaries ADD COLUMN trigger_reason TEXT",
+            "summary_payload": "ALTER TABLE session_summaries ADD COLUMN summary_payload TEXT",
+            "summary_format": (
+                "ALTER TABLE session_summaries ADD COLUMN "
+                "summary_format TEXT NOT NULL DEFAULT 'text'"
+            ),
+            "summary_source": (
+                "ALTER TABLE session_summaries ADD COLUMN "
+                "summary_source TEXT NOT NULL DEFAULT 'unknown'"
+            ),
+            "coverage_status": (
+                "ALTER TABLE session_summaries ADD COLUMN "
+                "coverage_status TEXT NOT NULL DEFAULT 'unknown'"
+            ),
+            "missing_obligations": (
+                "ALTER TABLE session_summaries ADD COLUMN missing_obligations TEXT"
+            ),
+            "critical_carry_forward": (
+                "ALTER TABLE session_summaries ADD COLUMN critical_carry_forward TEXT"
+            ),
+            "tokens_before": "ALTER TABLE session_summaries ADD COLUMN tokens_before INTEGER",
+            "tokens_after": "ALTER TABLE session_summaries ADD COLUMN tokens_after INTEGER",
+            "removed_count": (
+                "ALTER TABLE session_summaries ADD COLUMN "
+                "removed_count INTEGER NOT NULL DEFAULT 0"
+            ),
+            "kept_count": (
+                "ALTER TABLE session_summaries ADD COLUMN kept_count INTEGER NOT NULL DEFAULT 0"
+            ),
+            "chunk_count": (
+                "ALTER TABLE session_summaries ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"
+            ),
+            "flush_receipt_status": (
+                "ALTER TABLE session_summaries ADD COLUMN "
+                "flush_receipt_status TEXT NOT NULL DEFAULT 'unknown'"
+            ),
+        }
+        changed = False
+        for column, sql in additions.items():
+            if column not in columns:
+                await self._conn.execute(sql)
+                changed = True
+        if changed:
             await self._conn.commit()
 
     @property
@@ -405,7 +566,15 @@ class SessionStorage:
             (session.session_id,),
         )
         await self.conn.execute(
+            "DELETE FROM compacted_transcript_entries WHERE session_id = ?",
+            (session.session_id,),
+        )
+        await self.conn.execute(
             "DELETE FROM session_summaries WHERE session_id = ?",
+            (session.session_id,),
+        )
+        await self.conn.execute(
+            "DELETE FROM session_context_states WHERE session_id = ?",
             (session.session_id,),
         )
         await self.conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
@@ -642,6 +811,132 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
 
+    async def get_canonical_transcript(
+        self, session_id: str, limit: int | None = None, offset: int = 0
+    ) -> list[TranscriptEntry]:
+        """Return archived compacted rows plus the active transcript tail.
+
+        Provider replay intentionally keeps using get_transcript(). This API is
+        for recovery, diagnostics, and future provider-view construction where
+        the raw transcript needs to survive destructive compaction rewrites.
+        """
+        limit_val = limit if limit is not None else -1
+        sql = """
+            SELECT
+                original_entry_id AS id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM compacted_transcript_entries
+            WHERE session_id = ?
+            UNION ALL
+            SELECT
+                id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM transcript_entries
+            WHERE session_id = ?
+            ORDER BY created_at ASC, id ASC
+            LIMIT ? OFFSET ?
+        """
+        async with self.conn.execute(
+            sql, (session_id, session_id, limit_val, offset)
+        ) as cur:
+            rows = await cur.fetchall()
+        return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
+
+    async def copy_compacted_transcript_entries(
+        self,
+        *,
+        source_session_id: str,
+        target_session_id: str,
+        target_session_key: str,
+    ) -> None:
+        """Copy archived compacted transcript rows into a forked session."""
+        await self.conn.execute(
+            """
+            INSERT INTO compacted_transcript_entries (
+                session_id,
+                session_key,
+                compaction_id,
+                compaction_index,
+                original_entry_id,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                archived_at,
+                schema_version
+            )
+            SELECT
+                ?,
+                ?,
+                compaction_id,
+                compaction_index,
+                original_entry_id,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                archived_at,
+                schema_version
+            FROM compacted_transcript_entries
+            WHERE session_id = ?
+            ORDER BY created_at ASC, original_entry_id ASC, id ASC
+            """,
+            (target_session_id, target_session_key, source_session_id),
+        )
+        await self.conn.commit()
+
     async def count_transcript_entries(self, session_id: str) -> int:
         async with self.conn.execute(
             "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ?", (session_id,)
@@ -685,6 +980,10 @@ class SessionStorage:
     async def delete_transcript(self, session_id: str) -> None:
         await self.conn.execute(
             "DELETE FROM transcript_entries WHERE session_id = ?", (session_id,)
+        )
+        await self.conn.execute(
+            "DELETE FROM compacted_transcript_entries WHERE session_id = ?",
+            (session_id,),
         )
         await self.conn.commit()
 
@@ -742,12 +1041,47 @@ class SessionStorage:
         await self.conn.commit()
         return summary
 
+    async def _archive_transcript_entries(
+        self,
+        *,
+        node: SessionNode,
+        entries: list[TranscriptEntry],
+        compaction_id: str | None,
+        compaction_index: int | None,
+    ) -> None:
+        if not entries:
+            return
+        archived_at = _now_ms()
+        for entry in entries:
+            entry_data = entry.model_dump(exclude={"id"})
+            entry_data["session_id"] = node.session_id
+            entry_data["session_key"] = node.session_key
+            archive_data: dict[str, Any] = {
+                "session_id": entry_data.pop("session_id"),
+                "session_key": entry_data.pop("session_key"),
+                "compaction_id": compaction_id,
+                "compaction_index": compaction_index,
+                "original_entry_id": entry.id,
+                **entry_data,
+                "archived_at": archived_at,
+            }
+            cols = list(archive_data.keys())
+            placeholders = ", ".join("?" for _ in cols)
+            values = [_serialize(archive_data[c]) for c in cols]
+            await self.conn.execute(
+                "INSERT INTO compacted_transcript_entries "
+                f"({', '.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
+
     async def rewrite_compacted_session(
         self,
         *,
         node: SessionNode,
         summary: SessionSummary | None,
         entries: list[TranscriptEntry],
+        context_states: list[SessionContextState] | None = None,
+        archived_entries: list[TranscriptEntry] | None = None,
     ) -> None:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
@@ -755,11 +1089,6 @@ class SessionStorage:
 
         await self.conn.execute("BEGIN IMMEDIATE")
         try:
-            await self.conn.execute(
-                "DELETE FROM transcript_entries WHERE session_id = ?",
-                (node.session_id,),
-            )
-
             if summary is not None:
                 summary.session_id = node.session_id
                 summary.session_key = node.session_key
@@ -770,6 +1099,22 @@ class SessionStorage:
                 ) as cur:
                     row = await cur.fetchone()
                 summary.compaction_index = row[0] if row else 0
+
+            await self._archive_transcript_entries(
+                node=node,
+                entries=archived_entries or [],
+                compaction_id=summary.compaction_id if summary is not None else None,
+                compaction_index=summary.compaction_index
+                if summary is not None
+                else None,
+            )
+
+            await self.conn.execute(
+                "DELETE FROM transcript_entries WHERE session_id = ?",
+                (node.session_id,),
+            )
+
+            if summary is not None:
                 summary_data = summary.model_dump(exclude={"id"})
                 summary_cols = list(summary_data.keys())
                 summary_placeholders = ", ".join("?" for _ in summary_cols)
@@ -780,6 +1125,20 @@ class SessionStorage:
                     summary_values,
                 ) as cur:
                     summary.id = cur.lastrowid
+
+            for state in context_states or []:
+                state.session_id = node.session_id
+                state.session_key = node.session_key
+                state_data = state.model_dump(exclude={"id"})
+                state_cols = list(state_data.keys())
+                state_placeholders = ", ".join("?" for _ in state_cols)
+                state_values = [_serialize(state_data[c]) for c in state_cols]
+                async with self.conn.execute(
+                    "INSERT INTO session_context_states "
+                    f"({', '.join(state_cols)}) VALUES ({state_placeholders})",
+                    state_values,
+                ) as cur:
+                    state.id = cur.lastrowid
 
             for entry in entries:
                 entry.session_id = node.session_id
@@ -825,7 +1184,7 @@ class SessionStorage:
             row = await cur.fetchone()
         if row is None:
             return None
-        return SessionSummary(**dict(row))
+        return SessionSummary(**_deserialize_row(dict(row)))
 
     async def get_all_summaries(self, session_id: str) -> list[SessionSummary]:
         async with self.conn.execute(
@@ -833,7 +1192,82 @@ class SessionStorage:
             (session_id,),
         ) as cur:
             rows = await cur.fetchall()
-        return [SessionSummary(**dict(r)) for r in rows]
+        return [SessionSummary(**_deserialize_row(dict(r))) for r in rows]
+
+    # ── SessionContextState CRUD ─────────────────────────────────────────────
+
+    async def save_context_state(
+        self, state: SessionContextState
+    ) -> SessionContextState:
+        """Persist portable or provider-native context state for later replay."""
+        state.session_key = canonicalize_session_key(state.session_key)
+        data = state.model_dump(exclude={"id"})
+        cols = list(data.keys())
+        placeholders = ", ".join("?" for _ in cols)
+        values = [_serialize(data[c]) for c in cols]
+        async with self.conn.execute(
+            "INSERT INTO session_context_states "
+            f"({', '.join(cols)}) VALUES ({placeholders})",
+            values,
+        ) as cur:
+            state.id = cur.lastrowid
+        await self.conn.commit()
+        return state
+
+    async def get_context_states(
+        self,
+        session_key: str,
+        *,
+        provider: str | None = None,
+        state_kind: str | None = None,
+        valid_only: bool = True,
+    ) -> list[SessionContextState]:
+        session_key = canonicalize_session_key(session_key)
+        clauses = ["session_key = ?"]
+        params: list[Any] = [session_key]
+        if provider is not None:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if state_kind is not None:
+            clauses.append("state_kind = ?")
+            params.append(state_kind)
+        if valid_only:
+            clauses.append("valid = 1")
+        where = " AND ".join(clauses)
+        async with self.conn.execute(
+            "SELECT * FROM session_context_states "
+            f"WHERE {where} ORDER BY created_at ASC, id ASC",
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [SessionContextState(**_deserialize_row(dict(row))) for row in rows]
+
+    async def invalidate_context_states(
+        self,
+        session_key: str,
+        *,
+        provider: str | None = None,
+        state_kind: str | None = None,
+        reason: str = "invalidated",
+    ) -> int:
+        session_key = canonicalize_session_key(session_key)
+        clauses = ["session_key = ?", "valid = 1"]
+        params: list[Any] = [session_key]
+        if provider is not None:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if state_kind is not None:
+            clauses.append("state_kind = ?")
+            params.append(state_kind)
+        async with self.conn.execute(
+            "UPDATE session_context_states "
+            "SET valid = 0, invalid_reason = ? "
+            f"WHERE {' AND '.join(clauses)}",
+            [reason, *params],
+        ) as cur:
+            changed = cur.rowcount or 0
+        await self.conn.commit()
+        return int(changed)
 
     # ── FTS5 Search ──────────────────────────────────────────────────────
 

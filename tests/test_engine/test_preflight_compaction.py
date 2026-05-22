@@ -322,12 +322,16 @@ async def test_preflight_completed_event_reports_compaction_metadata(
     assert sm.compact_with_result_calls == [("user:session", context_window, None)]
     assert [(key, payload["status"]) for key, payload in events] == [
         ("user:session", "started"),
+        ("user:session", "observed"),
+        ("user:session", "observed"),
         ("user:session", "completed"),
     ]
     compaction_ids = {payload.get("compaction_id") for _, payload in events}
     assert len(compaction_ids) == 1
     assert None not in compaction_ids
     assert events[0][1]["event"] == "compaction.triggered"
+    assert events[1][1]["event"] == "compaction.chunk_summarized"
+    assert events[2][1]["event"] == "compaction.summary_verified"
     completed = events[-1][1]
     assert completed["event"] == "compaction.persisted"
     assert completed["event_chain"] == [
@@ -878,11 +882,34 @@ async def test_preflight_integration_with_real_session_manager(session_mgr) -> N
 
     # Patch compact_with_result() to verify the metadata-preserving path is used.
     original_compact_with_result = mgr.compact_with_result
-    compact_calls: list[tuple] = []
+    compact_calls: list[dict[str, object]] = []
 
-    async def _spy_compact_with_result(session_key, context_window_tokens, config=None):
-        compact_calls.append((session_key, context_window_tokens))
-        return await original_compact_with_result(session_key, context_window_tokens, config)
+    async def _spy_compact_with_result(
+        session_key,
+        context_window_tokens,
+        config=None,
+        *,
+        compaction_id=None,
+        trigger_reason=None,
+        flush_receipt_status=None,
+    ):
+        compact_calls.append(
+            {
+                "session_key": session_key,
+                "context_window_tokens": context_window_tokens,
+                "compaction_id": compaction_id,
+                "trigger_reason": trigger_reason,
+                "flush_receipt_status": flush_receipt_status,
+            }
+        )
+        return await original_compact_with_result(
+            session_key,
+            context_window_tokens,
+            config,
+            compaction_id=compaction_id,
+            trigger_reason=trigger_reason,
+            flush_receipt_status=flush_receipt_status,
+        )
 
     mgr.compact_with_result = _spy_compact_with_result  # type: ignore[method-assign]
 
@@ -892,7 +919,11 @@ async def test_preflight_integration_with_real_session_manager(session_mgr) -> N
 
     # compact_with_result() was invoked with the correct args.
     assert len(compact_calls) == 1
-    assert compact_calls[0] == (key, 100)
+    assert compact_calls[0]["session_key"] == key
+    assert compact_calls[0]["context_window_tokens"] == 100
+    assert compact_calls[0]["compaction_id"]
+    assert compact_calls[0]["trigger_reason"] == "preflight"
+    assert compact_calls[0]["flush_receipt_status"] == "not_required"
 
 
 @pytest.mark.asyncio

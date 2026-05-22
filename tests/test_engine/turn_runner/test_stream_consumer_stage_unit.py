@@ -93,12 +93,14 @@ class _RecordingCompactionPersist:
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        compaction_id: str | None = None,
     ) -> None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "summary": summary,
                 "kept_entries": kept_entries,
+                "compaction_id": compaction_id,
             }
         )
         if self.raises is not None:
@@ -545,12 +547,13 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     )
     inp = _make_input()
     await handler.handle(
-        CompactionEvent(summary="s", kept_entries=[1, 2]),
+        CompactionEvent(compaction_id="cmp_inline_1", summary="s", kept_entries=[1, 2]),
         inp,
     )
     assert len(persist.calls) == 1
     assert persist.calls[0]["summary"] == "s"
     assert persist.calls[0]["kept_entries"] == [1, 2]
+    assert persist.calls[0]["compaction_id"] == "cmp_inline_1"
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
 

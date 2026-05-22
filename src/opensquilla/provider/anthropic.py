@@ -42,6 +42,7 @@ def _uses_authorization_bearer(base_url: str) -> bool:
     normalized = base_url.lower()
     return "api.minimaxi.com" in normalized or "api.minimax.io" in normalized
 
+
 _KNOWN_MODELS: list[dict[str, Any]] = [
     {
         "model_id": "claude-opus-4-6",
@@ -182,6 +183,13 @@ def _build_message_payload(msg: Message, model: str | None = None) -> dict[str, 
             if block.signature:
                 thinking_block["signature"] = block.signature
             parts.append(thinking_block)
+        elif block.type == "compaction":
+            compaction_block: dict[str, Any] = {"type": "compaction"}
+            if block.content is not None:
+                compaction_block["content"] = block.content
+            if block.cache_control:
+                compaction_block["cache_control"] = block.cache_control
+            parts.append(compaction_block)
         elif block.type == "tool_result":
             is_error = (
                 derive_is_error(block.execution_status)
@@ -248,6 +256,21 @@ def _anthropic_input_token_counts(usage: dict[str, Any]) -> tuple[int, int, int]
     cache_creation_tokens = _cache_creation_input_tokens(usage)
     total_input_tokens = base_input_tokens + cache_read_tokens + cache_creation_tokens
     return total_input_tokens, cache_read_tokens, cache_creation_tokens
+
+
+def _anthropic_iteration_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
+    iterations = usage.get("iterations")
+    if not isinstance(iterations, list):
+        return _coerce_int(usage.get("input_tokens")), _coerce_int(usage.get("output_tokens"))
+
+    input_tokens = 0
+    output_tokens = 0
+    for iteration in iterations:
+        if not isinstance(iteration, dict):
+            continue
+        input_tokens += _coerce_int(iteration.get("input_tokens"))
+        output_tokens += _coerce_int(iteration.get("output_tokens"))
+    return input_tokens, output_tokens
 
 
 class AnthropicProvider:
@@ -476,7 +499,11 @@ class AnthropicProvider:
 
                         elif etype == "message_delta":
                             usage = event.get("usage", {})
-                            output_tokens = usage.get("output_tokens", 0)
+                            (
+                                iteration_input_tokens,
+                                iteration_output_tokens,
+                            ) = _anthropic_iteration_token_counts(usage)
+                            output_tokens = iteration_output_tokens
                             cached_tokens = max(
                                 cached_tokens,
                                 usage.get("cache_read_input_tokens", 0),
@@ -487,7 +514,12 @@ class AnthropicProvider:
                             )
                             if "input_tokens" in usage:
                                 base_input_tokens = _coerce_int(usage.get("input_tokens"))
-                            input_tokens = base_input_tokens + cached_tokens + cache_creation_tokens
+                            if isinstance(usage.get("iterations"), list):
+                                input_tokens = iteration_input_tokens
+                            else:
+                                input_tokens = (
+                                    base_input_tokens + cached_tokens + cache_creation_tokens
+                                )
                             stop_reason = event.get("delta", {}).get("stop_reason", "end_turn")
 
                         elif etype == "message_stop":

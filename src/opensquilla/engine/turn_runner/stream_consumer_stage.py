@@ -104,6 +104,7 @@ class CompactionPersistPort(Protocol):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        compaction_id: str | None = None,
     ) -> None: ...
 
 @runtime_checkable
@@ -722,10 +723,18 @@ class _CompactionHandler:
                     session_key=inp.session_key,
                     summary=event.summary,
                     kept_entries=event.kept_entries,
+                    compaction_id=event.compaction_id,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
                 from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
+                )
+
+                compaction_id = event.compaction_id or new_compaction_id()
 
                 notify_compaction(
                     inp.session_key,
@@ -736,6 +745,10 @@ class _CompactionHandler:
                     message=str(exc),
                     kept_count=len(event.kept_entries),
                     summary_len=len(event.summary or ""),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
                 )
                 await self._fire_after_compact(
                     state,

@@ -18,6 +18,12 @@ from opensquilla.gateway.context_overflow import (
 )
 from opensquilla.gateway.rpc_chat import _enforce_context_overflow
 from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction_state import (
+    StructuredCompactionSummary,
+    render_structured_summary,
+)
+from opensquilla.session.models import SessionContextState, SessionSummary
+from opensquilla.session.tokenizer import estimate_tokens
 
 
 @dataclass
@@ -84,6 +90,25 @@ class _LegacyCompactSessionManager(_FakeSessionManager):
 class _SummaryReadFailureSessionManager(_FakeSessionManager):
     async def get_summaries(self, session_key: str) -> list[Any]:
         raise RuntimeError(f"summary store unavailable for {session_key}")
+
+
+class _StructuredContextSessionManager(_FakeSessionManager):
+    def __init__(
+        self,
+        transcript: list[_FakeEntry],
+        *,
+        summaries: list[SessionSummary],
+        context_states: list[SessionContextState],
+    ) -> None:
+        super().__init__(transcript)
+        self._summaries = list(summaries)
+        self._context_states = list(context_states)
+
+    async def get_summaries(self, session_key: str) -> list[SessionSummary]:
+        return list(self._summaries)
+
+    async def get_context_states(self, session_key: str) -> list[SessionContextState]:
+        return list(self._context_states)
 
 
 class _FakeCompactionProvider:
@@ -340,6 +365,8 @@ async def test_auto_summarize_emits_started_and_completed_events(
     assert outcome.summarized is True
     assert [(key, payload["status"]) for key, payload in events] == [
         ("s-auto-events", "started"),
+        ("s-auto-events", "observed"),
+        ("s-auto-events", "observed"),
         ("s-auto-events", "completed"),
     ]
     assert all(payload["source"] == "automatic" for _, payload in events)
@@ -348,6 +375,8 @@ async def test_auto_summarize_emits_started_and_completed_events(
     assert len(compaction_ids) == 1
     assert None not in compaction_ids
     assert events[0][1]["event"] == "compaction.triggered"
+    assert events[1][1]["event"] == "compaction.chunk_summarized"
+    assert events[2][1]["event"] == "compaction.summary_verified"
     completed = events[-1][1]
     assert completed["event"] == "compaction.replayed"
     assert completed["event_chain"] == [
@@ -412,6 +441,53 @@ async def test_auto_summarize_refuses_when_compaction_still_exceeds_budget() -> 
     assert outcome.refusal is not None
     assert outcome.refusal["error"]["reason"] == "compaction_insufficient"
     assert len(sm.compact_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_payload_estimate_counts_rendered_structured_context_state() -> None:
+    structured = StructuredCompactionSummary(
+        user_goal="Finish the migration",
+        current_status="Current status has enough detail to exceed the plain summary.",
+        next_action="Run focused regression tests",
+        files_and_artifacts=[
+            {
+                "path": "src/opensquilla/session/context_view.py",
+                "status": "changed",
+                "why": "provider-visible compaction context is rendered here",
+            }
+        ],
+        critical_carry_forward=[
+            "Do not rely on summary_text when structured context state is valid."
+        ],
+    )
+    summary = SessionSummary(
+        session_id="sid",
+        session_key="s-structured",
+        summary_text="short summary",
+        covered_through_id=7,
+    )
+    state = SessionContextState(
+        session_id="sid",
+        session_key="s-structured",
+        provider="portable",
+        state_kind="structured_summary_v1",
+        payload=structured.model_dump(mode="json"),
+        covered_through_id=7,
+        portable=True,
+        valid=True,
+    )
+    sm = _StructuredContextSessionManager([], summaries=[summary], context_states=[state])
+
+    total = await context_overflow._estimate_session_payload_tokens(
+        "",
+        [],
+        session_manager=sm,
+        session_key="s-structured",
+    )
+
+    assert total == context_overflow._estimate_payload_tokens("", []) + estimate_tokens(
+        render_structured_summary(structured)
+    )
 
 
 @pytest.mark.asyncio

@@ -212,12 +212,16 @@ async def test_t3_completed_event_reports_compaction_metadata(
     assert result == "handled"
     assert [(key, payload["status"]) for key, payload in events] == [
         ("agent:main:webchat:default", "started"),
+        ("agent:main:webchat:default", "observed"),
+        ("agent:main:webchat:default", "observed"),
         ("agent:main:webchat:default", "completed"),
     ]
     compaction_ids = {payload.get("compaction_id") for _, payload in events}
     assert len(compaction_ids) == 1
     assert None not in compaction_ids
     assert events[0][1]["event"] == "compaction.triggered"
+    assert events[1][1]["event"] == "compaction.chunk_summarized"
+    assert events[2][1]["event"] == "compaction.summary_verified"
     completed = events[-1][1]
     assert completed["event"] == "compaction.persisted"
     assert completed["event_chain"] == [

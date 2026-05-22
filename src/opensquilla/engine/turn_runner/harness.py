@@ -12,6 +12,7 @@ the stage boundaries are ready to sequence.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any, cast
 
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
@@ -762,17 +763,36 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        compaction_id: str | None = None,
     ) -> None:
         from opensquilla.engine.cache_break_monitor import notify_compaction
+        from opensquilla.session.compaction_lifecycle import (
+            COMPACTION_PERSISTED_EVENT,
+            compaction_lifecycle_payload,
+            new_compaction_id,
+        )
 
         session_manager = self._runner._session_manager
         if session_manager is None:
             return
-        await session_manager.persist_compaction_result(
+        persist_method = session_manager.persist_compaction_result
+        params = inspect.signature(persist_method).parameters
+        persist_kwargs: dict[str, Any] = {}
+        if "compaction_id" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            persist_kwargs["compaction_id"] = compaction_id
+        if "trigger_reason" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            persist_kwargs["trigger_reason"] = "agent_inline_overflow"
+        await persist_method(
             session_key,
             summary,
             kept_entries,
+            **persist_kwargs,
         )
+        compaction_id = compaction_id or new_compaction_id()
         notify_compaction(
             session_key,
             source="automatic",
@@ -780,6 +800,10 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             status="completed",
             kept_count=len(kept_entries),
             summary_len=len(summary or ""),
+            **compaction_lifecycle_payload(
+                compaction_id,
+                COMPACTION_PERSISTED_EVENT,
+            ),
         )
 
 class _TurnRunnerMemorySnapshotRefreshAdapter(MemorySnapshotRefreshPort):

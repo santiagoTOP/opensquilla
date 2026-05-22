@@ -14,6 +14,10 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.openrouter_attribution import openrouter_app_headers
 from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.session.compaction_state import (
+    build_structured_summary_from_text,
+    extract_compaction_obligations,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -32,6 +36,7 @@ class CompactionConfig:
     api_key: str = ""
     base_url: str = "https://openrouter.ai/api/v1"
     timeout_seconds: float = 90.0
+    coverage_blocking: bool = False
 
 
 @dataclass
@@ -53,6 +58,11 @@ class CompactionResult:
     tokens_before: int = 0
     tokens_after: int = 0
     remaining_budget_tokens: int = 0
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
 
 
 def _string_value(value: Any) -> str:
@@ -663,6 +673,34 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     else:
         summary_source = "fallback"
 
+    obligations = extract_compaction_obligations(to_compact)
+    structured_summary, coverage = build_structured_summary_from_text(
+        merged,
+        obligations,
+        block_missing_critical=cfg.coverage_blocking,
+    )
+    if coverage.blocked:
+        log.warning(
+            "compaction.coverage_blocked",
+            missing_obligations=len(coverage.missing_obligations),
+            checked_obligations=coverage.checked_obligations,
+        )
+        return CompactionResult(
+            summary="",
+            kept_entries=entries,
+            removed_count=0,
+            chunks_processed=len(chunks),
+            summary_source=summary_source,
+            tokens_before=total_tokens,
+            tokens_after=total_tokens,
+            remaining_budget_tokens=max(window - total_tokens, 0),
+            summary_payload=structured_summary.model_dump(mode="json"),
+            summary_format="structured_v1",
+            coverage_status=coverage.status,
+            missing_obligations=coverage.missing_obligations,
+            critical_carry_forward=coverage.critical_carry_forward,
+        )
+
     log.info(
         "compaction.new.done",
         removed=len(to_compact),
@@ -682,6 +720,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         tokens_before=total_tokens,
         tokens_after=tokens_after,
         remaining_budget_tokens=max(window - tokens_after, 0),
+        summary_payload=structured_summary.model_dump(mode="json"),
+        summary_format="structured_v1",
+        coverage_status=coverage.status,
+        missing_obligations=coverage.missing_obligations,
+        critical_carry_forward=coverage.critical_carry_forward,
     )
 
 

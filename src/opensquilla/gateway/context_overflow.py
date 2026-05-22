@@ -36,8 +36,10 @@ from opensquilla.session.compaction import (
     estimate_entry_model_replay_tokens,
 )
 from opensquilla.session.compaction_lifecycle import (
+    COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
     COMPACTION_REPLAYED_EVENT,
+    COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
     CompactionLifecycleResult,
     compaction_lifecycle_payload,
@@ -48,6 +50,7 @@ from opensquilla.session.compaction_lifecycle import (
     pre_compaction_flush_enabled,
     pre_compaction_flush_requires_safe_receipt,
 )
+from opensquilla.session.context_view import build_compaction_context_records
 from opensquilla.session.keys import parse_agent_id
 from opensquilla.session.tokenizer import estimate_tokens
 
@@ -262,13 +265,37 @@ async def _estimate_session_payload_tokens(
     fallback_summary: str = "",
 ) -> int:
     total = _estimate_payload_tokens(message, transcript)
+    summaries: list[Any] = []
     get_summaries = getattr(session_manager, "get_summaries", None)
     if callable(get_summaries):
         summaries = await get_summaries(session_key)
-        if summaries:
-            for summary in summaries:
-                total += estimate_tokens(str(getattr(summary, "summary_text", "") or ""))
+
+    context_states: list[Any] = []
+    get_context_states = getattr(session_manager, "get_context_states", None)
+    if callable(get_context_states):
+        try:
+            context_states = await get_context_states(session_key)
+        except Exception as exc:  # pragma: no cover - optional estimate input
+            log.warning(
+                "context_overflow.context_state_estimate_failed",
+                session_key=session_key,
+                error=str(exc),
+            )
+            context_states = []
+
+    if summaries or context_states:
+        records = build_compaction_context_records(
+            context_states=context_states,
+            summaries=summaries,
+        )
+        if records:
+            for record in records:
+                total += estimate_tokens(record.text)
             return total
+
+        if summaries:
+            return total
+
     if fallback_summary:
         total += estimate_tokens(str(fallback_summary))
     return total
@@ -478,6 +505,26 @@ async def apply_context_overflow_policy(
                     compaction_config,
                 )
                 outcome.removed_count = 1 if summary else 0
+            if (
+                compaction_result is not None
+                and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                and bool(getattr(compaction_result, "summary", "") or "")
+            ):
+                for event in (
+                    COMPACTION_CHUNK_SUMMARIZED_EVENT,
+                    COMPACTION_SUMMARY_VERIFIED_EVENT,
+                ):
+                    observed_payload = compaction_lifecycle_payload(compaction_id, event)
+                    observed_payload.update(compaction_result_payload(compaction_result))
+                    notify_compaction(
+                        session_key,
+                        source="automatic",
+                        phase="gateway_auto_summarize",
+                        status="observed",
+                        context_window_tokens=budget,
+                        flush_receipt_status=flush_receipt_status(outcome.flush_receipt),
+                        **observed_payload,
+                    )
             compacted_transcript = await session_manager.get_transcript(session_key)
             post_estimate = await _estimate_session_payload_tokens(
                 message,

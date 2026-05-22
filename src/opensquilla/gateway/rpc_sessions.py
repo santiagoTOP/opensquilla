@@ -29,8 +29,15 @@ from opensquilla.session.compaction import (
     call_compact_with_optional_config,
 )
 from opensquilla.session.compaction_lifecycle import (
+    COMPACTION_CHUNK_SUMMARIZED_EVENT,
+    COMPACTION_PERSISTED_EVENT,
+    COMPACTION_SUMMARY_VERIFIED_EVENT,
+    COMPACTION_TRIGGERED_EVENT,
+    compaction_lifecycle_payload,
+    compaction_result_payload,
     flush_receipt_allows_destructive_compaction,
     flush_receipt_to_dict,
+    new_compaction_id,
     pre_compaction_flush_enabled,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
@@ -1586,6 +1593,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
 
     async def _run_locked() -> dict[str, Any]:
         receipt = None
+        compaction_id = new_compaction_id()
         storage = get_session_storage(ctx.session_manager)
         session = None
         if storage is not None and await storage.get_session(key) is None:
@@ -1598,6 +1606,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             phase="manual",
             status="started",
             context_window_tokens=context_window_tokens,
+            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
         transcript = []
         flush_enabled = pre_compaction_flush_enabled(ctx.config)
@@ -1662,6 +1671,11 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
             )
 
+            chunk_count = 0
+            coverage_status = "unknown"
+            missing_obligation_count = 0
+            critical_carry_forward_count = 0
+            state_kind = "text"
             compact_with_result = getattr(ctx.session_manager, "compact_with_result", None)
             if callable(compact_with_result):
                 result = await compact_with_result(
@@ -1679,6 +1693,28 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 remaining_budget_tokens = int(
                     getattr(result, "remaining_budget_tokens", 0) or 0
                 )
+                chunk_count = int(getattr(result, "chunks_processed", 0) or 0)
+                coverage_status = str(getattr(result, "coverage_status", "unknown") or "unknown")
+                missing_obligation_count = len(getattr(result, "missing_obligations", None) or [])
+                critical_carry_forward_count = len(
+                    getattr(result, "critical_carry_forward", None) or []
+                )
+                state_kind = str(getattr(result, "summary_format", "text") or "text")
+                if removed_count > 0 and summary:
+                    for event in (
+                        COMPACTION_CHUNK_SUMMARIZED_EVENT,
+                        COMPACTION_SUMMARY_VERIFIED_EVENT,
+                    ):
+                        observed_payload = compaction_lifecycle_payload(compaction_id, event)
+                        observed_payload.update(compaction_result_payload(result))
+                        notify_compaction(
+                            key,
+                            source="manual",
+                            phase="manual",
+                            status="observed",
+                            context_window_tokens=context_window_tokens,
+                            **observed_payload,
+                        )
             else:
                 compact = ctx.session_manager.compact
                 summary = await call_compact_with_optional_config(
@@ -1701,6 +1737,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 status="cancelled",
                 message="Compaction was cancelled.",
                 context_window_tokens=context_window_tokens,
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
             raise
         except Exception as exc:
@@ -1711,6 +1748,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 status="failed",
                 message=str(exc),
                 context_window_tokens=context_window_tokens,
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
             raise
         payload = {
@@ -1725,9 +1763,21 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             "remaining_budget_tokens": remaining_budget_tokens,
             "removed_count": removed_count,
             "kept_count": kept_count,
+            "chunk_count": chunk_count,
+            "coverage_status": coverage_status,
+            "missing_obligation_count": missing_obligation_count,
+            "critical_carry_forward_count": critical_carry_forward_count,
+            "state_kind": state_kind,
         }
         if receipt is not None:
             payload["flush_receipt"] = flush_receipt_to_dict(receipt)
+        final_event = (
+            COMPACTION_PERSISTED_EVENT
+            if removed_count > 0
+            else COMPACTION_TRIGGERED_EVENT
+        )
+        final_lifecycle_payload = compaction_lifecycle_payload(compaction_id, final_event)
+        final_lifecycle_payload.pop("coverage_status", None)
         notify_compaction(
             key,
             source="manual",
@@ -1738,9 +1788,15 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             remaining_budget_tokens=remaining_budget_tokens,
             removed_count=removed_count,
             kept_count=kept_count,
+            chunk_count=chunk_count,
+            coverage_status=coverage_status,
+            missing_obligation_count=missing_obligation_count,
+            critical_carry_forward_count=critical_carry_forward_count,
+            state_kind=state_kind,
             summary_len=len(summary),
             summary_source=summary_source,
             context_window_tokens=context_window_tokens,
+            **final_lifecycle_payload,
         )
         return payload
 

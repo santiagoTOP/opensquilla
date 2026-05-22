@@ -87,7 +87,13 @@ from opensquilla.session.compaction import (
     compact_context,
 )
 from opensquilla.session.compaction_lifecycle import (
+    COMPACTION_CHUNK_SUMMARIZED_EVENT,
+    COMPACTION_SUMMARY_VERIFIED_EVENT,
+    COMPACTION_TRIGGERED_EVENT,
+    compaction_lifecycle_payload,
+    compaction_result_payload,
     flush_receipt_allows_destructive_compaction,
+    new_compaction_id,
 )
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
@@ -2706,6 +2712,7 @@ class Agent:
                                 message="Context compacted; retrying the provider request.",
                             )
                             yield CompactionEvent(
+                                compaction_id=overflow_outcome.compaction_id,
                                 summary=overflow_outcome.summary,
                                 kept_entries=overflow_outcome.kept_entries,
                                 kept_count=len(overflow_outcome.messages),
@@ -2842,6 +2849,7 @@ class Agent:
                     if overflow_outcome.runtime_context_insert_index is not None:
                         runtime_context_insert_index = overflow_outcome.runtime_context_insert_index
                     yield CompactionEvent(
+                        compaction_id=overflow_outcome.compaction_id,
                         summary=overflow_outcome.summary,
                         kept_entries=overflow_outcome.kept_entries,
                         kept_count=len(overflow_outcome.messages),
@@ -3726,6 +3734,7 @@ class Agent:
                 runtime_context_insert_index=runtime_context_insert_index,
             )
 
+        compaction_id = new_compaction_id()
         # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
         flush_task: asyncio.Task | None = None
         self._consume_completed_flush_task()
@@ -3852,6 +3861,10 @@ class Agent:
                             reason=reason,
                             tokens_before=total_tokens,
                             context_window_tokens=window_tokens,
+                            **compaction_lifecycle_payload(
+                                compaction_id,
+                                COMPACTION_TRIGGERED_EVENT,
+                            ),
                         )
                     return None
 
@@ -3881,6 +3894,10 @@ class Agent:
                 status="started",
                 tokens_before=total_tokens,
                 context_window_tokens=window_tokens,
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
             )
 
         try:
@@ -3897,8 +3914,33 @@ class Agent:
                     reason=self._last_compaction_refusal_reason,
                     tokens_before=total_tokens,
                     context_window_tokens=window_tokens,
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
                 )
             return None  # signal failure
+
+        if self._session_key and result.removed_count > 0 and result.summary:
+            for event in (
+                COMPACTION_CHUNK_SUMMARIZED_EVENT,
+                COMPACTION_SUMMARY_VERIFIED_EVENT,
+            ):
+                observed_payload = compaction_lifecycle_payload(compaction_id, event)
+                observed_payload.update(
+                    compaction_result_payload(
+                        result,
+                        tokens_before=total_tokens,
+                    )
+                )
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="observed",
+                    context_window_tokens=window_tokens,
+                    **observed_payload,
+                )
 
         # Removing history without a replacement summary is equivalent to
         # bare truncation; reject it so the caller takes the existing
@@ -3921,6 +3963,10 @@ class Agent:
                     context_window_tokens=window_tokens,
                     removed_count=result.removed_count,
                     kept_count=len(result.kept_entries),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
                 )
             return None
 
@@ -3937,6 +3983,10 @@ class Agent:
                     reason="structured_content_noop",
                     tokens_before=total_tokens,
                     context_window_tokens=window_tokens,
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
                 )
             return CompactionOutcome(messages=messages)
 
@@ -3978,6 +4028,7 @@ class Agent:
             summary=result.summary,
             kept_entries=kept_entries,
             removed_count=result.removed_count,
+            compaction_id=compaction_id,
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
         )

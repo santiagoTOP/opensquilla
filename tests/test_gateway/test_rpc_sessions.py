@@ -1298,10 +1298,21 @@ class TestSessionsContextCompact:
         assert res.ok is True
         assert [(key, payload["status"]) for key, payload in events] == [
             (session.session_key, "started"),
+            (session.session_key, "observed"),
+            (session.session_key, "observed"),
             (session.session_key, "completed"),
         ]
         assert all(payload["source"] == "manual" for _, payload in events)
         assert all(payload["phase"] == "manual" for _, payload in events)
+        compaction_ids = {payload.get("compaction_id") for _, payload in events}
+        assert len(compaction_ids) == 1
+        assert None not in compaction_ids
+        assert [payload["event"] for _, payload in events] == [
+            "compaction.triggered",
+            "compaction.chunk_summarized",
+            "compaction.summary_verified",
+            "compaction.persisted",
+        ]
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_started_while_slow_compaction_is_running(
@@ -1338,6 +1349,8 @@ class TestSessionsContextCompact:
         assert res.ok is True
         assert [payload["status"] for _, payload in events] == [
             "started",
+            "observed",
+            "observed",
             "completed",
         ]
 

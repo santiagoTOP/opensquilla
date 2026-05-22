@@ -70,12 +70,14 @@ def compaction_event_chain(event: str) -> list[str]:
 
 
 def compaction_lifecycle_payload(compaction_id: str, event: str) -> dict[str, Any]:
-    return {
+    payload = {
         "compaction_id": compaction_id,
         "event": event,
         "event_chain": compaction_event_chain(event),
-        "coverage_status": COMPACTION_COVERAGE_UNKNOWN,
     }
+    if event not in {COMPACTION_PERSISTED_EVENT, COMPACTION_REPLAYED_EVENT}:
+        payload["coverage_status"] = COMPACTION_COVERAGE_UNKNOWN
+    return payload
 
 
 def compaction_result_payload(
@@ -92,6 +94,10 @@ def compaction_result_payload(
         "chunk_count": int(getattr(result, "chunks_processed", 0) or 0),
         "summary_len": len(str(getattr(result, "summary", "") or "")),
         "summary_source": str(getattr(result, "summary_source", "unknown") or "unknown"),
+        "coverage_status": str(getattr(result, "coverage_status", "unknown") or "unknown"),
+        "missing_obligation_count": len(getattr(result, "missing_obligations", None) or []),
+        "critical_carry_forward_count": len(getattr(result, "critical_carry_forward", None) or []),
+        "state_kind": str(getattr(result, "summary_format", "text") or "text"),
     }
     if tokens_before is None:
         tokens_before = getattr(result, "tokens_before", None)

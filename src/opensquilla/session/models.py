@@ -199,10 +199,48 @@ class SessionSummary(SQLModel, table=True):
     session_id: str = Field(index=True)
     session_key: str = Field(index=True)
     compaction_index: int = 0  # monotonically increasing per session
+    compaction_id: str | None = None
+    trigger_reason: str | None = None
     summary_text: str
+    summary_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    summary_format: str = "text"
+    summary_source: str = "unknown"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    critical_carry_forward: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    tokens_before: int | None = None
+    tokens_after: int | None = None
+    removed_count: int = 0
+    kept_count: int = 0
+    chunk_count: int = 0
+    flush_receipt_status: str = "unknown"
     # The transcript entry id up to which this summary covers (inclusive)
     covered_through_id: int = 0
     created_at: int = Field(default_factory=_now_ms)
+
+    # Schema generation (S-MIGRATE).
+    schema_version: int = 1
+
+
+class SessionContextState(SQLModel, table=True):
+    """Portable or provider-specific context state derived from session history."""
+
+    __tablename__ = "session_context_states"
+
+    id: int | None = Field(default=None, primary_key=True)
+    session_id: str = Field(index=True)
+    session_key: str = Field(index=True)
+    provider: str = "portable"
+    model: str | None = None
+    state_kind: str
+    payload: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    covered_through_id: int = 0
+    created_at: int = Field(default_factory=_now_ms)
+    expires_at: int | None = None
+    portable: bool = False
+    cacheable: bool = False
+    valid: bool = True
+    invalid_reason: str | None = None
 
     # Schema generation (S-MIGRATE).
     schema_version: int = 1

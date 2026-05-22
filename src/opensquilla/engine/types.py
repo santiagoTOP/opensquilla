@@ -177,6 +177,7 @@ class CompactionEvent:
     """Emitted when Agent completes inline compaction. Captured by TurnRunner for DB persistence."""
 
     kind: Literal["compaction"] = field(default="compaction", init=False)
+    compaction_id: str | None = None
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     kept_count: int = 0
@@ -192,6 +193,7 @@ class CompactionOutcome:
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
+    compaction_id: str | None = None
     request_context_insert_index: int | None = None
     runtime_context_insert_index: int | None = None
 

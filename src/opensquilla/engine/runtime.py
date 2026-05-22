@@ -138,13 +138,20 @@ from opensquilla.provider import (
 )
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.session.compaction_lifecycle import (
+    COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
+    COMPACTION_REPLAYED_EVENT,
+    COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
     compaction_lifecycle_payload,
     compaction_result_payload,
     flush_receipt_allows_destructive_compaction,
     new_compaction_id,
     pre_compaction_flush_requires_safe_receipt,
+)
+from opensquilla.session.context_view import (
+    build_compaction_context_records,
+    build_provider_compaction_context,
 )
 from opensquilla.session.cost_rollup import (
     normalize_event_cost_source,
@@ -4026,12 +4033,14 @@ class TurnRunner:
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
 
+        flush_receipt_status = "not_required"
         if self._pre_compaction_flush_enabled():
             flush_safe = await self._await_pre_compaction_flush_grace(
                 transcript,
                 session_key,
                 event_prefix="t3_upgrade_compaction",
             )
+            flush_receipt_status = "safe" if flush_safe else "unsafe"
             if self._pre_compaction_flush_requires_safe_receipt() and not flush_safe:
                 log.warning(
                     "t3_upgrade_compaction.skipped",
@@ -4068,10 +4077,19 @@ class TurnRunner:
             compaction_result = None
             compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
             if callable(compact_with_result):
+                compact_method = self._session_manager.compact_with_result
+                compact_kwargs: dict[str, Any] = {}
+                if _accepts_keyword_arg(compact_method, "compaction_id"):
+                    compact_kwargs["compaction_id"] = compaction_id
+                if _accepts_keyword_arg(compact_method, "trigger_reason"):
+                    compact_kwargs["trigger_reason"] = "t3_upgrade"
+                if _accepts_keyword_arg(compact_method, "flush_receipt_status"):
+                    compact_kwargs["flush_receipt_status"] = flush_receipt_status
                 compaction_result = await self._session_manager.compact_with_result(
                     session_key,
                     context_window_tokens,
                     compaction_config,
+                    **compact_kwargs,
                 )
                 result = getattr(compaction_result, "summary", "") or ""
             else:
@@ -4081,6 +4099,25 @@ class TurnRunner:
                     context_window_tokens,
                     compaction_config,
                 )
+            if (
+                compaction_result is not None
+                and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                and bool(getattr(compaction_result, "summary", "") or "")
+            ):
+                for event in (
+                    COMPACTION_CHUNK_SUMMARIZED_EVENT,
+                    COMPACTION_SUMMARY_VERIFIED_EVENT,
+                ):
+                    observed_payload = compaction_lifecycle_payload(compaction_id, event)
+                    observed_payload.update(compaction_result_payload(compaction_result))
+                    notify_compaction(
+                        session_key,
+                        source="automatic",
+                        phase="t3_upgrade",
+                        status="observed",
+                        context_window_tokens=context_window_tokens,
+                        **observed_payload,
+                    )
             self.mark_compacted_this_turn(session_key)
             self._record_compaction_success(session_key)
             if result:
@@ -4200,12 +4237,14 @@ class TurnRunner:
             context_window_tokens=context_window_tokens,
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
+        flush_receipt_status = "not_required"
         if self._pre_compaction_flush_enabled():
             flush_safe = await self._await_pre_compaction_flush_grace(
                 transcript,
                 session_key,
                 event_prefix="preflight_compaction",
             )
+            flush_receipt_status = "safe" if flush_safe else "unsafe"
             if self._pre_compaction_flush_requires_safe_receipt() and not flush_safe:
                 log.warning(
                     "preflight_compaction.skipped",
@@ -4242,10 +4281,19 @@ class TurnRunner:
             compaction_result = None
             compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
             if callable(compact_with_result):
+                compact_method = self._session_manager.compact_with_result
+                compact_kwargs: dict[str, Any] = {}
+                if _accepts_keyword_arg(compact_method, "compaction_id"):
+                    compact_kwargs["compaction_id"] = compaction_id
+                if _accepts_keyword_arg(compact_method, "trigger_reason"):
+                    compact_kwargs["trigger_reason"] = "preflight"
+                if _accepts_keyword_arg(compact_method, "flush_receipt_status"):
+                    compact_kwargs["flush_receipt_status"] = flush_receipt_status
                 compaction_result = await self._session_manager.compact_with_result(
                     session_key,
                     context_window_tokens,
                     compaction_config,
+                    **compact_kwargs,
                 )
                 result = getattr(compaction_result, "summary", "") or ""
             else:
@@ -4255,6 +4303,30 @@ class TurnRunner:
                     context_window_tokens,
                     compaction_config,
                 )
+            if (
+                compaction_result is not None
+                and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                and bool(getattr(compaction_result, "summary", "") or "")
+            ):
+                for event in (
+                    COMPACTION_CHUNK_SUMMARIZED_EVENT,
+                    COMPACTION_SUMMARY_VERIFIED_EVENT,
+                ):
+                    observed_payload = compaction_lifecycle_payload(compaction_id, event)
+                    observed_payload.update(
+                        compaction_result_payload(
+                            compaction_result,
+                            tokens_before=total_tokens,
+                        )
+                    )
+                    notify_compaction(
+                        session_key,
+                        source="automatic",
+                        phase="preflight",
+                        status="observed",
+                        context_window_tokens=context_window_tokens,
+                        **observed_payload,
+                    )
             self.mark_compacted_this_turn(session_key)
         except asyncio.CancelledError:
             raise
@@ -4631,17 +4703,49 @@ class TurnRunner:
         # assistant + user(tool_result) must keep its tool_result tail.
         if trim_last_user and last_entry_was_user and history and history[-1].role == "user":
             history.pop()
+        context_states = await self._load_context_states(session_key)
+        provider_context = build_provider_compaction_context(
+            context_states=context_states,
+            provider_kind=str(getattr(agent.provider, "provider_name", "")),
+        )
+        if provider_context.messages:
+            history = provider_context.messages + history
         if history:
             agent.set_history(history)
-        return await self._compaction_summary_context(session_key, summary_markers)
+        return await self._compaction_summary_context(
+            session_key,
+            summary_markers,
+            context_states=context_states,
+            skip_covered_through_ids=provider_context.covered_through_ids,
+        )
+
+    async def _load_context_states(self, session_key: str) -> list[Any]:
+        context_states: list[Any] = []
+        get_context_states = getattr(self._session_manager, "get_context_states", None)
+        if callable(get_context_states):
+            try:
+                context_states = await get_context_states(session_key)
+            except KeyError:
+                context_states = []
+            except Exception as exc:  # pragma: no cover - context state is best-effort
+                log.warning(
+                    "compaction_context_state.load_failed",
+                    session_key=session_key,
+                    error=str(exc),
+                )
+                context_states = []
+        return context_states
 
     async def _compaction_summary_context(
         self,
         session_key: str,
         legacy_summary_markers: list[str],
+        *,
+        context_states: list[Any] | None = None,
+        skip_covered_through_ids: set[int] | None = None,
     ) -> str | None:
         """Return durable compaction summaries as request-scoped context."""
-        summary_texts: list[str] = []
+        summaries: list[Any] = []
         get_summaries = getattr(self._session_manager, "get_summaries", None)
         if callable(get_summaries):
             try:
@@ -4655,12 +4759,46 @@ class TurnRunner:
                     error=str(exc),
                 )
                 summaries = []
-            for summary in summaries:
-                text = getattr(summary, "summary_text", "")
-                if isinstance(text, str) and text.strip():
-                    summary_texts.append(text)
-        summary_texts.extend(legacy_summary_markers)
-        return _format_compaction_summary_context(summary_texts)
+        loaded_context_states = (
+            await self._load_context_states(session_key)
+            if context_states is None
+            else context_states
+        )
+        context_records = build_compaction_context_records(
+            context_states=loaded_context_states,
+            summaries=summaries,
+            legacy_summary_markers=legacy_summary_markers,
+            skip_covered_through_ids=skip_covered_through_ids,
+        )
+        context_items = [record.text for record in context_records]
+        if context_items:
+            replayed_compaction_ids = list(
+                dict.fromkeys(
+                    record.compaction_id
+                    for record in context_records
+                    if record.compaction_id is not None
+                )
+            )
+            replay_compaction_id = (
+                replayed_compaction_ids[0]
+                if replayed_compaction_ids
+                else new_compaction_id()
+            )
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="summary_replay",
+                status="replayed",
+                summary_count=len(context_items),
+                summary_len=sum(len(text) for text in context_items),
+                context_state_count=len(loaded_context_states),
+                replayed_compaction_ids=replayed_compaction_ids,
+                **compaction_lifecycle_payload(
+                    replay_compaction_id,
+                    COMPACTION_REPLAYED_EVENT,
+                ),
+            )
+        return _format_compaction_summary_context(context_items)
 
     @staticmethod
     def _maybe_unpack_attachments(content: str) -> Any:

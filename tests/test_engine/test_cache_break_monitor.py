@@ -171,7 +171,8 @@ def test_notify_compaction_resets_cache_only_after_completed_status(
     )
     monitor.check_response_for_cache_break("agent:main:s1", before, 5000)
 
-    cache_break_monitor.notify_compaction("agent:main:s1", status="started")
+    for status in ("started", "observed", "replayed"):
+        cache_break_monitor.notify_compaction("agent:main:s1", status=status)
     after_started = monitor.record_prompt_state(
         messages=[
             Message(role="assistant", content="kept"),
