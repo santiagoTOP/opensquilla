@@ -370,14 +370,20 @@ class _ProviderRetryPolicy:
     provider_failure_budgets: dict[ProviderFailureKind, int]
 
     @classmethod
-    def from_provider_budget(cls, max_provider_retries: int) -> _ProviderRetryPolicy:
+    def from_provider_budget(
+        cls,
+        max_provider_retries: int,
+        *,
+        length_capped_continuations: int = 1,
+    ) -> _ProviderRetryPolicy:
+        length_capped_continuations = max(1, length_capped_continuations)
         return cls(
             max_provider_retries=max_provider_retries,
             attempt_budgets={
                 _ProviderAttemptKind.REASONING_ONLY: 1,
                 _ProviderAttemptKind.MALFORMED_EMPTY: 1,
                 _ProviderAttemptKind.STREAM_INCOMPLETE: 1,
-                _ProviderAttemptKind.LENGTH_CAPPED: 1,
+                _ProviderAttemptKind.LENGTH_CAPPED: length_capped_continuations,
             },
             provider_failure_budgets={ProviderFailureKind.EMPTY_RESPONSE: 1},
         )
@@ -1994,7 +2000,10 @@ class Agent:
 
                 _retry_attempt = 0
                 _call_attempt = 0
-                _retry_policy = _ProviderRetryPolicy.from_provider_budget(_fallback.max_retries)
+                _retry_policy = _ProviderRetryPolicy.from_provider_budget(
+                    _fallback.max_retries,
+                    length_capped_continuations=self.config.length_capped_continuations,
+                )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
                 while _retry_attempt <= _fallback.max_retries:
@@ -4575,6 +4584,7 @@ class Agent:
             max_turn_output_tokens=self.config.max_turn_output_tokens,
             max_turn_billed_cost_usd=self.config.max_turn_billed_cost_usd,
             max_turn_tool_errors=self.config.max_turn_tool_errors,
+            length_capped_continuations=self.config.length_capped_continuations,
             context_window_tokens=self.config.context_window_tokens,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
             flush_enabled=self.config.flush_enabled,

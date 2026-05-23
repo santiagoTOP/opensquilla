@@ -200,6 +200,7 @@ def _make_input(
     tool_timeout=None,
     request_timeout=None,
     max_provider_retries=None,
+    length_capped_continuations=None,
 ):
     return AgentBootstrapStageInput(
         provider=provider if provider is not None else object(),
@@ -220,6 +221,7 @@ def _make_input(
         tool_timeout=tool_timeout,
         request_timeout=request_timeout,
         max_provider_retries=max_provider_retries,
+        length_capped_continuations=length_capped_continuations,
     )
 
 
@@ -268,6 +270,16 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.max_tokens == 4096
     assert o.agent_config.context_window_tokens == 200_000
     assert o.agent_config.max_history_turns == 0
+    assert o.agent_config.length_capped_continuations == 1
+
+
+@pytest.mark.asyncio
+async def test_length_capped_continuations_threads_to_agent_config() -> None:
+    stage = _make_stage()
+    inp = _make_input(length_capped_continuations=3)
+    out = await stage.run(inp)
+
+    assert out.output.agent_config.length_capped_continuations == 3
 
 
 @pytest.mark.asyncio

@@ -249,6 +249,7 @@ def test_run_agent_command_direct_call_normalizes_typer_defaults(
     assert captured["tool_timeout"] is None
     assert captured["request_timeout"] is None
     assert captured["max_provider_retries"] is None
+    assert captured["length_capped_continuations"] is None
     assert captured["thinking"] is None
     assert captured["transcript_path"] is None
     assert captured["usage_path"] is None
@@ -1031,3 +1032,49 @@ def test_top_level_agent_command_accepts_automation_options(
     assert captured["stateless_keep_project_rules"] is True
     assert captured["scratch_dir"] == "scratch"
     assert captured["workspace_lockdown"] is True
+
+
+def test_top_level_agent_command_accepts_length_capped_continuations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.main import app
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_agent_command(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("opensquilla.cli.main.run_agent_command", fake_run_agent_command)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "agent",
+            "--message",
+            "hello",
+            "--length-capped-continuations",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["length_capped_continuations"] == 3
+
+
+def test_top_level_agent_command_rejects_invalid_length_capped_continuations() -> None:
+    from opensquilla.cli.main import app
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "agent",
+            "--message",
+            "hello",
+            "--length-capped-continuations",
+            "0",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid value for '--length-capped-continuations'" in result.output
+    assert "x>=1" in result.output

@@ -546,6 +546,52 @@ async def test_length_capped_visible_text_continues_once_before_terminal() -> No
 
 
 @pytest.mark.asyncio
+async def test_length_capped_visible_text_uses_configured_continuation_budget() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="part one "),
+                ProviderDone(stop_reason="length", input_tokens=1, output_tokens=2),
+            ],
+            [
+                ProviderText(text="part two "),
+                ProviderDone(stop_reason="length", input_tokens=3, output_tokens=4),
+            ],
+            [
+                ProviderText(text="part three "),
+                ProviderDone(stop_reason="length", input_tokens=5, output_tokens=6),
+            ],
+            [
+                ProviderText(text="done"),
+                ProviderDone(stop_reason="stop", input_tokens=7, output_tokens=8),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            length_capped_continuations=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 4
+    assert sum(
+        1
+        for event in events
+        if event.kind == "warning" and event.code == "provider_output_continue"
+    ) == 3
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "part one part two part three done"
+    assert done.input_tokens == 16
+    assert done.output_tokens == 20
+
+
+@pytest.mark.asyncio
 async def test_length_capped_tool_call_is_not_executed() -> None:
     provider = _SequenceProvider(
         [

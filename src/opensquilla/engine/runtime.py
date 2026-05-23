@@ -1627,6 +1627,7 @@ class TurnRunner:
         tool_timeout: float | None = None,
         request_timeout: float | None = None,
         max_provider_retries: int | None = None,
+        length_capped_continuations: int | None = None,
         input_mode: str = "user",
         persist_input: bool = False,
         input_provenance: dict[str, Any] | None = None,
@@ -1683,6 +1684,7 @@ class TurnRunner:
                     tool_timeout=tool_timeout,
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
+                    length_capped_continuations=length_capped_continuations,
                     input_mode=input_mode,
                     persist_input=persist_input,
                     input_provenance=input_provenance,
@@ -1720,6 +1722,7 @@ class TurnRunner:
                         tool_timeout=tool_timeout,
                         request_timeout=request_timeout,
                         max_provider_retries=max_provider_retries,
+                        length_capped_continuations=length_capped_continuations,
                         input_mode=input_mode,
                         persist_input=persist_input,
                         input_provenance=input_provenance,
@@ -1751,6 +1754,7 @@ class TurnRunner:
         tool_timeout: float | None = None,
         request_timeout: float | None = None,
         max_provider_retries: int | None = None,
+        length_capped_continuations: int | None = None,
         input_mode: str = "user",
         persist_input: bool = False,
         input_provenance: dict[str, Any] | None = None,
@@ -1957,6 +1961,7 @@ class TurnRunner:
                     tool_timeout=tool_timeout,
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
+                    length_capped_continuations=length_capped_continuations,
                 )
             )
             ab_out = ab_outcome.require_output()

@@ -289,6 +289,7 @@ class AgentBootstrapStageInput:
     tool_timeout: float | None
     request_timeout: float | None
     max_provider_retries: int | None
+    length_capped_continuations: int | None
 
 @dataclass(frozen=True)
 class AgentBootstrapStageOutput:
@@ -420,6 +421,11 @@ class AgentBootstrapStage:
             tool_timeout=budgets.tool_timeout,
             request_timeout=budgets.request_timeout,
             max_provider_retries=budgets.max_provider_retries,
+            length_capped_continuations=(
+                inp.length_capped_continuations
+                if inp.length_capped_continuations is not None
+                else AgentConfig().length_capped_continuations
+            ),
             max_tokens=catalog.max_tokens,
             context_window_tokens=catalog.context_window,
             max_history_turns=_route_max_history_turns(inp.turn.metadata),

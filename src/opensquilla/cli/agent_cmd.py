@@ -100,6 +100,7 @@ async def run_agent_once(
     tool_timeout: float | None = None,
     request_timeout: float | None = None,
     max_provider_retries: int | None = None,
+    length_capped_continuations: int | None = None,
     transcript_path: str | None = None,
     usage_path: str | None = None,
     config: Any | None = None,
@@ -271,6 +272,7 @@ async def run_agent_once(
             tool_timeout=tool_timeout,
             request_timeout=request_timeout,
             max_provider_retries=max_provider_retries,
+            length_capped_continuations=length_capped_continuations,
             history_has_persisted_user=True,
             no_memory_capture=no_memory_capture,
             attachments=run_attachments,
@@ -688,6 +690,12 @@ def run_agent_command(
         min=0,
         help="Maximum provider-level retries for transient errors",
     ),
+    length_capped_continuations: int | None = typer.Option(
+        None,
+        "--length-capped-continuations",
+        min=1,
+        help="Maximum automatic continuations after provider output reaches its length limit",
+    ),
     thinking: str = typer.Option(
         "",
         "--thinking",
@@ -761,6 +769,7 @@ def run_agent_command(
     tool_timeout_seconds = _unwrap_typer_default(tool_timeout_seconds)
     request_timeout_seconds = _unwrap_typer_default(request_timeout_seconds)
     max_provider_retries = _unwrap_typer_default(max_provider_retries)
+    length_capped_continuations = _unwrap_typer_default(length_capped_continuations)
     thinking = _unwrap_typer_default(thinking)
     transcript_path = _unwrap_typer_default(transcript_path)
     usage_path = _unwrap_typer_default(usage_path)
@@ -791,6 +800,7 @@ def run_agent_command(
             tool_timeout=tool_timeout_seconds,
             request_timeout=request_timeout_seconds,
             max_provider_retries=max_provider_retries,
+            length_capped_continuations=length_capped_continuations,
             transcript_path=transcript_path or None,
             usage_path=usage_path or None,
             session_db_path=session_db_path,

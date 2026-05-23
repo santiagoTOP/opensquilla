@@ -560,6 +560,12 @@ def agent(
         min=0,
         help="Maximum provider-level retries for transient errors",
     ),
+    length_capped_continuations: int | None = typer.Option(
+        None,
+        "--length-capped-continuations",
+        min=1,
+        help="Maximum automatic continuations after provider output reaches its length limit",
+    ),
     thinking: str = typer.Option(
         "",
         "--thinking",
@@ -635,6 +641,7 @@ def agent(
         tool_timeout_seconds=tool_timeout_seconds,
         request_timeout_seconds=request_timeout_seconds,
         max_provider_retries=max_provider_retries,
+        length_capped_continuations=length_capped_continuations,
         transcript_path=transcript_path,
         usage_path=usage_path,
         session_db_path=session_db_path,
