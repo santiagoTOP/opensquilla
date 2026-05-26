@@ -49,7 +49,6 @@ def test_live_subagent_completion_event_uses_same_renderer() -> None:
     assert "session.event.subagent_completion" in source
     assert "_appendSubagentCompletion(payload)" in source
 
-
 def test_chat_renders_live_and_historical_artifacts_as_header_auth_downloads() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
 
@@ -985,6 +984,32 @@ def test_approval_monitor_uses_adaptive_timeout_backoff() -> None:
     assert "setTimeout(async () =>" in source
     assert "_increasePollBackoff();" in source
     assert "setInterval(_poll, POLL_MS)" not in source
+
+
+def test_approval_monitor_sends_auth_headers() -> None:
+    source = Path("src/opensquilla/gateway/static/js/approval_monitor.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function _authHeaders(extra)" in source
+    assert "App.getAuthToken" in source
+    assert "window.App && App.getAuthToken" not in source
+    assert "typeof App !== 'undefined'" in source
+    assert "headers['Authorization'] = `Bearer ${token}`;" in source
+    assert "headers: _authHeaders()," in source
+    assert "headers: _authHeaders({ 'Content-Type': 'application/json' })" in source
+
+
+def test_approvals_view_sends_auth_headers() -> None:
+    source = Path("src/opensquilla/gateway/static/js/views/approvals.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function _authHeaders(extra)" in source
+    assert "App.getAuthToken" in source
+    assert "headers['Authorization'] = `Bearer ${token}`;" in source
+    assert "fetch('/api/approvals', { headers: _authHeaders() })" in source
+    assert "headers: _authHeaders({ 'Content-Type': 'application/json' })" in source
 
 
 def test_session_api_token_totals_load_independently_of_token_widget() -> None:

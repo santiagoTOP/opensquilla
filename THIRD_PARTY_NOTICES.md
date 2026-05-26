@@ -19,7 +19,7 @@ It covers:
 ## OpenClaw-derived bundled skill descriptors
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
-  - `coding-agent`
+  - `sub-agent`
   - `cron`
   - `github`
   - `nano-pdf`
@@ -30,6 +30,9 @@ It covers:
 - Upstream project: https://github.com/openclaw/openclaw
 - License: MIT
 - Copyright notice: Copyright (c) 2025 Peter Steinberger
+
+Note: `sub-agent` was renamed from `coding-agent` on 2026-05-23; the
+descriptor retains the same OpenClaw upstream lineage and MIT attribution.
 
 The descriptor text instructs the agent runtime how to use built-in skill
 surfaces and external tools; OpenSquilla does not redistribute third-party CLIs
@@ -66,7 +69,51 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
+- `git-diff`
+- `history-explorer`
+- `http-fetch`
+- `latex-compile`
 - `memory`
+- `meta-arxiv-daily-digest-deck`
+- `meta-codereview-current-diff`
+- `meta-compliance-audit-bundle`
+- `meta-diagram-triangulation`
+- `meta-github-pr-watch-digest`
+- `meta-issue-to-pr-autopilot`
+- `meta-knowledge-base-bootstrap`
+- `meta-long-running-build-watchdog`
+- `meta-migration-assistant`
+- `meta-multi-format-export-pack`
+- `meta-paper-write`
+- `meta-pdf-intelligence`
+- `meta-pdf-reformat-pipeline`
+- `meta-pre-commit-quality-gate`
+- `meta-scheduled-morning-digest`
+- `meta-security-review-bundle`
+- `meta-skill-creator`
+- `skill-creator-linter`
+- `skill-creator-proposals`
+- `skill-creator-smoke-test`
+- `stack-trace-generic-probe`
+- `stack-trace-go-probe`
+- `stack-trace-js-probe`
+- `stack-trace-python-probe`
+- `stack-trace-rust-probe`
+- `meta-spreadsheet-insight`
+- `meta-stack-trace-investigator`
+- `meta-travel-planner`
+- `meta-web-research-to-report`
+- `meta-web-to-pdf-briefing`
+- `paper-abstract-author`
+- `paper-citation-planner`
+- `paper-experiment-stub`
+- `paper-outline-author`
+- `paper-plot-stub`
+- `paper-preference-planner`
+- `paper-refbib-stub`
+- `paper-revision-author`
+- `paper-section-author`
+- `paper-source-curator`
 
 ## tokenjuice adapted reduction rules
 
@@ -145,6 +192,7 @@ SOFTWARE.
 ## ClawHub-derived bundled skill descriptors
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
+  - `deep-research`
   - `docx`
   - `html-to-pdf`
   - `multi-search-engine`

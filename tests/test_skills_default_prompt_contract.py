@@ -15,14 +15,51 @@ from opensquilla.skills.loader import SkillLoader
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
 DEFAULTS = {
-    "coding-agent",
+    "sub-agent",
     "cron",
+    "deep-research",
     "docx",
+    "git-diff",
     "github",
+    "history-explorer",
     "html-to-pdf",
+    "http-fetch",
+    "latex-compile",
     "memory",
+    "meta-compliance-audit-bundle",
+    "meta-github-pr-watch-digest",
+    "meta-issue-to-pr-autopilot",
+    "meta-knowledge-base-bootstrap",
+    "meta-long-running-build-watchdog",
+    "meta-migration-assistant",
+    "meta-multi-format-export-pack",
+    "meta-paper-write",
+    "meta-pdf-intelligence",
+    "meta-pdf-reformat-pipeline",
+    "meta-scheduled-morning-digest",
+    "meta-arxiv-daily-digest-deck",
+    "meta-codereview-current-diff",
+    "meta-diagram-triangulation",
+    "meta-pre-commit-quality-gate",
+    "meta-security-review-bundle",
+    "meta-skill-creator",
+    "meta-spreadsheet-insight",
+    "meta-stack-trace-investigator",
+    "meta-travel-planner",
+    "meta-web-research-to-report",
+    "meta-web-to-pdf-briefing",
     "multi-search-engine",
     "nano-pdf",
+    "paper-experiment-stub",
+    "paper-abstract-author",
+    "paper-citation-planner",
+    "paper-outline-author",
+    "paper-plot-stub",
+    "paper-preference-planner",
+    "paper-refbib-stub",
+    "paper-revision-author",
+    "paper-section-author",
+    "paper-source-curator",
     "pdf-toolkit",
     "pptx",
     "skill-creator",
@@ -30,6 +67,16 @@ DEFAULTS = {
     "tmux",
     "weather",
     "xlsx",
+}
+INTERNAL_HELPERS = {
+    "skill-creator-linter",
+    "skill-creator-proposals",
+    "skill-creator-smoke-test",
+    "stack-trace-generic-probe",
+    "stack-trace-go-probe",
+    "stack-trace-js-probe",
+    "stack-trace-python-probe",
+    "stack-trace-rust-probe",
 }
 
 
@@ -83,7 +130,7 @@ def test_bundled_directory_only_contains_retained_default_skills() -> None:
         if path.is_dir() and (path / "SKILL.md").is_file()
     }
 
-    assert bundled_names == DEFAULTS
+    assert bundled_names == DEFAULTS | INTERNAL_HELPERS
 
 
 def test_skill_filter_defaults_are_release_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,6 +156,7 @@ async def test_default_prompt_only_injects_retained_bundled_skills(
             has_bin_cache={
                 "codex": True,
                 "curl": True,
+                "xelatex": True,
                 "nano-pdf": True,
                 "tmux": True,
             },
@@ -121,7 +169,41 @@ async def test_default_prompt_only_injects_retained_bundled_skills(
     prompt = ctx.system_prompt[1]
     for name in DEFAULTS:
         assert f"<name>{name}</name>" in prompt
+    for name in INTERNAL_HELPERS:
+        assert f"<name>{name}</name>" not in prompt
     assert "<name>healthcheck</name>" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_default_prompt_prefers_matching_meta_skills_over_direct_answers(
+    tmp_path: Path,
+) -> None:
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
+
+    ctx = await filter_skills(_ctx(loader))
+
+    prompt = ctx.system_prompt[1]
+    assert "When a kind=\"meta\" entry clearly matches" in prompt
+    assert "prefer `meta_invoke(name=\"<name>\")` over answering directly" in prompt
+    assert "multi-skill orchestration" in prompt
+
+
+@pytest.mark.asyncio
+async def test_internal_meta_helpers_stay_loadable_but_hidden_from_model(
+    tmp_path: Path,
+) -> None:
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
+
+    ctx = await filter_skills(_ctx(loader))
+    prompt = ctx.system_prompt[1]
+
+    for name in INTERNAL_HELPERS:
+        skill = loader.get_by_name(name)
+        assert skill is not None
+        assert skill.user_invocable is False
+        assert skill.disable_model_invocation is True
+        assert name not in {s.name for s in loader.get_user_invocable()}
+        assert f"<name>{name}</name>" not in prompt
 
 
 @pytest.mark.asyncio

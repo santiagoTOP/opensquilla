@@ -54,6 +54,16 @@ from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_ag
 
 log = structlog.get_logger(__name__)
 
+_AUTO_PROPOSE_TOOL_ALLOWLIST = frozenset(
+    {
+        "emit_text",
+        "meta_skill_fill_slots",
+        "meta_skill_assemble",
+        "meta_skill_lint_run",
+        "meta_skill_smoke_run",
+        "meta_skill_persist_proposal",
+    }
+)
 _DEBUG_FILE_HANDLER_ATTR = "_opensquilla_debug_file_handler"
 _ENABLED_VALUES = {"1", "true", "yes", "on"}
 _DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -68,6 +78,60 @@ _LOG_LEVELS = {
     "TRACE": logging.DEBUG,
     "NOTSET": logging.NOTSET,
 }
+
+
+def _make_auto_propose_tool_invoker(
+    registry: ToolRegistry,
+    *,
+    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
+) -> Callable[[str, dict[str, Any]], Any]:
+    """Build the unattended auto-propose tool invoker through dispatch policy."""
+
+    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
+    from opensquilla.tools.dispatch import build_tool_handler
+    from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
+
+    ctx = ToolContext(
+        is_owner=False,
+        caller_kind=CallerKind.CRON,
+        interaction_mode=InteractionMode.UNATTENDED,
+        agent_id="auto_propose",
+        allowed_tools=set(allowed_tools),
+    )
+    return make_tool_invoker_from_handler(
+        tool_handler=build_tool_handler(registry, ctx),
+    )
+
+
+def _resolve_migrations_dir() -> Path:
+    """Locate yoyo migrations in env override, installed package, or checkout."""
+
+    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
+    if env_dir:
+        candidate = Path(env_dir)
+        if any(candidate.glob("V*.py")):
+            return candidate
+
+    try:
+        from importlib import resources as importlib_resources
+
+        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
+        if package_dir.is_dir():
+            path = Path(str(package_dir))
+            if any(path.glob("V*.py")):
+                return path
+    except Exception:
+        pass
+
+    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
+    if any(repo_dir.glob("V*.py")):
+        return repo_dir
+
+    raise RuntimeError(
+        "opensquilla migrations directory not found "
+        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
+        "and repo migrations/)"
+    )
 
 
 class TaskRuntimeStreamError(RuntimeError):
@@ -255,6 +319,101 @@ async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) ->
             )
 
 
+async def _pause_auto_propose_crons(
+    *,
+    scheduler: Any,
+    agent_ids: list[str],
+) -> None:
+    """Pause per-agent auto-propose jobs without deleting persisted rows."""
+
+    existing_jobs = await _list_scheduler_jobs(scheduler)
+    target_names = {f"auto_propose:{agent_id}" for agent_id in agent_ids}
+    pause_job = getattr(scheduler, "pause_job", None)
+    update_job = getattr(scheduler, "update_job", None)
+    for job in existing_jobs:
+        if getattr(job, "name", "") not in target_names:
+            continue
+        status = getattr(getattr(job, "status", None), "value", getattr(job, "status", ""))
+        if status in {"paused", "disabled", "deleted"}:
+            continue
+        job_id = getattr(job, "id", None)
+        if not job_id:
+            continue
+        try:
+            if callable(pause_job):
+                result = pause_job(job_id)
+            elif callable(update_job):
+                result = update_job(job_id, enabled=False)
+            else:
+                continue
+            if inspect.isawaitable(result):
+                await result
+            log.info("boot.auto_propose.paused", job_id=job_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("boot.auto_propose.pause_failed", job_id=job_id, error=str(exc))
+
+
+async def _register_auto_propose_crons(
+    *,
+    scheduler: Any,
+    auto_cfg: Any,
+    agent_ids: list[str],
+) -> None:
+    """Register or resume one isolated auto-propose cron per configured agent."""
+
+    from opensquilla.scheduler.types import SessionTarget
+
+    schedule_raw = auto_cfg.cron
+    existing_jobs = await _list_scheduler_jobs(scheduler)
+    existing_by_name = {
+        getattr(job, "name", ""): job
+        for job in existing_jobs
+        if getattr(job, "name", "").startswith("auto_propose:")
+    }
+    allowed_agent_ids = set(getattr(auto_cfg, "agent_ids", []) or [])
+    if allowed_agent_ids:
+        agent_ids = [agent_id for agent_id in agent_ids if agent_id in allowed_agent_ids]
+
+    update_job = getattr(scheduler, "update_job", None)
+    resume_job = getattr(scheduler, "resume_job", None)
+    for agent_id in agent_ids:
+        name = f"auto_propose:{agent_id}"
+        existing = existing_by_name.get(name)
+        if existing is not None:
+            patch: dict[str, Any] = {}
+            if getattr(existing, "schedule_raw", "") != schedule_raw:
+                patch["schedule_raw"] = schedule_raw
+            if getattr(existing, "payload", {}).get("agent_id") != agent_id:
+                patch["payload"] = {"agent_id": agent_id}
+            if getattr(existing, "session_target", None) != SessionTarget.ISOLATED:
+                patch["session_target"] = SessionTarget.ISOLATED
+            if patch and callable(update_job):
+                result = update_job(getattr(existing, "id"), **patch)
+                if inspect.isawaitable(result):
+                    await result
+
+            status = getattr(
+                getattr(existing, "status", None),
+                "value",
+                getattr(existing, "status", ""),
+            )
+            if status == "paused" and callable(resume_job):
+                result = resume_job(getattr(existing, "id"))
+                if inspect.isawaitable(result):
+                    await result
+            log.info("boot.auto_propose.already_registered", agent_id=agent_id)
+            continue
+
+        await scheduler.add_job(
+            name=name,
+            schedule_raw=schedule_raw,
+            handler_key="auto_propose",
+            payload={"agent_id": agent_id},
+            session_target=SessionTarget.ISOLATED,
+        )
+        log.info("boot.auto_propose.registered", agent_id=agent_id, schedule=schedule_raw)
+
+
 @dataclass
 class ServiceContainer:
     """Typed container for initialized services. Returned by build_services().
@@ -289,6 +448,7 @@ class ServiceContainer:
     turn_capture_services: dict[str, Any] = field(default_factory=dict)
     flush_service: Any = None  # SessionFlushService | None (gated by OPENSQUILLA_SESSION_FLUSH)
     memory_repair_service: Any = None
+    meta_run_writer: Any = None
     task_runtime: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
@@ -352,6 +512,11 @@ class ServiceContainer:
         if self.memory_repair_service is not None:
             try:
                 await self.memory_repair_service.stop()
+            except Exception:
+                pass
+        if self.meta_run_writer is not None:
+            try:
+                self.meta_run_writer.close()
             except Exception:
                 pass
 
@@ -503,6 +668,18 @@ def _ensure_configured_agent_workspaces(
 def _state_path(config: GatewayConfig, filename: str) -> Path:
     state_root = Path(config.state_dir or default_opensquilla_home() / "state")
     return state_root / filename
+
+
+def _gateway_home(config: GatewayConfig) -> Path:
+    state_root = _resolved_path(getattr(config, "state_dir", None))
+    if state_root is not None:
+        return state_root.parent
+
+    config_path = _resolved_path(getattr(config, "config_path", None))
+    if config_path is not None:
+        return config_path.parent
+
+    return default_opensquilla_home()
 
 
 def _task_runtime_max_concurrency(config: GatewayConfig) -> int:
@@ -1245,11 +1422,7 @@ async def build_services(
 
         if "://" not in session_db_path:
             Path(session_db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        env_migrations_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
-        if env_migrations_dir:
-            migrations_dir = Path(env_migrations_dir)
-        else:
-            migrations_dir = Path(__file__).resolve().parents[3] / "migrations"
+        migrations_dir = _resolve_migrations_dir()
         applied = apply_pending(session_db_path, migrations_dir)
         if applied:
             log.info("build_services.migrations_applied", count=len(applied), ids=applied)
@@ -1622,6 +1795,28 @@ async def build_services(
         except Exception as e:
             log.warning("build_services.memory_repair_service_failed", error=str(e))
 
+    meta_run_writer = None
+    try:
+        persistence_cfg = getattr(getattr(config, "meta_skill", None), "persistence", None)
+        if persistence_cfg is not None and getattr(persistence_cfg, "enabled", False):
+            storage = get_session_storage(session_manager)
+            db_path = getattr(storage, "_db_path", None) if storage is not None else None
+            if db_path and db_path != ":memory:":
+                from opensquilla.persistence.meta_run_writer import open_meta_run_writer
+
+                meta_run_writer = open_meta_run_writer(db_path)
+                if hasattr(storage, "_meta_run_writer"):
+                    storage._meta_run_writer = meta_run_writer
+                meta_run_writer.mark_orphans_failed(
+                    age_ms=int(
+                        getattr(persistence_cfg, "orphan_cleanup_age_seconds", 3600)
+                    )
+                    * 1000,
+                )
+    except Exception as e:  # noqa: BLE001 - meta traces must not block boot.
+        log.warning("build_services.meta_run_writer_failed", error=str(e))
+        meta_run_writer = None
+
     svc = ServiceContainer(
         config=config,
         provider_selector=provider_selector,
@@ -1640,6 +1835,7 @@ async def build_services(
         turn_capture_services=turn_capture_services,
         flush_service=flush_service,
         memory_repair_service=memory_repair_service,
+        meta_run_writer=meta_run_writer,
     )
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
@@ -1693,6 +1889,7 @@ def build_turn_runner_from_services(
         # plumbing stays here so the path is wired end-to-end.
         turn_hooks=getattr(svc, "turn_hooks", None),
         compaction_hooks=getattr(svc, "compaction_hooks", None),
+        meta_run_writer=getattr(svc, "meta_run_writer", None),
     )
 
 
@@ -1725,6 +1922,11 @@ async def start_gateway_server(
     _setup_file_logging(config)
     if config.config_path:
         log.info("gateway.config_loaded", path=config.config_path)
+
+    if subscription_manager is None:
+        from opensquilla.gateway.websocket import SubscriptionManager
+
+        subscription_manager = SubscriptionManager()
 
     # Gateway-specific: set env var for other components to discover
     os.environ["OPENSQUILLA_GATEWAY_PORT"] = str(config.port)

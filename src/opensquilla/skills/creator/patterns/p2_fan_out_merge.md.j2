@@ -1,0 +1,64 @@
+---
+name: {{ name | tojson }}
+description: {{ description | tojson }}
+kind: meta
+meta_priority: {{ meta_priority | default(50) }}
+always: false
+triggers:
+{%- for t in triggers %}
+  - {{ t | tojson }}
+{%- endfor %}
+provenance:
+  origin: opensquilla-user
+  license: Apache-2.0
+composition:
+  steps:
+{%- for b in branches %}
+    - id: {{ b.id }}
+      skill: {{ b.skill | tojson }}
+      with:
+{%- if b.with_keys %}
+{%- for k, v in b.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- else %}
+        task: "{{ b.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+{%- endif %}
+{%- endfor %}
+    - id: {{ merge.id }}
+      skill: {{ merge.skill | tojson }}
+      depends_on: [{% for b in branches %}{{ b.id }}{% if not loop.last %}, {% endif %}{% endfor %}]
+      with:
+{%- if merge.with_keys %}
+{%- for k, v in merge.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- else %}
+        task: {{ merge.task | tojson }}
+{%- for b in branches %}
+        {{ b.id }}_output: "{{ '{{' }} outputs.{{ b.id }} | truncate(2000) {{ '}}' }}"
+{%- endfor %}
+{%- endif %}
+{%- if tail %}
+    - id: {{ tail.id }}
+      skill: {{ tail.skill | tojson }}
+      depends_on: [{{ merge.id }}]
+      with:
+{%- if tail.with_keys %}
+{%- for k, v in tail.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- else %}
+        task: {{ tail.task | tojson }}
+        upstream: "{{ '{{' }} outputs.{{ merge.id }} | truncate(2000) {{ '}}' }}"
+{%- endif %}
+{%- endif %}
+---
+
+# {{ name }} (Meta-Skill, P2 fan_out_merge)
+
+{{ description }}
+
+## Fallback
+
+LLM should invoke the branch skills (in parallel where possible), then call the merge skill to aggregate, then optionally call the tail skill.

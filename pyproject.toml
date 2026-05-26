@@ -101,6 +101,7 @@ exclude = [
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
+"migrations/" = "opensquilla/_migrations/"
 "src/opensquilla/skills/bundled/pptx/references/pptxgenjs.md" = "opensquilla/skills/bundled/pptx/references/pptxgenjs.md"
 "src/opensquilla/skills/bundled/pptx/references/python_pptx.md" = "opensquilla/skills/bundled/pptx/references/python_pptx.md"
 
@@ -117,6 +118,7 @@ markers = [
     "llm_reasoning: live reasoning-capable model tests",
     "llm_gateway: live gateway/end-to-end runtime tests",
     "llm_image: live image-generation model API tests",
+    "llm_router_acc: live multi-model routing accuracy tests",
     "agent_context_boundary: agent context budget and compaction boundary tests",
     "local_golden: local opt-in synthetic complex-task golden tests",
     "webui_browser: real browser Web UI tests driven by Playwright",
@@ -135,6 +137,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 # example code meant to be copy-pasted verbatim; reformatting would
 # harm readability. E402 imports-after-sys.path-munge is intentional.
 "src/opensquilla/skills/bundled/skill-creator/scripts/*.py" = ["E501", "N806", "E402"]
+"src/opensquilla/skills/bundled/skill-creator-linter/scripts/*.py" = ["E402", "I001"]
 
 [tool.mypy]
 python_version = "3.12"

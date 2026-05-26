@@ -1123,7 +1123,7 @@ class DiscordChannelEntry(ConfiguredChannelEntry):
 
 
 class DingTalkChannelEntry(ConfiguredChannelEntry):
-    """Gateway config entry for a DingTalk (钉钉) channel."""
+    """Gateway config entry for a DingTalk channel."""
 
     type: Literal["dingtalk"] = "dingtalk"
     client_id: str
@@ -1131,7 +1131,7 @@ class DingTalkChannelEntry(ConfiguredChannelEntry):
 
 
 class WeComChannelEntry(ConfiguredChannelEntry):
-    """Gateway config entry for a WeCom (企业微信) corp-app channel."""
+    """Gateway config entry for a WeCom corp-app channel."""
 
     type: Literal["wecom"] = "wecom"
     corp_id: str
@@ -1298,11 +1298,116 @@ class SubagentsGatewayConfig(BaseModel):
     """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
 
 
+class MetaSkillPersistenceConfig(BaseSettings):
+    """Persistence/audit ledger for meta-skill executions (G4)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_META_SKILL_PERSISTENCE_",
+        extra="forbid",
+    )
+    enabled: bool = True
+    orphan_cleanup_age_seconds: int = 3600
+    # Per-DAG memory persist: when False the orchestrator skips any step
+    # whose ``skill`` is "memory" (the conventional last-step pattern that
+    # archives DAG output to memory/*.md). Defaults to True to preserve
+    # existing behaviour. Toggle off for exploratory runs where polluting
+    # the long-term memory store is undesirable.
+    memory_persist_enabled: bool = True
+
+
+class MetaSkillAutoProposeConfig(BaseSettings):
+    """Unattended synthesis: drive meta-skill-creator from co-occurrence
+    patterns observed in ``~/.opensquilla/logs/decisions-*.jsonl``.
+
+    Two independent triggers feed the same library function
+    (``skills.creator.auto_propose``):
+      * ``enabled`` schedules a recurring cron job
+      * ``on_dream_complete`` piggybacks on memory-consolidation dreams
+
+    Both default off. Operators flip them on after reviewing
+    meta-skill-creator's gated output once.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_META_SKILL_AUTO_PROPOSE_",
+        extra="forbid",
+    )
+
+    enabled: bool = False
+    """Path 1: schedule the auto-propose cron job. When false no
+    handler is registered at all (zero-impact code path)."""
+
+    cron: str = "0 5 * * *"
+    """Cron expression (5-field, local time) for the scheduled job."""
+
+    window_days: int = Field(default=30, ge=1, le=365)
+    """How many days of decision-log history to aggregate."""
+
+    min_freq: int = Field(default=3, ge=1)
+    """Drop co-occurrence chains observed fewer than this many times."""
+
+    top_k: int = Field(default=5, ge=1, le=50)
+    """At most this many distinct patterns considered per fire."""
+
+    on_dream_complete: bool = False
+    """Path 2: also run after a successful memory-consolidation dream.
+    Independent of ``enabled`` — either, both, or neither may be on."""
+
+    auto_enable: bool = False
+    """When true, eligible low-risk proposals are promoted to MANAGED
+    automatically after the creator gates pass. Defaults off."""
+
+    auto_enable_max_risk: Literal["low", "medium", "high"] = "low"
+    """Highest deterministic risk class that unattended promotion may accept."""
+
+    agent_ids: list[str] = Field(default_factory=list)
+    """Restrict to these agent IDs; empty = all configured agents."""
+
+
+class MetaSkillConfig(BaseSettings):
+    """Top-level meta-skill subsystem configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_META_SKILL_",
+        env_nested_delimiter="__",
+        extra="forbid",
+    )
+    persistence: MetaSkillPersistenceConfig = Field(
+        default_factory=MetaSkillPersistenceConfig,
+    )
+    auto_propose: MetaSkillAutoProposeConfig = Field(
+        default_factory=MetaSkillAutoProposeConfig,
+    )
+
+
+class TlsConfig(BaseSettings):
+    """Optional TLS termination at the gateway itself.
+
+    When ``keyfile`` and ``certfile`` are set, ``run_gateway`` passes
+    ``ssl_keyfile`` / ``ssl_certfile`` to uvicorn so the gateway speaks
+    HTTPS / WSS on its bound port. Disabled by default — gateways
+    behind a reverse proxy (nginx + LetsEncrypt) keep using plain HTTP.
+
+    Self-signed certs are fine for IP-based access (browser prints a
+    one-time "not trusted" warning); for a real CA-signed cert wire
+    via the same fields.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_TLS_",
+        extra="forbid",
+    )
+    keyfile: str = ""
+    certfile: str = ""
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
         env_nested_delimiter="__",
     )
+
+    tls: TlsConfig = Field(default_factory=TlsConfig)
 
     # bind defaults to 127.0.0.1 (loopback only).
     # OPENSQUILLA_LISTEN is recognised as a short-name env alias for ``host``
@@ -1349,6 +1454,7 @@ class GatewayConfig(BaseSettings):
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
+    meta_skill: MetaSkillConfig = Field(default_factory=MetaSkillConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)

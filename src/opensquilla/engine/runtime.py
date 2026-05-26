@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Final, Literal, SupportsInt, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, SupportsInt, TypeGuard, cast
 
 import structlog
 
@@ -167,6 +167,9 @@ from opensquilla.session.keys import (
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 from opensquilla.tools.types import CallerKind, ToolContext
 
+if TYPE_CHECKING:
+    from opensquilla.persistence.meta_run_writer import MetaRunWriter
+
 # Stable user-facing envelope for LLM timeouts.
 _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
     "status": "error",
@@ -196,6 +199,31 @@ _ARTIFACT_DELIVERY_TOOL_NAME: Final[str] = "publish_artifact"
 _ARTIFACT_DELIVERY_FAILURE_MAX_CHARS: Final[int] = 360
 
 _HOOKS_FEATURE_ENV: Final[str] = "OPENSQUILLA_HOOKS"
+
+
+def collect_invoked_skills(
+    turn_segments: list[dict],
+    *,
+    extra_first: list[str] | None = None,
+) -> list[str]:
+    """Collect skill names from skill_view/meta_invoke tool segments."""
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in extra_first or []:
+        if isinstance(name, str) and name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    for segment in turn_segments:
+        tool_name = segment.get("name")
+        if tool_name not in {"skill_view", "meta_invoke"}:
+            continue
+        skill_name = (segment.get("input") or {}).get("name")
+        if not isinstance(skill_name, str) or not skill_name or skill_name in seen:
+            continue
+        seen.add(skill_name)
+        result.append(skill_name)
+    return result
 
 
 def _hooks_mode_from_env() -> str:
@@ -1262,6 +1290,7 @@ class TurnRunner:
         diagnostics_state: Any | None = None,
         turn_hooks: Sequence[TurnHook] | None = None,
         compaction_hooks: Sequence[CompactionHook] | None = None,
+        meta_run_writer: MetaRunWriter | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -1276,6 +1305,7 @@ class TurnRunner:
         self._turn_capture_services = turn_capture_services
         self._session_flush_service = session_flush_service
         self._diagnostics_state = diagnostics_state
+        self._meta_run_writer = meta_run_writer
         # TurnHook surface. The default trace hook reproduces the inline trace
         # event behavior while keeping the event sink replaceable at construction.
         if turn_hooks is None:
@@ -2184,6 +2214,7 @@ class TurnRunner:
                 session_intent=session_intent,
                 done_event=done_event,
                 trace_id=trace_context.trace_id if trace_context is not None else None,
+                skills_invoked=collect_invoked_skills(turn_segments),
             )
             if pending_error_event is not None:
                 yield pending_error_event
@@ -2912,6 +2943,21 @@ class TurnRunner:
         from opensquilla.tools.policy import apply_tool_policy_from_config
         from opensquilla.tools.registry import filter_by_profile, resolve_profile
 
+        loaded_skills: list[Any] = []
+        if self._skill_loader is not None:
+            try:
+                loaded_skills = list(self._skill_loader.load_all())
+            except Exception:
+                loaded_skills = []
+        if ctx is not None and any(
+            getattr(skill, "kind", "skill") == "meta"
+            and not getattr(skill, "disable_model_invocation", False)
+            for skill in loaded_skills
+        ):
+            if ctx.surfaced_tools is None:
+                ctx.surfaced_tools = set()
+            ctx.surfaced_tools.add("meta_invoke")
+
         if ctx is not None:
             ctx = apply_tool_policy_from_config(
                 ctx,
@@ -2951,16 +2997,11 @@ class TurnRunner:
         )
         if metadata is not None:
             metadata["tool_profile"] = profile.value
-        known_skill_names: set[str] = set()
-        if self._skill_loader is not None:
-            try:
-                known_skill_names = {
-                    skill.name
-                    for skill in self._skill_loader.load_all()
-                    if not getattr(skill, "disable_model_invocation", False)
-                }
-            except Exception:
-                known_skill_names = set()
+        known_skill_names = {
+            skill.name
+            for skill in loaded_skills
+            if not getattr(skill, "disable_model_invocation", False)
+        }
         tool_handler = build_tool_handler(
             self._tool_registry,
             ctx,
@@ -3641,6 +3682,7 @@ class TurnRunner:
         session_intent: str | None = None,
         done_event: DoneEvent | None = None,
         trace_id: str | None = None,
+        skills_invoked: list[str] | None = None,
     ) -> None:
         """Write one DecisionEntry for this turn (best-effort, never raises).
 
@@ -3826,6 +3868,7 @@ class TurnRunner:
                 provider=provider_name,
                 latency_ms=latency_ms,
                 ts=ts,
+                skills_invoked=skills_invoked if skills_invoked is not None else [],
                 pipeline_steps=pipeline_steps,
                 savings=savings_telemetry,
                 system_chars=prompt_report.system_chars if prompt_report else 0,

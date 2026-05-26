@@ -56,7 +56,7 @@ from opensquilla.tools.types import (
 
 log = structlog.get_logger("opensquilla.tools.dispatch")
 
-__all__ = ["build_tool_handler"]
+__all__ = ["build_tool_handler", "preflight_tool_call"]
 
 _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
@@ -382,6 +382,49 @@ def _resolve_registry_miss(
         error_class_override="ToolNotFound",
         user_message_override=user_message,
     )
+
+
+async def preflight_tool_call(
+    *,
+    registry: ToolRegistry,
+    ctx: ToolContext | None,
+    tool_call: ToolCall,
+    known_skill_names: set[str] | frozenset[str] | None = None,
+) -> ToolResult | None:
+    """Return a denial envelope when a tool call fails dispatch preflight."""
+    known = frozenset(known_skill_names or ())
+
+    injection_envelope = _check_injection_guard(tool_call, ctx)
+    if injection_envelope is not None:
+        return injection_envelope
+
+    registered = registry.get(tool_call.tool_name)
+    if registered is None:
+        return _resolve_registry_miss(tool_call, known, ctx)
+
+    non_executable_arguments = _check_non_executable_arguments(tool_call, ctx)
+    if non_executable_arguments is not None:
+        return non_executable_arguments
+
+    dispatch_input = DispatchInput(
+        tool_call=tool_call,
+        ctx=ctx,
+        registered=registered,
+        known_skill_names=known,
+        registry=registry,
+    )
+
+    def _emit_policy_log(log_event: dict) -> None:
+        event = log_event.get("event", "dispatch.policy_block")
+        fields = {k: v for k, v in log_event.items() if k != "event"}
+        log.warning(event, **fields)
+
+    decision = run_chain_with_emit(dispatch_input, emit=_emit_policy_log)
+    if not decision.allowed:
+        if decision.envelope is None:
+            raise RuntimeError("PolicyCheck returned a denial without an envelope")
+        return decision.envelope
+    return None
 
 
 # ---------------------------------------------------------------------------

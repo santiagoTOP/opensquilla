@@ -10,6 +10,7 @@ import pytest
 from opensquilla.engine.types import AgentConfig, DoneEvent
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
+    _gateway_home,
     _register_dream_crons,
     _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
@@ -71,6 +72,25 @@ def test_compaction_time_budget_defaults_allow_long_chain_work() -> None:
     assert agent_config.flush_timeout_seconds == 15.0
     assert agent_config.flush_background_timeout_seconds == 120.0
     assert compaction_config.timeout_seconds == 90.0
+
+
+def test_gateway_home_uses_configured_state_parent(tmp_path: Path) -> None:
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "instance" / "state"),
+        workspace_dir=str(tmp_path / "instance" / "workspace"),
+    )
+
+    assert _gateway_home(config) == tmp_path / "instance"
+
+
+def test_gateway_home_falls_back_to_config_path_parent(tmp_path: Path) -> None:
+    config = GatewayConfig(
+        state_dir=None,
+        config_path=str(tmp_path / "service" / "config.toml"),
+        workspace_dir=str(tmp_path / "service" / "workspace"),
+    )
+
+    assert _gateway_home(config) == tmp_path / "service"
 
 
 class _FakeDreamScheduler:
@@ -227,6 +247,86 @@ async def test_start_gateway_server_shares_diagnostics_state_between_app_and_tur
         assert captured_runner["diagnostics_state"] is state
         state.set_runtime(enabled=True, raw=True)
         assert captured_runner["diagnostics_state"].raw_turn_call_enabled() is True
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_server_creates_default_subscription_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_bridge: dict[str, Any] = {}
+
+    class FakeTurnRunner:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def set_session_lock_provider(self, _provider: Any) -> None:
+            pass
+
+    class FakeEventBridge:
+        def __init__(self, *, subscription_manager: Any, connection_registry: Any) -> None:
+            captured_bridge["subscription_manager"] = subscription_manager
+            captured_bridge["connection_registry"] = connection_registry
+
+        async def emit(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    async def fake_build_services(**kwargs: Any) -> Any:
+        config = kwargs["config"]
+
+        async def close() -> None:
+            return None
+
+        return SimpleNamespace(
+            provider_selector=object(),
+            tool_registry=object(),
+            session_manager=object(),
+            skill_loader=object(),
+            usage_tracker=object(),
+            config=config,
+            memory_sync_managers={},
+            model_catalog=None,
+            memory_retrievers={},
+            turn_capture_services={},
+            flush_service=None,
+            cron_scheduler=None,
+            task_runtime=None,
+            agent_registry=None,
+            memory_managers={},
+            memory_stores={},
+            _turn_runner_ref=[],
+            close=close,
+        )
+
+    from opensquilla.gateway import boot
+    from opensquilla.gateway.websocket import SubscriptionManager
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.event_bridge.EventBridge", FakeEventBridge)
+    monkeypatch.setattr(boot, "build_services", fake_build_services)
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: None,
+    )
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+
+    server = await boot.start_gateway_server(config=config, run=False)
+
+    try:
+        assert isinstance(captured_bridge["subscription_manager"], SubscriptionManager)
     finally:
         await server.close()
 

@@ -12,6 +12,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -97,6 +98,8 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.terminal_reply import build_terminal_reply
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
+from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 from .context import ContextAssembly
 from .subagent import SubagentManager, SubagentSpec
@@ -136,6 +139,16 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
+
+_meta_invoke_depth: ContextVar[int] = ContextVar(
+    "opensquilla_meta_invoke_depth", default=0
+)
+_meta_invoke_turn_count: ContextVar[int] = ContextVar(
+    "opensquilla_meta_invoke_turn_count", default=0
+)
+
+MAX_META_INVOKE_DEPTH = 3
+MAX_META_INVOKE_PER_TURN = 8
 
 
 def _is_deepseek_model_id(model_id: str | None) -> bool:
@@ -555,6 +568,8 @@ class Agent:
         turn_call_logger: TurnCallLogger | None = None,
         memory_sync_manager: Any | None = None,
         session_flush_service: Any | None = None,
+        tool_registry: ToolRegistry | None = None,
+        tool_context: ToolContext | None = None,
     ) -> None:
         self.provider = provider
         self.config = config or AgentConfig()
@@ -565,6 +580,9 @@ class Agent:
         self._usage_tracker = usage_tracker
         self._session_key = session_key
         self._turn_call_logger = turn_call_logger
+        self._tool_registry: ToolRegistry | None = tool_registry
+        self._tool_context: ToolContext | None = tool_context
+        self._meta_run_writer = (self.config.metadata or {}).get("meta_run_writer")
         self._pending_warnings: list[WarningEvent] = []
 
         self._state: AgentState = AgentState.IDLE
@@ -1415,6 +1433,7 @@ class Agent:
                     if result.execution_status is not None
                     else None
                 ),
+                terminates_turn=result.terminates_turn,
             )
             self.config.metadata["tool_json_guard_applied"] = True
             self.config.metadata["tool_json_guard_calls"] = (
@@ -1491,6 +1510,70 @@ class Agent:
             is_error=result.is_error,
             artifacts=list(result.artifacts),
             execution_status=result.execution_status,
+            terminates_turn=result.terminates_turn,
+        )
+
+    def _tool_result_compression_mode(self) -> str:
+        mode = self.config.tool_result_compression_mode
+        if mode in {"off", "truncate", "summarize"}:
+            return mode
+        return "truncate" if self.config.tool_result_compression_enabled else "off"
+
+    def _tool_result_over_budget(self, text: str) -> bool:
+        budget_tokens = int(
+            self.config.context_window_tokens * self.config.tool_result_compression_max_share
+        )
+        return get_approx_tokens(text) > budget_tokens
+
+    async def _compress_tool_result(self, result: ToolResult) -> ToolResult:
+        """Compatibility wrapper for legacy compression callers.
+
+        The current runtime projects tool results with Tokenjuice. This helper
+        remains for embedded tests and callers that exercise the older
+        compression API directly.
+        """
+        guarded_content, guarded = _omit_large_json_tool_fields(result.content)
+        if guarded:
+            result = ToolResult(
+                tool_use_id=result.tool_use_id,
+                tool_name=result.tool_name,
+                content=guarded_content,
+                is_error=result.is_error,
+                artifacts=list(result.artifacts),
+                execution_status=(
+                    mark_execution_status_truncated(result.execution_status)
+                    if result.execution_status is not None
+                    else None
+                ),
+                terminates_turn=result.terminates_turn,
+            )
+        mode = self._tool_result_compression_mode()
+        if mode == "off" or not self._tool_result_over_budget(result.content):
+            return result
+
+        budget_tokens = int(
+            self.config.context_window_tokens * self.config.tool_result_compression_max_share
+        )
+        max_preview_chars = max(0, budget_tokens * 4)
+        compressed_content = compact_tool_result_content(
+            tool_name=result.tool_name,
+            content=result.content,
+            max_preview_chars=max_preview_chars,
+            budget_class=resolve_budget_class(result.tool_name),
+            is_error=result.is_error,
+        )
+        return ToolResult(
+            tool_use_id=result.tool_use_id,
+            tool_name=result.tool_name,
+            content=compressed_content,
+            is_error=result.is_error,
+            artifacts=list(result.artifacts),
+            execution_status=(
+                mark_execution_status_truncated(result.execution_status)
+                if result.execution_status is not None
+                else None
+            ),
+            terminates_turn=result.terminates_turn,
         )
 
     # ------------------------------------------------------------------
@@ -1552,6 +1635,8 @@ class Agent:
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
         self._provider_tool_result_overrides = {}
+        self._current_turn_message = message
+        _meta_invoke_turn_count.set(0)
 
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
@@ -2889,6 +2974,7 @@ class Agent:
                 # No tool calls → we're done
                 if not tool_calls:
                     break
+                tool_calls = [self._coerce_meta_skill_view_tool_call(tc) for tc in tool_calls]
 
                 tool_deadline = _loop.time() + self.config.iteration_timeout
 
@@ -3123,6 +3209,21 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
+                    if tc.tool_name == "meta_invoke":
+                        async for event in _flush_parallel_batch(parallel_batch):
+                            yield event
+                        parallel_batch = []
+                        active_ctx = (
+                            current_tool_context.get()
+                            or self._tool_context
+                            or ToolContext()
+                        )
+                        async for ev in self._run_one_streaming(tc, active_ctx):
+                            if isinstance(ev, ToolResult):
+                                results_by_id[tc.tool_use_id] = ev
+                            else:
+                                yield ev
+                        continue
                     policy = _get_tool_concurrency_policy(
                         tc.tool_name,
                         tc.arguments,
@@ -3199,7 +3300,7 @@ class Agent:
                         )
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
-                    if self._is_turn_yield_result(result):
+                    if self._is_turn_yield_result(result) or result.terminates_turn:
                         turn_yielded = True
                     tool_result_blocks.append(
                         ContentBlockToolResult(
@@ -4448,6 +4549,327 @@ class Agent:
             }:
                 self._tool_failure_loop_counts.clear()
         return result
+
+    def _coerce_meta_skill_view_tool_call(self, tc: ToolCall) -> ToolCall:
+        if tc.tool_name != "skill_view":
+            return tc
+        name = tc.arguments.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return tc
+        file_path = tc.arguments.get("file_path")
+        if file_path not in (None, "", "SKILL.md", "./SKILL.md"):
+            return tc
+
+        metadata = self.config.metadata or {}
+        skill_loader = metadata.get("skill_loader")
+        if skill_loader is None:
+            return tc
+        try:
+            skill_spec = skill_loader.get_by_name(name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent.meta_skill_view_coerce_failed", skill=name, error=str(exc))
+            return tc
+
+        if (
+            skill_spec is None
+            or getattr(skill_spec, "kind", "skill") != "meta"
+            or getattr(skill_spec, "disable_model_invocation", False)
+        ):
+            return tc
+
+        logger.info(
+            "agent.meta_skill_view_coerced",
+            skill=name,
+            tool_use_id=tc.tool_use_id,
+        )
+        return ToolCall(
+            tool_use_id=tc.tool_use_id,
+            tool_name="meta_invoke",
+            arguments={"name": name},
+            synthetic_from_text=tc.synthetic_from_text,
+            origin_trace=tc.origin_trace,
+        )
+
+    async def _run_one_streaming(
+        self,
+        tc: ToolCall,
+        tool_context: Any,
+    ) -> AsyncIterator[AgentEvent | ToolResult]:
+        """Stream a meta_invoke tool call inline and return a terminal ToolResult."""
+
+        import opensquilla.skills.creator  # noqa: F401
+        from opensquilla.skills.meta.inputs import make_meta_inputs
+        from opensquilla.skills.meta.orchestrator import (
+            MetaOrchestrator,
+            make_agent_runner_from_parent,
+            make_llm_chat_from_provider,
+            make_tool_invoker_from_handler,
+        )
+        from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
+        from opensquilla.skills.meta.types import MetaMatch, MetaResult
+        from opensquilla.tools.dispatch import preflight_tool_call
+        from opensquilla.tools.types import current_tool_context
+
+        current_depth = _meta_invoke_depth.get()
+        turn_count = _meta_invoke_turn_count.get()
+        if current_depth >= MAX_META_INVOKE_DEPTH:
+            yield ToolResult(
+                tool_use_id=tc.tool_use_id,
+                tool_name="meta_invoke",
+                content=(
+                    f"meta_invoke recursion depth limit reached "
+                    f"({MAX_META_INVOKE_DEPTH}); refusing nested call to "
+                    f"{tc.arguments.get('name', '<unknown>')!r}."
+                ),
+                is_error=True,
+                terminates_turn=False,
+            )
+            return
+        if turn_count >= MAX_META_INVOKE_PER_TURN:
+            yield ToolResult(
+                tool_use_id=tc.tool_use_id,
+                tool_name="meta_invoke",
+                content=(
+                    f"meta_invoke per-turn invocation limit reached "
+                    f"({MAX_META_INVOKE_PER_TURN})."
+                ),
+                is_error=True,
+                terminates_turn=False,
+            )
+            return
+
+        depth_token = _meta_invoke_depth.set(current_depth + 1)
+        try:
+            _meta_invoke_turn_count.set(turn_count + 1)
+            if self._tool_registry is None:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content="meta_invoke requires Agent to be constructed with tool_registry",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+
+            effective_ctx = current_tool_context.get() or tool_context
+            policy_err = await preflight_tool_call(
+                registry=self._tool_registry,
+                ctx=effective_ctx,
+                tool_call=tc,
+            )
+            if policy_err is not None:
+                yield policy_err
+                return
+
+            metadata = self.config.metadata or {}
+            skill_loader = metadata.get("skill_loader")
+            if skill_loader is None:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=(
+                        "meta_invoke unavailable: skill_loader missing from "
+                        "AgentConfig.metadata"
+                    ),
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+
+            workspace_dir = (
+                getattr(effective_ctx, "workspace_dir", None)
+                or metadata.get("bootstrap_workspace_dir")
+                or getattr(self.config, "workspace_dir", None)
+            )
+            name = tc.arguments.get("name")
+            if not isinstance(name, str) or not name:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content="meta_invoke requires a non-empty 'name' argument",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+
+            skill_spec = skill_loader.get_by_name(name)
+            if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=f"meta_invoke: {name!r} is not a registered meta-skill",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+            if getattr(skill_spec, "disable_model_invocation", False):
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=f"meta_invoke: {name!r} is not available for model invocation",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+
+            try:
+                plan = parse_meta_plan(skill_spec)
+            except MetaPlanError as exc:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=f"meta-skill {name!r} plan invalid: {exc}",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+            if plan is None:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=f"meta-skill {name!r} parsed to None",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+
+            runner = make_agent_runner_from_parent(
+                provider=self.provider,
+                base_config=self.config,
+                tool_definitions=self.tool_definitions,
+                tool_handler=self.tool_handler,
+                agent_factory=type(self),
+                workspace_dir=str(workspace_dir) if workspace_dir else None,
+                usage_tracker=self._usage_tracker,
+                session_key=self._session_key,
+            )
+            llm_chat = (
+                getattr(self, "_test_llm_chat_override", None)
+                or (
+                    make_llm_chat_from_provider(
+                        provider=self.provider,
+                        base_config=self.config,
+                        usage_tracker=self._usage_tracker,
+                        session_key=self._session_key,
+                    )
+                    if self.provider is not None
+                    else None
+                )
+            )
+            tool_invoker = (
+                make_tool_invoker_from_handler(tool_handler=self.tool_handler)
+                if self.tool_handler is not None
+                else None
+            )
+            memory_persist_enabled = True
+            orch = MetaOrchestrator(
+                agent_runner=runner,
+                skill_loader=skill_loader,
+                llm_chat=llm_chat,
+                tool_invoker=tool_invoker,
+                workspace_dir=str(workspace_dir) if workspace_dir else None,
+                run_writer=self._meta_run_writer,
+                triggered_by="soft_meta_invoke",
+                session_key=getattr(self, "_session_key", None),
+                turn_id=getattr(self, "_turn_id", None),
+                memory_persist_enabled=memory_persist_enabled,
+                usage_tracker=self._usage_tracker,
+            )
+
+            system_prompt = (
+                self._context.system_prompt
+                if self._context is not None
+                else self.config.system_prompt or ""
+            )
+            match = MetaMatch(
+                plan=plan,
+                inputs=make_meta_inputs(
+                    user_message=(
+                        getattr(self, "_current_turn_message", "")
+                        or metadata.get("user_message", "")
+                    ),
+                    system_prompt=system_prompt,
+                ),
+            )
+
+            result: MetaResult | None = None
+            try:
+                async for ev in orch.iter_events(match):
+                    if isinstance(ev, MetaResult):
+                        result = ev
+                    elif isinstance(ev, TextDeltaEvent):
+                        continue
+                    else:
+                        yield ev
+            except Exception as exc:  # noqa: BLE001
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=f"meta-skill {name!r} raised: {exc}",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+
+            if result is None:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content="orchestrator produced no MetaResult sentinel",
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
+            if not result.ok:
+                yield self._format_meta_invoke_failure(tc, result, plan)
+                return
+            if result.final_text:
+                yield TextDeltaEvent(text=result.final_text)
+            yield ToolResult(
+                tool_use_id=tc.tool_use_id,
+                tool_name="meta_invoke",
+                content=(
+                    f"meta-skill {name!r} completed; final answer streamed separately."
+                    if result.final_text
+                    else "(meta-skill completed with no output text)"
+                ),
+                is_error=False,
+                terminates_turn=True,
+            )
+        finally:
+            try:
+                _meta_invoke_depth.reset(depth_token)
+            except ValueError:
+                _meta_invoke_depth.set(current_depth)
+
+    def _format_meta_invoke_failure(
+        self,
+        tc: ToolCall,
+        result: Any,
+        plan: Any,
+    ) -> ToolResult:
+        per_step_cap = 1200
+        lines: list[str] = [
+            f"Meta-skill `{getattr(plan, 'name', '?')}` failed at step "
+            f"`{result.failed_step_id}`",
+            "",
+            f"Error: {result.error}",
+            "",
+            "Partial outputs:",
+        ]
+        for sid, text in (result.step_outputs or {}).items():
+            if sid == result.failed_step_id:
+                continue
+            snippet = text if len(text) <= per_step_cap else text[:per_step_cap] + "..."
+            lines.extend([f"- {sid}:", snippet, ""])
+        lines.append(f"Original meta-skill requested: {tc.arguments.get('name', '')}")
+        return ToolResult(
+            tool_use_id=tc.tool_use_id,
+            tool_name="meta_invoke",
+            content="\n".join(lines),
+            is_error=True,
+            terminates_turn=False,
+        )
 
     # ------------------------------------------------------------------
     # Subagent factory

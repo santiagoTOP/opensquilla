@@ -146,6 +146,7 @@ class DecisionEntry:
     session_flush_extraction_model: str | None = None
     session_flush_fallback_used: bool = False
     session_flush_fallback_reason: str | None = None
+    skills_invoked: list[str] = field(default_factory=list)
     pipeline_steps: list[PipelineStepRecord] = field(default_factory=list)
     savings: SavingsTelemetry = field(default_factory=SavingsTelemetry)
     schema_version: int = SCHEMA_VERSION

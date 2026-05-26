@@ -233,9 +233,13 @@ class AgentConfig:
     # bounded operator budgets for CI, benchmarks, and constrained runs.
     max_iterations: int = 0
     # Total turn wall-clock budget (seconds; 0 = disabled)
-    timeout: float = 300.0
+    # 30 min — see iteration_timeout note below; outer turn budget for
+    # meta-skill DAGs (paper-write / arxiv-deck run 5-7 min commonly).
+    timeout: float = 1800.0
     # Per-iteration timeout: one LLM call + its tool executions
-    iteration_timeout: float = 300.0
+    # 30 min — single iteration may be the whole meta DAG when the soft
+    # path treats meta_invoke as a single tool call.
+    iteration_timeout: float = 1800.0
     # HTTP-level timeout for a single LLM API request
     request_timeout: float = 120.0
     # Per-tool execution timeout
@@ -293,6 +297,15 @@ class AgentConfig:
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
+    # Legacy compression knobs remain as compatibility shims for meta_invoke
+    # tests and embedded callers; the runtime's default path uses Tokenjuice.
+    tool_result_compression_enabled: bool = True
+    tool_result_compression_mode: Literal["off", "truncate", "summarize"] | None = None
+    tool_result_compression_max_share: float = 0.25
+    tool_result_compression_summary_model: str | None = None
+    tool_result_compression_summary_max_tokens: int = 1024
+    tool_result_compression_summary_timeout_seconds: float = 20.0
+    tool_result_compression_summary_input_max_chars: int = 60_000
     tool_result_projection_max_inline_chars: int = 60_000
     tool_result_provider_request_max_chars: int = 0
     provider_request_proof_max_chars: int = 0
