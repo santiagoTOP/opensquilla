@@ -295,17 +295,8 @@ class AgentConfig:
     repair_max_items_per_tick: int = 5
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
-    # Tokenjuice projection: project eligible fresh tool results before the
-    # next LLM turn. This is not user-selectable behavior.
-    # Legacy compression knobs remain as compatibility shims for meta_invoke
-    # tests and embedded callers; the runtime's default path uses Tokenjuice.
-    tool_result_compression_enabled: bool = True
-    tool_result_compression_mode: Literal["off", "truncate", "summarize"] | None = None
-    tool_result_compression_max_share: float = 0.25
-    tool_result_compression_summary_model: str | None = None
-    tool_result_compression_summary_max_tokens: int = 1024
-    tool_result_compression_summary_timeout_seconds: float = 20.0
-    tool_result_compression_summary_input_max_chars: int = 60_000
+    # Tokenjuice projection canonicalizes tool results immediately after tool
+    # execution. Raw tool output is transient and is not persisted separately.
     tool_result_projection_max_inline_chars: int = 60_000
     tool_result_provider_request_max_chars: int = 0
     provider_request_proof_max_chars: int = 0
@@ -313,13 +304,6 @@ class AgentConfig:
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
     tool_failure_loop_block_threshold: int = 3
-    tool_result_store_dir: str | None = None
-    tool_result_store_session_id: str | None = None
-    tool_result_store_session_key: str | None = None
-    tool_result_store_agent_id: str | None = None
-    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
-    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
-    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:

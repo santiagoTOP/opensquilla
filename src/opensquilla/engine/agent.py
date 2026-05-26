@@ -37,11 +37,6 @@ from opensquilla.engine.session_sanitize import (
 )
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
-from opensquilla.engine.tool_result_store import (
-    ToolResultRecord,
-    ToolResultStore,
-    ToolResultStoreBudgetError,
-)
 from opensquilla.engine.tool_text_compat import strip_synthetic_tool_call_suffix
 from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx_tokens
 from opensquilla.execution_status import (
@@ -602,7 +597,6 @@ class Agent:
         self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
         self._tool_failure_loop_counts: dict[tuple[str, str], int] = {}
-        self._provider_tool_result_overrides: dict[str, ContentBlockToolResult] = {}
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
@@ -970,30 +964,20 @@ class Agent:
             return messages
 
         replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
-        stored_handles: list[str] = []
 
         for message_index, block_index, block, content, original_tokens in eligible_refs:
             if total_tool_result_tokens <= budget_tokens:
                 break
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            stored = self._store_tool_result_snapshot(
-                content,
-                tool_use_id=block.tool_use_id,
-                tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
-            )
-            if stored is not None:
-                stored_handles.append(stored.handle)
             head = content[:240]
             tail = content[-240:] if len(content) > 240 else ""
             omitted = max(0, len(content) - len(head) - len(tail))
-            handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
             compacted = (
                 "[aggregate_tool_result_compacted]\n"
                 f"tool_use_id: {block.tool_use_id}\n"
                 f"original_chars: {len(content)}\n"
                 f"original_tokens_estimate: {_tool_result_budget_tokens(content)}\n"
                 f"sha256: {digest}\n"
-                f"{handle_line}"
                 f"omitted_chars: {omitted}\n"
                 "reason: older non-error tool result compacted for provider context budget.\n"
                 f"head:\n{head}"
@@ -1080,7 +1064,6 @@ class Agent:
             "tool_aggregate_projection",
             original_tool_results=len(tool_result_refs),
             compacted_tool_results=len(replacements),
-            tool_result_handles=stored_handles,
             tokens_before=before_tokens,
             tokens_after=after_tokens,
         )
@@ -1235,12 +1218,6 @@ class Agent:
         if max_preview_chars > 0:
             max_preview_chars = max(1, min(max_preview_chars, 4_000))
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        stored = self._store_tool_result_snapshot(
-            content,
-            tool_use_id=tool_use_id,
-            tool_name=tool_name,
-        )
-        handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
         if max_preview_chars <= 0:
             head = ""
             tail = ""
@@ -1259,7 +1236,6 @@ class Agent:
             f"tool_use_id: {tool_use_id}\n"
             f"original_chars: {len(content)}\n"
             f"sha256: {digest}\n"
-            f"{handle_line}"
             f"omitted_chars: {omitted}\n"
             f"reason: {reason}.\n"
             f"head:\n{head}"
@@ -1357,64 +1333,16 @@ class Agent:
         )
         return sanitized_messages
 
-    def _store_tool_result_snapshot(
-        self,
-        content: str,
-        *,
-        tool_use_id: str,
-        tool_name: str,
-    ) -> ToolResultRecord | None:
-        if not self.config.tool_result_store_dir:
-            return None
-        session_id = self.config.tool_result_store_session_id or self._session_key
-        session_key = self.config.tool_result_store_session_key or self._session_key
-        agent_id = self.config.tool_result_store_agent_id
-        if not agent_id and session_key:
-            from opensquilla.session.keys import parse_agent_id
-
-            agent_id = parse_agent_id(session_key)
-        if not session_id or not session_key or not agent_id:
-            self.config.metadata["tool_result_store_skips"] = (
-                self.config.metadata.get("tool_result_store_skips", 0) + 1
-            )
-            return None
-        try:
-            record = ToolResultStore(self.config.tool_result_store_dir).write(
-                content,
-                tool_use_id=tool_use_id,
-                tool_name=tool_name,
-                session_id=session_id,
-                session_key=session_key,
-                agent_id=agent_id,
-                max_bytes=self.config.tool_result_store_max_bytes,
-                disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
-                retention_seconds=self.config.tool_result_store_retention_seconds,
-            )
-        except ToolResultStoreBudgetError as exc:
-            self.config.metadata["tool_result_store_skips"] = (
-                self.config.metadata.get("tool_result_store_skips", 0) + 1
-            )
-            logger.info(
-                "tool_result_store.skipped",
-                tool_use_id=tool_use_id,
-                tool_name=tool_name,
-                reason=str(exc),
-            )
-            return None
-        except Exception as exc:  # pragma: no cover - storage must not break turns
-            logger.warning(
-                "tool_result_store.write_failed",
-                tool_use_id=tool_use_id,
-                tool_name=tool_name,
-                error=str(exc),
-            )
-            return None
-        self.config.metadata["tool_result_store_writes"] = (
-            self.config.metadata.get("tool_result_store_writes", 0) + 1
+    def _fallback_tool_result_projection(self, result: ToolResult) -> str:
+        return self._tool_result_projection_for_provider(
+            content=result.content,
+            tool_use_id=result.tool_use_id,
+            tool_name=result.tool_name,
+            reason="tokenjuice returned no projection",
+            max_preview_chars=self._tokenjuice_max_inline_chars(),
         )
-        return record
 
-    async def _project_tool_result_for_llm(
+    async def _canonicalize_tool_result(
         self,
         result: ToolResult,
         *,
@@ -1452,6 +1380,13 @@ class Agent:
             command=self._tool_call_string_arg(tool_call, "command"),
             cwd=self._tool_call_string_arg(tool_call, "workdir", "cwd"),
         )
+        if projected_content is None and len(result.content) > self._tokenjuice_max_inline_chars():
+            projected_content = self._fallback_tool_result_projection(result)
+            self.config.metadata["tool_projection_backend"] = "bounded_fallback"
+            self.config.metadata["tool_projection_fallback_calls"] = (
+                self.config.metadata.get("tool_projection_fallback_calls", 0) + 1
+            )
+
         if projected_content is None:
             self.config.metadata["tool_projection_noops"] = (
                 self.config.metadata.get("tool_projection_noops", 0) + 1
@@ -1463,21 +1398,6 @@ class Agent:
                 original_chars=len(result.content),
             )
             return result
-
-        stored = self._store_tool_result_snapshot(
-            result.content,
-            tool_use_id=result.tool_use_id,
-            tool_name=result.tool_name,
-        )
-        stored_handle = stored.handle if stored is not None else None
-        if stored is not None:
-            projected_content = (
-                "[tool_result_projection]\n"
-                f"tool_result_handle: {stored.handle}\n"
-                f"sha256: {stored.sha256}\n"
-                f"original_chars: {stored.chars}\n"
-                f"{projected_content}"
-            )
 
         tokens_before = get_approx_tokens(result.content)
         tokens_after = get_approx_tokens(projected_content)
@@ -1499,7 +1419,6 @@ class Agent:
             "tool_projection_applied",
             tool_use_id=result.tool_use_id,
             name=result.tool_name,
-            tool_result_handle=stored_handle,
             original_chars=len(result.content),
             projected_chars=len(projected_content),
         )
@@ -1510,69 +1429,6 @@ class Agent:
             is_error=result.is_error,
             artifacts=list(result.artifacts),
             execution_status=result.execution_status,
-            terminates_turn=result.terminates_turn,
-        )
-
-    def _tool_result_compression_mode(self) -> str:
-        mode = self.config.tool_result_compression_mode
-        if mode in {"off", "truncate", "summarize"}:
-            return mode
-        return "truncate" if self.config.tool_result_compression_enabled else "off"
-
-    def _tool_result_over_budget(self, text: str) -> bool:
-        budget_tokens = int(
-            self.config.context_window_tokens * self.config.tool_result_compression_max_share
-        )
-        return get_approx_tokens(text) > budget_tokens
-
-    async def _compress_tool_result(self, result: ToolResult) -> ToolResult:
-        """Compatibility wrapper for legacy compression callers.
-
-        The current runtime projects tool results with Tokenjuice. This helper
-        remains for embedded tests and callers that exercise the older
-        compression API directly.
-        """
-        guarded_content, guarded = _omit_large_json_tool_fields(result.content)
-        if guarded:
-            result = ToolResult(
-                tool_use_id=result.tool_use_id,
-                tool_name=result.tool_name,
-                content=guarded_content,
-                is_error=result.is_error,
-                artifacts=list(result.artifacts),
-                execution_status=(
-                    mark_execution_status_truncated(result.execution_status)
-                    if result.execution_status is not None
-                    else None
-                ),
-                terminates_turn=result.terminates_turn,
-            )
-        mode = self._tool_result_compression_mode()
-        if mode == "off" or not self._tool_result_over_budget(result.content):
-            return result
-
-        budget_tokens = int(
-            self.config.context_window_tokens * self.config.tool_result_compression_max_share
-        )
-        max_preview_chars = max(0, budget_tokens * 4)
-        compressed_content = compact_tool_result_content(
-            tool_name=result.tool_name,
-            content=result.content,
-            max_preview_chars=max_preview_chars,
-            budget_class=resolve_budget_class(result.tool_name),
-            is_error=result.is_error,
-        )
-        return ToolResult(
-            tool_use_id=result.tool_use_id,
-            tool_name=result.tool_name,
-            content=compressed_content,
-            is_error=result.is_error,
-            artifacts=list(result.artifacts),
-            execution_status=(
-                mark_execution_status_truncated(result.execution_status)
-                if result.execution_status is not None
-                else None
-            ),
             terminates_turn=result.terminates_turn,
         )
 
@@ -1634,7 +1490,6 @@ class Agent:
         semantic_message: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
-        self._provider_tool_result_overrides = {}
         self._current_turn_message = message
         _meta_invoke_turn_count.set(0)
 
@@ -3247,18 +3102,18 @@ class Agent:
                 for tc in tool_calls:
                     result = results_by_id[tc.tool_use_id]
                     result_tool_call = tc
-                    for artifact in result.artifacts:
-                        yield ArtifactEvent(**_artifact_event_kwargs(artifact))
-                    yield ToolResultEvent(
-                        tool_use_id=result.tool_use_id,
-                        tool_name=result.tool_name,
-                        result=result.content,
-                        is_error=result.is_error,
-                        arguments=tc.arguments,
-                        execution_status=result.execution_status,
-                    )
                     pending_approval = _pending_approval_payload(result.content)
                     if pending_approval is not None and not tc.arguments.get("approval_id"):
+                        for artifact in result.artifacts:
+                            yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                        yield ToolResultEvent(
+                            tool_use_id=result.tool_use_id,
+                            tool_name=result.tool_name,
+                            result=result.content,
+                            is_error=result.is_error,
+                            arguments=tc.arguments,
+                            execution_status=result.execution_status,
+                        )
                         await _wait_for_pending_approval_resolution(
                             pending_approval,
                             timeout=_cap_timeout_by_deadlines(self._approval_wait_timeout()),
@@ -3274,30 +3129,22 @@ class Agent:
                         )
                         result = await _run_one(retry_call)
                         result_tool_call = retry_call
-                        for artifact in result.artifacts:
-                            yield ArtifactEvent(**_artifact_event_kwargs(artifact))
-                        yield ToolResultEvent(
-                            tool_use_id=result.tool_use_id,
-                            tool_name=result.tool_name,
-                            result=result.content,
-                            is_error=result.is_error,
-                            arguments=retry_arguments,
-                            execution_status=result.execution_status,
-                        )
-                    executed_results.append(result)
-                    projected_result = await self._project_tool_result_for_llm(
+
+                    result = await self._canonicalize_tool_result(
                         result,
                         tool_call=result_tool_call,
                     )
-                    if projected_result.content != result.content:
-                        self._provider_tool_result_overrides[result.tool_use_id] = (
-                            ContentBlockToolResult(
-                                tool_use_id=projected_result.tool_use_id,
-                                content=projected_result.content,
-                                is_error=projected_result.is_error,
-                                execution_status=projected_result.execution_status,
-                            )
-                        )
+                    for artifact in result.artifacts:
+                        yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                    yield ToolResultEvent(
+                        tool_use_id=result.tool_use_id,
+                        tool_name=result.tool_name,
+                        result=result.content,
+                        is_error=result.is_error,
+                        arguments=result_tool_call.arguments,
+                        execution_status=result.execution_status,
+                    )
+                    executed_results.append(result)
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
                     if self._is_turn_yield_result(result) or result.terminates_turn:
@@ -3538,44 +3385,10 @@ class Agent:
             runtime_context_message,
             runtime_context_insert_index,
         )
-        source_messages = self._apply_provider_tool_result_overrides(source_messages)
         source_messages = self._strip_provider_context_marker_replay_for_provider(source_messages)
         source_messages = self._compact_aggregate_tool_results_for_provider(source_messages)
         source_messages = self._sanitize_projected_tool_use_arguments_for_provider(source_messages)
         return sanitize_session_messages(source_messages)
-
-    def _apply_provider_tool_result_overrides(self, messages: list[Message]) -> list[Message]:
-        if not self._provider_tool_result_overrides:
-            return messages
-
-        projected: list[Message] = []
-        changed = False
-        for message in messages:
-            if not isinstance(message.content, list):
-                projected.append(message)
-                continue
-            blocks: list[Any] = []
-            message_changed = False
-            for block in message.content:
-                if isinstance(block, ContentBlockToolResult):
-                    override = self._provider_tool_result_overrides.get(block.tool_use_id)
-                    if override is not None:
-                        blocks.append(override)
-                        message_changed = True
-                        continue
-                blocks.append(block)
-            if message_changed:
-                projected.append(
-                    Message(
-                        role=message.role,
-                        content=blocks,
-                        reasoning_content=message.reasoning_content,
-                    )
-                )
-                changed = True
-            else:
-                projected.append(message)
-        return projected if changed else messages
 
     @staticmethod
     def _provider_request_is_smaller(before: list[Message], after: list[Message]) -> bool:
@@ -4961,13 +4774,6 @@ class Agent:
             tool_failure_loop_block_threshold=(self.config.tool_failure_loop_block_threshold),
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
             tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
-            tool_result_store_dir=self.config.tool_result_store_dir,
-            tool_result_store_session_id=self.config.tool_result_store_session_id,
-            tool_result_store_session_key=self.config.tool_result_store_session_key,
-            tool_result_store_agent_id=self.config.tool_result_store_agent_id,
-            tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
-            tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
-            tool_result_store_retention_seconds=(self.config.tool_result_store_retention_seconds),
         )
         return Agent(
             provider=self.provider,

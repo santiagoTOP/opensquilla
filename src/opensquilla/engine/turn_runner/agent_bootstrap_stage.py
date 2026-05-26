@@ -66,8 +66,6 @@ class _AgentConfigAuxiliaries:
 
     thinking: bool | ThinkingLevel
     flush_workspace_dir: str
-    tool_result_store_dir: str
-    tool_result_store_session_id: str
     # Memory-cfg-derived (defaults match the inline ``getattr`` defaults)
     flush_enabled: bool
     flush_timeout_seconds: float
@@ -79,9 +77,6 @@ class _AgentConfigAuxiliaries:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"]
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
-    tool_result_store_max_bytes: int
-    tool_result_store_disk_budget_bytes: int
-    tool_result_store_retention_seconds: int
 
 @dataclass(frozen=True)
 class _MemorySnapshotResult:
@@ -143,9 +138,8 @@ class AgentConfigBuilderPort(Protocol):
     """Wraps the ``TurnRunner`` helpers AgentConfig assembly needs.
 
     The inline body calls ``_resolve_turn_thinking(turn)``,
-    ``_resolve_memory_source_dir(agent_id)``, and reads
-    ``media_root_from_config(self._config) / "tool-results"`` plus a
-    handful of ``getattr`` reads off ``_mem_cfg`` / ``_agent_token_cfg``.
+    ``_resolve_memory_source_dir(agent_id)``, and reads a handful of
+    ``getattr`` values off ``_mem_cfg`` / ``_agent_token_cfg``.
 
     Folding them into a single port keeps the stage body free of
     runtime imports. The adapter returns a typed
@@ -319,8 +313,7 @@ class AgentBootstrapStage:
     - ``model_catalog.lookup`` — synchronous catalog dict lookups; pure.
     - ``agent_config_builder.build_auxiliaries`` — synchronous reads of
       ``_mem_cfg`` / ``_agent_token_cfg`` plus
-      ``_resolve_memory_source_dir`` filesystem path resolution and
-      ``media_root_from_config`` path build. Idempotent.
+      ``_resolve_memory_source_dir`` filesystem path resolution.
     - ``memory_snapshot.warm_and_capture`` — async; calls
       ``sync_manager.warm_session`` (transcript-driven preload) and
       mutates ``self._memory_snapshots`` dict.
@@ -418,17 +411,6 @@ class AgentBootstrapStage:
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(
                 aux.tool_result_projection_max_inline_chars
-            ),
-            tool_result_store_dir=aux.tool_result_store_dir,
-            tool_result_store_session_id=aux.tool_result_store_session_id,
-            tool_result_store_session_key=inp.session_key,
-            tool_result_store_agent_id=inp.agent_id,
-            tool_result_store_max_bytes=aux.tool_result_store_max_bytes,
-            tool_result_store_disk_budget_bytes=(
-                aux.tool_result_store_disk_budget_bytes
-            ),
-            tool_result_store_retention_seconds=(
-                aux.tool_result_store_retention_seconds
             ),
             metadata=agent_metadata,
         )

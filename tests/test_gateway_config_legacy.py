@@ -171,9 +171,6 @@ def test_load_migrates_legacy_agent_token_saving_fields(tmp_path: Path) -> None:
     cfg = GatewayConfig.load(toml_path)
 
     assert cfg.agent_token_saving.tool_result_projection_max_inline_chars == 43210
-    assert cfg.agent_token_saving.tool_result_store_max_bytes == 1234
-    assert cfg.agent_token_saving.tool_result_store_disk_budget_bytes == 5678
-    assert cfg.agent_token_saving.tool_result_store_retention_seconds == 90
     backups = sorted(tmp_path.glob("config.toml.backup.*"))
     assert backups
     backup_text = backups[-1].read_text(encoding="utf-8")
@@ -181,7 +178,7 @@ def test_load_migrates_legacy_agent_token_saving_fields(tmp_path: Path) -> None:
     migrated = toml_path.read_text(encoding="utf-8")
     assert "tool_result_compression_" not in migrated
     assert "tool_result_projection_max_inline_chars = 43210" in migrated
-    assert "tool_result_store_max_bytes = 1234" in migrated
+    assert "tool_result_store_" not in migrated
 
 
 def test_legacy_agent_token_saving_migration_preserves_new_projection_setting(

@@ -64,6 +64,9 @@ DEPRECATED_AGENT_TOKEN_SAVING_FIELDS: frozenset[str] = frozenset(
         "agent_token_saving.tool_result_compression_summary_max_tokens",
         "agent_token_saving.tool_result_compression_summary_timeout_seconds",
         "agent_token_saving.tool_result_compression_summary_input_max_chars",
+        "agent_token_saving.tool_result_store_max_bytes",
+        "agent_token_saving.tool_result_store_disk_budget_bytes",
+        "agent_token_saving.tool_result_store_retention_seconds",
     }
 )
 DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(

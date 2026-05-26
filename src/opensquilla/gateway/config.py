@@ -946,9 +946,6 @@ class AgentTokenSavingConfig(BaseSettings):
 
     # Tokenjuice projection is the default tool-result path.
     tool_result_projection_max_inline_chars: int = Field(default=60_000, ge=1000)
-    tool_result_store_max_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
-    tool_result_store_disk_budget_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
-    tool_result_store_retention_seconds: int = Field(default=7 * 24 * 60 * 60, ge=0)
 
 
 class CompactionLlmConfig(BaseSettings):

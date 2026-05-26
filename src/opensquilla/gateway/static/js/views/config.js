@@ -47,7 +47,7 @@ const ConfigView = (() => {
     'log_file_backup_count':
       'Number of rotated debug.log backups to retain.',
     'agent_token_saving.tool_result_projection_max_inline_chars':
-      'Maximum inline size for tokenjuice tool-result projections before they are fed back to the model. Raw tool output is preserved separately when storage is available.',
+      'Maximum inline size for canonical tokenjuice tool-result projections. Raw tool output is transient and is not stored.',
     'squilla_router.enabled':
       'Turn the ML-powered tier router on or off. When off, every request uses the default model regardless of complexity.',
     'squilla_router.rollout_phase':

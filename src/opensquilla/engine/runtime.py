@@ -2175,12 +2175,6 @@ class TurnRunner:
                         "tool_projection_tokens_saved": int(
                             turn.metadata.get("tool_projection_tokens_saved", 0) or 0
                         ),
-                        "tool_result_store_writes": int(
-                            turn.metadata.get("tool_result_store_writes", 0) or 0
-                        ),
-                        "tool_result_store_skips": int(
-                            turn.metadata.get("tool_result_store_skips", 0) or 0
-                        ),
                     },
                 )
 
@@ -3760,14 +3754,6 @@ class TurnRunner:
                 )
                 savings_telemetry.tool_projection_tokens_saved = metadata.get(
                     "tool_projection_tokens_saved",
-                    0,
-                )
-                savings_telemetry.tool_result_store_writes = metadata.get(
-                    "tool_result_store_writes",
-                    0,
-                )
-                savings_telemetry.tool_result_store_skips = metadata.get(
-                    "tool_result_store_skips",
                     0,
                 )
 
