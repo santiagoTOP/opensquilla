@@ -68,7 +68,7 @@ async def test_meta_invoke_handler_raises_routing_error() -> None:
 
 # ---------------------------------------------------------------------------
 # Task 3: ToolResult.terminates_turn field + preservation through
-# Agent._compress_tool_result rebuild sites.
+# Agent._canonicalize_tool_result rebuild sites.
 # ---------------------------------------------------------------------------
 
 
@@ -86,24 +86,32 @@ def test_tool_result_has_terminates_turn_field() -> None:
 
 
 class _NullProvider:
-    """Minimal LLMProvider stand-in: never called by _compress_tool_result."""
+    """Minimal LLMProvider stand-in: never called by tool-result canonicalization."""
 
     provider_name = "null"
 
     def chat(self, *args: object, **kwargs: object) -> object:  # pragma: no cover
-        raise AssertionError("provider.chat must not be called by _compress_tool_result")
+        raise AssertionError("provider.chat must not be called by tool-result canonicalization")
 
     async def list_models(self) -> list[object]:  # pragma: no cover
         return []
 
 
 @pytest.mark.asyncio
-async def test_compress_tool_result_preserves_terminates_turn_when_short() -> None:
-    """When content is short enough to not need compression, the rebuild
-    must still carry terminates_turn through."""
+async def test_canonicalize_tool_result_preserves_terminates_turn_when_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When tokenjuice leaves content unchanged, terminates_turn must survive."""
+    import opensquilla.engine.agent as agent_mod
     from opensquilla.engine import Agent, AgentConfig
     from opensquilla.tool_boundary import ToolResult
 
+    monkeypatch.setattr(
+        agent_mod,
+        "reduce_tool_result_with_tokenjuice",
+        lambda **kwargs: None,
+        raising=False,
+    )
     agent = Agent(provider=_NullProvider(), config=AgentConfig())
 
     original = ToolResult(
@@ -113,26 +121,26 @@ async def test_compress_tool_result_preserves_terminates_turn_when_short() -> No
         is_error=False,
         terminates_turn=True,
     )
-    compressed = await agent._compress_tool_result(original)
-    assert compressed.terminates_turn is True
+    canonical = await agent._canonicalize_tool_result(original)
+    assert canonical.terminates_turn is True
 
 
 @pytest.mark.asyncio
-async def test_compress_tool_result_preserves_terminates_turn_when_compressed() -> None:
-    """When content IS large enough to trigger compression, the rebuild
-    must STILL carry terminates_turn through (the other code path)."""
+async def test_canonicalize_tool_result_preserves_terminates_turn_when_projected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When canonicalization rebuilds the result, terminates_turn must survive."""
+    import opensquilla.engine.agent as agent_mod
     from opensquilla.engine import Agent, AgentConfig
     from opensquilla.tool_boundary import ToolResult
 
-    # Shrink context_window_tokens so 50_000 chars (~12500 tokens) exceeds
-    # the compression budget (context_window_tokens * max_share = 1000 * 0.25
-    # = 250 tokens). truncate mode keeps compression purely local — no
-    # provider call needed.
-    config = AgentConfig(
-        context_window_tokens=1000,
-        tool_result_compression_enabled=True,
-        tool_result_compression_mode="truncate",
+    monkeypatch.setattr(
+        agent_mod,
+        "reduce_tool_result_with_tokenjuice",
+        lambda **kwargs: None,
+        raising=False,
     )
+    config = AgentConfig(tool_result_projection_max_inline_chars=1000)
     agent = Agent(provider=_NullProvider(), config=config)
 
     big_content = "x" * 50_000
@@ -143,15 +151,13 @@ async def test_compress_tool_result_preserves_terminates_turn_when_compressed() 
         is_error=False,
         terminates_turn=True,
     )
-    compressed = await agent._compress_tool_result(original)
-    # Sanity-check the compression path actually fired (content shrunk).
-    assert len(compressed.content) < len(big_content), (
-        "test setup error: compression did not trigger; "
-        "second rebuild site would not be exercised"
+    canonical = await agent._canonicalize_tool_result(original)
+    assert len(canonical.content) < len(big_content), (
+        "test setup error: fallback projection did not trigger"
     )
     # The FLAG must survive the rebuild.
-    assert compressed.terminates_turn is True, (
-        "terminates_turn lost during ToolResult compression rebuild"
+    assert canonical.terminates_turn is True, (
+        "terminates_turn lost during ToolResult canonicalization rebuild"
     )
 
 

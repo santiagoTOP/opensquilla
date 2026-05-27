@@ -46,6 +46,15 @@ _ALL_DEPRECATED_MEMORY_FIELDS = {
 }
 
 
+def test_explicit_missing_config_path_stays_attached_to_defaults(tmp_path: Path) -> None:
+    target = tmp_path / "new-user-config.toml"
+
+    cfg = GatewayConfig.load(target)
+
+    assert cfg.config_path == str(target)
+    assert not target.exists()
+
+
 def _build_toml_with_deprecated(tmp_path: Path) -> Path:
     """Write a minimal config.toml that contains all deprecated fields."""
     lines = ["[memory]\n"]
@@ -171,9 +180,6 @@ def test_load_migrates_legacy_agent_token_saving_fields(tmp_path: Path) -> None:
     cfg = GatewayConfig.load(toml_path)
 
     assert cfg.agent_token_saving.tool_result_projection_max_inline_chars == 43210
-    assert cfg.agent_token_saving.tool_result_store_max_bytes == 1234
-    assert cfg.agent_token_saving.tool_result_store_disk_budget_bytes == 5678
-    assert cfg.agent_token_saving.tool_result_store_retention_seconds == 90
     backups = sorted(tmp_path.glob("config.toml.backup.*"))
     assert backups
     backup_text = backups[-1].read_text(encoding="utf-8")
@@ -181,7 +187,7 @@ def test_load_migrates_legacy_agent_token_saving_fields(tmp_path: Path) -> None:
     migrated = toml_path.read_text(encoding="utf-8")
     assert "tool_result_compression_" not in migrated
     assert "tool_result_projection_max_inline_chars = 43210" in migrated
-    assert "tool_result_store_max_bytes = 1234" in migrated
+    assert "tool_result_store_" not in migrated
 
 
 def test_legacy_agent_token_saving_migration_preserves_new_projection_setting(

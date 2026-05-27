@@ -17,8 +17,10 @@ LINT = _LINTER_DIR / "scripts" / "lint.py"
 def _run_lint(skill_md: str, gates: str = "G1,G2") -> dict:
     proc = subprocess.run(
         [sys.executable, str(LINT), "--gates", gates, "--skill-md-stdin"],
-        input=skill_md, capture_output=True, text=True,
+        input=skill_md, capture_output=True, text=True, encoding="utf-8",
     )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, proc.stderr
     return json.loads(proc.stdout)
 
 
@@ -49,6 +51,15 @@ composition:
 
 def test_g1_passes_on_valid_p1() -> None:
     out = _run_lint(VALID_P1)
+    assert out["G1"]["passed"] is True
+
+
+def test_g1_accepts_utf8_stdin_with_localized_trigger() -> None:
+    localized = VALID_P1.replace(
+        '  - "lint test trigger"',
+        '  - "处理 PDF — 质量门"',
+    )
+    out = _run_lint(localized)
     assert out["G1"]["passed"] is True
 
 
@@ -147,7 +158,7 @@ def test_linter_passes_existing_meta_bundle(bundle: str) -> None:
     """Regression: linter must accept every existing kind=meta bundle.
     Catches over-strict lint rules."""
     skill_path = REPO / "src" / "opensquilla" / "skills" / "bundled" / bundle / "SKILL.md"
-    skill_md = skill_path.read_text()
+    skill_md = skill_path.read_text(encoding="utf-8")
     out = _run_lint(skill_md)
     assert out["G1"]["passed"] is True, f"{bundle} G1 fail: {out['G1']['diagnostics']}"
     assert out["G2"]["passed"] is True, f"{bundle} G2 fail: {out['G2']['diagnostics']}"

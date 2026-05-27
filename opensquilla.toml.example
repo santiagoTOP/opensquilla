@@ -241,13 +241,9 @@ thinking_level = "medium"
 # tier_profile = "dashscope"
 
 [agent_token_saving]
-# Project fresh tool results with the built-in tokenjuice reducer before they
-# are fed back into the model. Raw tool responses remain available through the
-# tool-result store when configured by the gateway runtime.
+# Canonicalize tool results with the built-in tokenjuice reducer immediately
+# after tool execution. Raw tool responses are transient and are not stored.
 tool_result_projection_max_inline_chars = 60000
-tool_result_store_max_bytes = 8388608
-tool_result_store_disk_budget_bytes = 268435456
-tool_result_store_retention_seconds = 604800
 
 [compaction]
 enabled = true
