@@ -165,6 +165,9 @@ def test_paper_meta_skill_has_pre_compile_quality_gates(tmp_path: Path) -> None:
 
     assert {
         "final_manuscript_package",
+        "persist_sections",
+        "assemble_manuscript_tex",
+        "citation_map",
         "paper_length_gate",
         "citation_integrity_gate",
         "latex_sanitizer",
@@ -172,46 +175,59 @@ def test_paper_meta_skill_has_pre_compile_quality_gates(tmp_path: Path) -> None:
     } <= ids
 
 
-def test_paper_meta_skill_uses_compact_default_manuscript_path(
+def test_paper_meta_skill_uses_full_pdf_default_with_clarification(
     tmp_path: Path,
 ) -> None:
     loader = _loader(tmp_path)
     _assert_composes_at_least_two_skills(loader, "meta-paper-write")
     steps, plan = _steps_by_id(loader, "meta-paper-write")
 
-    assert plan.final_text_mode == "step:final_manuscript_package"
-    # PR8 follow-up migration: paper_mode (llm_classify) was replaced
-    # with paper_collect (user_input) so the user picks the mode rather
-    # than letting the LLM guess from a single sentence.
-    assert steps["paper_collect"].kind == "user_input"
-    paper_collect_cfg = steps["paper_collect"].clarify_config
-    assert paper_collect_cfg is not None
-    mode_field = next(
-        f for f in paper_collect_cfg.fields if f.name == "paper_mode"
+    assert plan.final_text_mode == "step:deliver_paper"
+    assert steps["paper_collect"].kind == "llm_chat"
+    assert steps["paper_collect"].clarify_config is None
+    assert steps["paper_clarify"].kind == "user_input"
+    assert steps["paper_clarify"].when == (
+        "'NEEDS_CLARIFICATION: yes' in outputs.paper_collect"
     )
-    assert mode_field.type == "enum"
-    assert set(mode_field.choices) == {
-        "FULL_MANUSCRIPT",
-        "COMPACT_SKELETON",
-        "REPAIR_EXISTING",
-        "COMPILE_ONLY",
-    }
+    assert steps["paper_contract"].kind == "llm_chat"
+    assert steps["paper_contract"].depends_on == ("paper_collect", "paper_clarify")
+    paper_collect_prompt = str(steps["paper_collect"].with_args)
+    assert "NEEDS_CLARIFICATION" in paper_collect_prompt
+    assert "FULL_MANUSCRIPT by default" in paper_collect_prompt
+    assert "TARGET_PAGES" in paper_collect_prompt
+    assert "CITATION_TARGET" in paper_collect_prompt
+    assert "MISSING_FIELDS" in paper_collect_prompt
+    raw = str(loader.get_by_name("meta-paper-write").composition_raw)
+    assert "inputs.collected.paper_collect" not in raw
     # Pipeline rewrite: experiment/plot (skill_exec stubs producing fake
     # CSV + matplotlib chart) replaced with 4 LLM steps that design the
     # experiments and emit LaTeX placeholder figures/tables/analysis.
     assert "experiment" not in steps
     assert "plot" not in steps
     assert steps["experiment_design"].when == (
-        "inputs.collected.paper_collect.paper_mode in "
-        "('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+        "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or "
+        "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
     )
     assert steps["figure_placeholders"].when == steps["experiment_design"].when
     assert steps["table_placeholders"].when == steps["experiment_design"].when
     assert steps["analysis_outline"].when == steps["experiment_design"].when
     assert steps["compile_latex"].when == (
-        "inputs.collected.paper_collect.paper_mode == 'COMPILE_ONLY'"
+        "'PAPER_MODE: COMPILE_ONLY' in outputs.paper_contract"
     )
+    assert steps["writing_plan"].when == (
+        "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
+    )
+    assert steps["compile_pdf"].when == (
+        "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or "
+        "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or "
+        "'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
+    )
+    assert steps["publish_pdf"].when == steps["compile_pdf"].when
+    assert steps["deliver_paper"].when == steps["compile_pdf"].when
+    compile_prompt = str(steps["compile_pdf"].tool_args)
+    assert "refusing to create degraded PDF" in compile_prompt
     for step_id in (
+        "paper_contract",
         "paper_preferences",
         "source_pack",
         "experiment_design",
@@ -221,29 +237,77 @@ def test_paper_meta_skill_uses_compact_default_manuscript_path(
         "outline",
         "citation_plan",
         "final_manuscript_package",
-        "citation_map",
-        "paper_length_gate",
         "citation_integrity_gate",
         "latex_sanitizer",
         "compile_latex",
     ):
         assert steps[step_id].kind == "llm_chat", step_id
+    for step_id in (
+        "persist_sections",
+        "assemble_manuscript_tex",
+        "citation_map",
+        "paper_length_gate",
+        "compile_pdf",
+    ):
+        assert steps[step_id].kind == "tool_call", step_id
+    for step_id in (
+        "section_abstract",
+        "section_introduction",
+        "section_related_work",
+        "section_method",
+        "section_experiments",
+        "section_discussion",
+        "section_conclusion",
+    ):
+        assert steps[step_id].kind == "agent", step_id
+        assert steps[step_id].skill == "paper-section-author", step_id
     for step_id in ("search_papers", "refbib"):
         assert steps[step_id].kind == "skill_exec"
+    assert steps["persist_sections"].depends_on == (
+        "section_abstract",
+        "section_introduction",
+        "section_related_work",
+        "section_method",
+        "section_experiments",
+        "section_discussion",
+        "section_conclusion",
+    )
+    assert steps["assemble_manuscript_tex"].depends_on == (
+        "writing_plan", "persist_sections", "refbib",
+    )
     assert steps["compile_latex"].depends_on == ("latex_sanitizer",)
     # New citation-provenance contract — the manuscript prompt must
     # carry the strict "do not invent cite keys" instructions.
     final_prompt = str(steps["final_manuscript_package"].with_args)
     assert "DO NOT invent cite keys" in final_prompt
     assert "verbatim in REFERENCES_BIB" in final_prompt
+    assert "MANUSCRIPT_PLAN" in final_prompt
+    assert "REFERENCE_PLACEHOLDERS" in final_prompt
+    assert "TARGET_LENGTH_EXPANSION_PLAN" in final_prompt
+    assert "Limitations" in final_prompt
+    assert "Threats to Validity" in final_prompt
+    assert "references are safer than fabricated BibTeX" in final_prompt
+    assert "put the plan and expansion plan before the LaTeX skeleton" in final_prompt
+    assert "keep MANUSCRIPT_TEX under 2,500 words" in final_prompt
+    assert "\\documentclass" in final_prompt
+    assert "\\begin{document}" in final_prompt
     assert "figure_placeholders" in final_prompt
     assert "table_placeholders" in final_prompt
     assert "analysis_outline" in final_prompt
+    assert "CITATION_STRATEGY" in final_prompt
     # citation_map step exposes the per-key audit table.
-    citation_map_prompt = str(steps["citation_map"].with_args)
+    persist_prompt = str(steps["persist_sections"].tool_args)
+    assert "SECTION_ARTIFACTS" in persist_prompt
+    assert "CONTEXT_POLICY" in persist_prompt
+    assemble_prompt = str(steps["assemble_manuscript_tex"].tool_args)
+    assert "MANUSCRIPT_PATH" in assemble_prompt
+    assert "full manuscript persisted on disk" in assemble_prompt
+    citation_map_prompt = str(steps["citation_map"].tool_args)
     assert "Source Quality" in citation_map_prompt
     assert "INVALID" in citation_map_prompt
     assert "STRONG" in citation_map_prompt
+    length_prompt = str(steps["paper_length_gate"].tool_args)
+    assert "artifact-only length check" in length_prompt
 
 
 def test_pdf_intelligence_preserves_traceable_multi_document_structure(

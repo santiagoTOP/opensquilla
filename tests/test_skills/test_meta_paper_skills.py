@@ -70,9 +70,23 @@ def test_meta_paper_write_declares_long_paper_generation_contract() -> None:
     assert "{{ with.max_results | default(25) }}" in search
     assert "10+ page" in outline
     assert "20+ distinct citation keys" in outline
-    assert "10+ compiled pages" in section
-    assert "at least 20 distinct citation keys" in section
+    assert "writing-plan-derived" in section
+    assert "Do not impose a fixed page count" in section
+    assert "Write only the assigned section" in section
+    assert "repeated context compaction" in section
+    assert "related_work" in section
+    assert "conclusion" in section
+    assert "Do not call tools" in section
+    assert "organize by methodology or claim axis" in section
+    assert "no invented results" in section
     assert "{{ outputs.refbib | truncate(8000) }}" in meta
+
+
+def test_paper_section_author_preserves_math_delimiters() -> None:
+    section = (BUNDLED / "paper-section-author" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Do NOT escape math delimiter dollars" in section
+    assert "\\( ... \\)" in section
 
 
 def test_meta_paper_write_declares_quality_pipeline_stages() -> None:
@@ -100,10 +114,23 @@ def test_meta_paper_write_declares_quality_pipeline_stages() -> None:
     assert "DO NOT invent cite keys" in meta
     assert "Source Quality" in meta
     # Quality bar / mode behavior.
-    assert "10+ compiled pages" in meta
-    assert "20 distinct citation keys" in meta
-    assert "Do not run xelatex in the" in meta
-    assert "default meta-skill path" in meta
+    assert "CITATION_TARGET" in meta
+    assert "LENGTH_STRATEGY" in meta
+    assert "do not enforce a fixed count" in meta
+    assert "default FULL_MANUSCRIPT" in meta
+    assert "compiled PDF" in meta
+    assert "refuses to create degraded PDF" in meta
+
+
+def test_meta_paper_write_enforces_user_requested_page_target() -> None:
+    meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "TARGET_PAGES:" in meta
+    assert "MIN_TARGET_PAGES" in meta
+    assert "LENGTH_GATE: fail" in meta
+    assert "sys.exit(1)" in meta
+    assert "PDF_PAGE_TARGET_NOT_MET" in meta
+    assert "minimum total target_words" in meta
 
 
 def test_paper_preference_planner_declares_two_generation_modes() -> None:

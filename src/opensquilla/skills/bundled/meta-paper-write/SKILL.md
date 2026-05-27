@@ -26,13 +26,53 @@ metadata:
 composition:
   steps:
     - id: paper_collect
+      kind: llm_chat
+      with:
+        system: "You extract paper requirements and decide whether clarification is required."
+        task: |
+          Extract a structured paper brief from the original user request.
+          Do NOT ask a question in this step. Instead, mark
+          NEEDS_CLARIFICATION: yes when any required field is missing,
+          ambiguous, or only guessable. The next paper_clarify step will
+          ask the user for missing information.
+
+          Mode defaults:
+          - Use FULL_MANUSCRIPT by default. Quality is preferred over the
+            compact fast path.
+          - Use COMPACT_SKELETON only when the user explicitly asks for a
+            short skeleton, outline, or compact draft.
+          - Use REPAIR_EXISTING only when the user provides or references an
+            existing manuscript to fix.
+          - Use COMPILE_ONLY only when the user explicitly asks only to compile
+            an existing LaTeX manuscript.
+
+          Required fields for a complete paper contract:
+          topic, paper_mode, language, target_pages, audience.
+
+          Original user request:
+          {{ inputs.user_message | xml_escape | truncate(1400) }}
+
+          Return exactly:
+          TOPIC: <paper topic, or MISSING_TOPIC>
+          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON|REPAIR_EXISTING|COMPILE_ONLY>
+          LANGUAGE: <en|zh|ja|other>
+          TARGET_PAGES: <integer 1-50, or MISSING_TARGET_PAGES>
+          AUDIENCE: <academic|technical|business|general>
+          CITATION_TARGET: <integer if user explicitly requested one, otherwise AUTO>
+          NEEDS_CLARIFICATION: <yes|no>
+          MISSING_FIELDS:
+            - <field name, or none>
+          CLARIFY_QUESTION: <single concise question if NEEDS_CLARIFICATION is yes, otherwise none>
+          ASSUMPTIONS:
+            - <assumption or none>
+    - id: paper_clarify
       kind: user_input
+      depends_on: [paper_collect]
+      when: "'NEEDS_CLARIFICATION: yes' in outputs.paper_collect"
       clarify:
         mode: form
         intro: |
-          开始之前，请确认 5 件事 —— 我会用它生成完整论文 / Before drafting,
-          please confirm 5 items — I'll use them to generate the manuscript.
-        skip_if: "inputs.collected.paper_collect is defined"
+          论文信息还不完整。请补齐下面字段，我会优先生成完整论文并输出 PDF。
         nl_extract: true
         fields:
           - name: topic
@@ -42,24 +82,24 @@ composition:
             max_chars: 200
           - name: paper_mode
             type: enum
-            required: true
             choices:
               - FULL_MANUSCRIPT
               - COMPACT_SKELETON
               - REPAIR_EXISTING
               - COMPILE_ONLY
-            prompt: "类型 / Mode (FULL_MANUSCRIPT=10+页完整稿; COMPACT_SKELETON=骨架; REPAIR_EXISTING=修复; COMPILE_ONLY=只编译)"
+            default: FULL_MANUSCRIPT
+            prompt: "类型 / Mode (默认 FULL_MANUSCRIPT=完整论文+PDF)"
           - name: language
             type: enum
+            required: true
             choices: [en, zh, ja, other]
-            default: en
             prompt: "语言 / Language"
           - name: target_length_pages
             type: int
             min: 1
             max: 50
             default: 10
-            prompt: "目标页数 / Target pages (1–50)"
+            prompt: "目标页数 / Target pages (1-50)"
           - name: audience
             type: enum
             choices: [academic, technical, business, general]
@@ -67,36 +107,67 @@ composition:
             prompt: "受众 / Audience"
         cancel_keywords: ["算了", "取消", "cancel", "stop", "abort"]
         timeout_hours: 24
+    - id: paper_contract
+      kind: llm_chat
+      depends_on: [paper_collect, paper_clarify]
+      with:
+        system: "You merge extracted paper requirements and clarification answers into the final paper contract."
+        task: |
+          Build the final paper contract. Prefer explicit clarification
+          answers over the first-pass extraction. If clarification is empty,
+          use only confidently extracted values. Do not invent missing topic.
+
+          First-pass extraction:
+          {{ outputs.paper_collect | truncate(1200) }}
+
+          Clarification answers (may be empty when not needed):
+          {{ inputs.get('collected', {}).get('paper_clarify', {}) | tojson }}
+
+          Original user request:
+          {{ inputs.user_message | xml_escape | truncate(1200) }}
+
+          Return exactly:
+          TOPIC: <resolved topic>
+          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON|REPAIR_EXISTING|COMPILE_ONLY>
+          LANGUAGE: <en|zh|ja|other>
+          TARGET_PAGES: <integer 1-50>
+          AUDIENCE: <academic|technical|business|general>
+          CITATION_TARGET: <integer if explicitly requested, otherwise AUTO>
+          PDF_REQUIRED: yes
+          ASSUMPTIONS:
+            - <assumption or none>
     - id: paper_preferences
       kind: llm_chat
-      depends_on: [paper_collect]
+      depends_on: [paper_contract]
       with:
         system: "You expand extracted paper requirements into a structured planning contract."
         task: |
           Expand the extracted paper facts into a full planning contract.
 
           Extracted paper contract (DO NOT override these):
-          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
+          {{ outputs.paper_contract | truncate(1200) }}
 
           Original user request (context only, do NOT override confirmed facts):
           {{ inputs.user_message | xml_escape | truncate(1200) }}
 
           Return exactly:
-          PAPER_MODE: <copy PAPER_MODE from extracted contract>
+          PAPER_MODE: <copy PAPER_MODE from extracted contract verbatim>
           MODE: DIRECT
-          TOPIC: <copy TOPIC from extracted contract>
-          AUDIENCE: <copy AUDIENCE from extracted contract>
+          TOPIC: <copy TOPIC from extracted contract verbatim>
+          AUDIENCE: <copy AUDIENCE from extracted contract verbatim>
           VENUE_STYLE: <generic research paper or inferred venue>
-          LANGUAGE: <copy LANGUAGE from extracted contract>
-          TARGET_LENGTH: <copy TARGET_PAGES from extracted contract>+ compiled pages
-          MIN_REFERENCES: 20
+          LANGUAGE: <copy LANGUAGE from extracted contract verbatim — use the exact enum value, do not translate>
+          TARGET_LENGTH: <copy TARGET_PAGES from extracted contract verbatim> compiled pages unless the user requested a different unit
+          CITATION_TARGET: <copy explicit citation target, otherwise derive from target length, source availability, audience, and venue style>
+          LENGTH_STRATEGY: <section-level page/word allocation based on TARGET_LENGTH and user intent>
+          CITATION_STRATEGY: <how many sources to use per major section and why>
           CITATION_STYLE: BibTeX cite keys, LaTeX \cite{...}
           ASSUMPTIONS:
             - <assumption>
     - id: search_query_translation
       kind: llm_chat
-      depends_on: [paper_collect]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      depends_on: [paper_contract]
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         system: "You translate paper topics into concise English academic search queries. Output only the query text."
         task: |
@@ -116,38 +187,43 @@ composition:
             (clean up only obvious typos / extraneous words).
 
           Topic (may be Chinese, Japanese, or English):
-          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
+          TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
     - id: search_papers
       kind: skill_exec
       skill: multi-search-engine
       depends_on: [paper_preferences, search_query_translation]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         # search_query_translation returns ONLY the English query text
         # (no labels / no preamble), so we can inline it directly.
         # Academic-site bias filters out blog/wiki/social.
         query: "{{ outputs.search_query_translation | xml_escape | truncate(200) }} (site:arxiv.org OR site:aclanthology.org OR site:dl.acm.org OR site:openreview.net OR site:ieee.org OR site:nature.com OR site:science.org)"
         engines: [brave, duckduckgo, tavily]
-        max_results: 25
+        # Brave Web Search API hard-caps ``count`` at 20 (multi-search-engine
+        # clamps internally as defense in depth). Set explicitly so future
+        # readers don't need to re-discover the limit.
+        max_results: 20
     - id: refbib
       kind: skill_exec
       skill: paper-refbib-stub
       depends_on: [search_papers]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         search_results: "{{ outputs.search_papers | truncate(8000) }}"
     - id: source_pack
       kind: llm_chat
       depends_on: [search_papers, refbib]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         system: "You curate paper sources and enforce citation coverage."
         task: |
           Build a source pack for a paper draft. Prefer primary papers,
           official documentation, surveys, and reputable technical reports.
-          Keep at least 20 usable references when the search results allow it.
-          If fewer than 20 credible references are available, keep all credible
-          references and state the gap.
+          Keep enough usable references to satisfy CITATION_TARGET and
+          CITATION_STRATEGY from paper_preferences when the search results
+          allow it. If fewer credible references are available than the
+          requested/derived target, keep all credible references and state the
+          gap.
 
           Paper preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
@@ -167,7 +243,7 @@ composition:
     - id: experiment_design
       kind: llm_chat
       depends_on: [paper_preferences, source_pack]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
         system: "You design rigorous, falsifiable experiments. You also decide how many figures and tables the paper needs based on the target page budget, the research questions, and the analysis dimensions — do not over- or under-provision."
         task: |
@@ -177,7 +253,7 @@ composition:
           straight from your output.
 
           Paper facts:
-          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
+          TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
 
           Preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
@@ -257,7 +333,7 @@ composition:
     - id: figure_placeholders
       kind: llm_chat
       depends_on: [experiment_design]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
         system: "You render LaTeX placeholder figure environments from a structured figure plan. Output is pure LaTeX, ready to inline into a manuscript."
         task: |
@@ -306,7 +382,7 @@ composition:
     - id: table_placeholders
       kind: llm_chat
       depends_on: [experiment_design]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
         system: "You render LaTeX placeholder table environments from a structured table plan. Output is pure LaTeX, ready to inline into a manuscript."
         task: |
@@ -347,7 +423,7 @@ composition:
     - id: analysis_outline
       kind: llm_chat
       depends_on: [experiment_design, figure_placeholders, table_placeholders]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
         system: "You design analysis-chapter outlines that bind every figure/table to a claim and an analysis dimension."
         task: |
@@ -394,7 +470,7 @@ composition:
     - id: outline
       kind: llm_chat
       depends_on: [source_pack, experiment_design]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         system: "You design long-form LaTeX paper outlines with citation plans."
         task: |
@@ -419,18 +495,20 @@ composition:
     - id: citation_plan
       kind: llm_chat
       depends_on: [outline, source_pack, refbib]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         system: "You plan citation placement for clean BibTeX/LaTeX manuscripts. You ONLY use cite keys that exist in the provided bibliography — never invent keys."
         task: |
-          Build a citation plan that uses at least 20 distinct citation keys
-          when the bibliography provides them. Use only keys that appear in
-          the BibTeX below (every key must be present verbatim — verify by
-          string match before you write it). Attach citations to claims,
-          not paragraphs in bulk.
+          Build a citation plan that follows CITATION_TARGET and
+          CITATION_STRATEGY from paper_preferences. If the user did not give
+          an explicit citation count, derive a target from target length,
+          source availability, audience, and venue style instead of using a
+          fixed number. Use only keys that appear in the BibTeX below (every
+          key must be present verbatim — verify by string match before you
+          write it). Attach citations to claims, not paragraphs in bulk.
 
           Topic and mode:
-          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
+          TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
 
           Outline:
           {{ outputs.outline | truncate(6000) }}
@@ -440,15 +518,16 @@ composition:
 
           Bibliography (authoritative — cite keys MUST come from here):
           {{ outputs.refbib | truncate(8000) }}
+
+          Paper preferences (authoritative for length/citation targets):
+          {{ outputs.paper_preferences | truncate(2000) }}
     # ─── Plan→Write→Unify (FULL_MANUSCRIPT mode only) ──────────────────
-    # COMPACT_SKELETON / REPAIR_EXISTING still use the single-shot
-    # `final_manuscript_package` step further below; this branch is
-    # the section-by-section flow for 10+/20+ page papers that hit
-    # the LLM single-call token cap.
+    # The default path is FULL_MANUSCRIPT: write section-by-section, unify the
+    # manuscript, run quality gates, compile a PDF, and deliver the artifact.
     - id: writing_plan
       kind: llm_chat
       depends_on: [paper_preferences, outline, citation_plan, experiment_design, figure_placeholders, table_placeholders, analysis_outline, refbib]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
         system: "You build a writing blueprint for a long-form academic manuscript. The blueprint is consumed verbatim by per-section authors; precision matters more than prose."
         task: |
@@ -458,11 +537,11 @@ composition:
           per-section length budget BEFORE any prose is written.
 
           Paper facts:
-          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}
-          MODE: {{ inputs.collected.paper_collect.paper_mode }}
-          LANGUAGE: {{ inputs.collected.paper_collect.language }}
-          TARGET_PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
-          AUDIENCE: {{ inputs.collected.paper_collect.audience }}
+          TOPIC: {{ outputs.paper_contract | truncate(1200) }}
+          MODE: {{ outputs.paper_contract | truncate(400) }}
+          LANGUAGE: {{ outputs.paper_contract | truncate(400) }}
+          TARGET_PAGES: {{ outputs.paper_contract | truncate(400) }}
+          AUDIENCE: {{ outputs.paper_contract | truncate(400) }}
 
           Preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
@@ -485,14 +564,32 @@ composition:
           Table placeholders (IDs only):
           {{ outputs.table_placeholders | truncate(1500) }}
 
-          Length budget rules:
-          - target_pages 10 → roughly 4500 words total
-          - target_pages 15 → roughly 7000 words total
-          - target_pages 20 → roughly 9500 words total
-          - target_pages 30 → roughly 14000 words total
-          Allocate words across sections roughly: 5% abstract, 18%
-          introduction, 12% related_work, 22% method, 24% experiments,
-          12% discussion, 7% conclusion. Tune ±20% based on contributions.
+          Length/citation budget rules:
+          - Treat paper_preferences.LENGTH_STRATEGY and TARGET_LENGTH as
+            authoritative; do not use a fixed default page or word budget when
+            the user requested a different length.
+          - Convert the requested compiled-page target into an approximate
+            total word budget using the paper language, figure/table count,
+            and venue style. For normal academic article formatting, set the
+            minimum total target_words to at least TARGET_PAGES × 650 English
+            words (or the equivalent dense prose units for non-English text).
+            Do not reduce below TARGET_PAGES × 580 for figures/tables; instead
+            add analysis, limitations, related-work synthesis, and method detail.
+          - Allocate words across sections according to the requested paper
+            type and contribution shape. A method-heavy paper should give
+            more budget to Method; an empirical paper should give more to
+            Experiments/Results; a survey should give more to Related Work.
+          - The sum of PER_SECTION_BLUEPRINT.*.target_words must meet or
+            exceed the minimum total target_words implied by TARGET_PAGES. If
+            the target is 12 pages, the blueprint should normally allocate at
+            least 7,800 total words across abstract/introduction/related_work/
+            method/experiments/discussion/conclusion.
+          - Treat paper_preferences.CITATION_TARGET and CITATION_STRATEGY as
+            authoritative. If they are AUTO, derive a citation budget
+            proportional to target length and available verified references;
+            never invent citations to hit a count.
+          - Return explicit per-section target_words and cite_keys budgets
+            that downstream section authors must obey.
 
           Return EXACTLY this structure (no preamble, no markdown headings):
 
@@ -586,12 +683,12 @@ composition:
           - tense: <e.g. "we present / we observe", active>
           - perspective: <e.g. third-person except contributions list>
           - formality: academic; no contractions, no marketing language
-          - language: {{ inputs.collected.paper_collect.language }}
+          - language: {{ outputs.paper_contract | truncate(400) }}
     - id: section_abstract
       kind: agent
       skill: paper-section-author
       depends_on: [writing_plan]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
         task: |
           You are writing the ABSTRACT section. Follow the writing plan
@@ -621,7 +718,7 @@ composition:
       kind: agent
       skill: paper-section-author
       depends_on: [writing_plan, section_abstract]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
         task: |
           You are writing the INTRODUCTION section.
@@ -652,13 +749,15 @@ composition:
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.introduction.target_words.
           - Output ONLY the LaTeX fragment for this section. No fences.
     - id: section_related_work
-      kind: llm_chat
+      kind: agent
+      skill: paper-section-author
       depends_on: [writing_plan, section_introduction]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
-        system: "You author the Related Work section of an academic paper as a pure LaTeX fragment. NEVER invent cite keys."
         task: |
-          Write the RELATED WORK section.
+          You are writing the RELATED WORK section.
+
+          section: related_work
 
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
@@ -688,7 +787,7 @@ composition:
       kind: agent
       skill: paper-section-author
       depends_on: [writing_plan, section_related_work, figure_placeholders]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
         task: |
           You are writing the METHOD section.
@@ -728,7 +827,7 @@ composition:
       kind: agent
       skill: paper-section-author
       depends_on: [writing_plan, section_method, figure_placeholders, table_placeholders]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
         task: |
           You are writing the EXPERIMENTS / RESULTS section. Use the
@@ -772,7 +871,7 @@ composition:
       kind: agent
       skill: paper-section-author
       depends_on: [writing_plan, section_experiments, analysis_outline]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
         task: |
           You are writing the DISCUSSION section.
@@ -807,13 +906,15 @@ composition:
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.discussion.target_words.
           - Output ONLY the LaTeX fragment.
     - id: section_conclusion
-      kind: llm_chat
+      kind: agent
+      skill: paper-section-author
       depends_on: [writing_plan, section_discussion, section_abstract]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
-        system: "You author the Conclusion section of an academic paper as a pure LaTeX fragment."
         task: |
-          Write the CONCLUSION section. Must close the loop on the abstract.
+          You are writing the CONCLUSION section. Must close the loop on the abstract.
+
+          section: conclusion
 
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
@@ -832,26 +933,26 @@ composition:
           - Match TERMINOLOGY_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.conclusion.target_words.
           - Output ONLY the LaTeX fragment.
-    - id: assemble_manuscript_tex
+    - id: persist_sections
       kind: tool_call
       tool: exec_command
       tool_allowlist: [exec_command]
-      depends_on: [writing_plan, section_abstract, section_introduction, section_related_work, section_method, section_experiments, section_discussion, section_conclusion, refbib]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      depends_on: [section_abstract, section_introduction, section_related_work, section_method, section_experiments, section_discussion, section_conclusion]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       tool_args:
-        # Concatenate all section outputs into a full LaTeX document
-        # wrapped with \documentclass + preamble + \begin{document} +
-        # \end{document}. Emit the canonical MANUSCRIPT_TEX: /
-        # REFERENCES_BIB: envelope so downstream citation_map /
-        # compile_pdf parse the same shape as the old single-shot path.
+        # Persist large section bodies to disk and return only a compact
+        # manifest. This keeps later LLM steps from repeatedly ingesting the
+        # full manuscript and reduces repeated context-compaction pressure.
         command: |
           python3 - <<'PY'
-          import os, re, sys
-          # Helper to strip ```latex fences and surrounding markdown.
+          import os, re
+          from pathlib import Path
+
           def clean(text):
               text = re.sub(r'^```(?:latex|tex)?\s*\n', '', text or '', flags=re.MULTILINE)
               text = re.sub(r'\n```\s*$', '', text)
               return text.strip()
+
           sections = {
               'abstract':     os.environ.get('SEC_ABSTRACT', ''),
               'introduction': os.environ.get('SEC_INTRO', ''),
@@ -861,51 +962,21 @@ composition:
               'discussion':   os.environ.get('SEC_DISCUSSION', ''),
               'conclusion':   os.environ.get('SEC_CONCLUSION', ''),
           }
-          for k in list(sections):
-              sections[k] = clean(sections[k])
-          bib = os.environ.get('BIB_TEXT', '').strip()
-          # Build preamble — load xeCJK if any section has CJK
-          any_cjk = any(re.search(r'[一-鿿]', v) for v in sections.values())
-          preamble = [
-              r"\documentclass{article}",
-              r"\usepackage{xeCJK}" if any_cjk else r"% no CJK",
-              r"\usepackage{graphicx}",
-              r"\usepackage{booktabs}",
-              r"\usepackage{amsmath,amssymb}",
-              r"\usepackage{hyperref}",
-              r"\usepackage{geometry}",
-              r"\geometry{margin=2.5cm}",
-              r"\title{From writing_plan TITLE — see paper.tex header}",
-              r"\author{OpenSquilla meta-paper-write}",
-              r"\date{\today}",
-              r"\begin{document}",
-              r"\maketitle",
-          ]
-          body_parts = [
-              sections['abstract'],     # \begin{abstract}...\end{abstract}
-              sections['introduction'], # \section{Introduction}...
-              sections['related_work'],
-              sections['method'],
-              sections['experiments'],
-              sections['discussion'],
-              sections['conclusion'],
-          ]
-          tail = [
-              r"\bibliographystyle{plain}",
-              r"\bibliography{references}",
-              r"\end{document}",
-          ]
-          tex = '\n'.join(preamble) + '\n\n' + '\n\n'.join(p for p in body_parts if p) + '\n\n' + '\n'.join(tail)
-          print('MANUSCRIPT_TEX:')
-          print(tex)
-          print()
-          print('REFERENCES_BIB:')
-          print(bib if bib else '% no verified references')
-          print()
-          print('COMPILE_NOTES:')
-          print('- assembled section-by-section via paper-section-author')
-          print(f'- sections present: {", ".join(k for k, v in sections.items() if v)}')
-          print(f'- total chars: {sum(len(v) for v in sections.values())}')
+          out_dir = Path('paper') / 'sections'
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          print('SECTION_ARTIFACTS:')
+          total = 0
+          for name, text in sections.items():
+              body = clean(text)
+              path = out_dir / f'{name}.tex'
+              path.write_text(body, encoding='utf-8')
+              chars = len(body)
+              total += chars
+              first_line = next((line.strip() for line in body.splitlines() if line.strip()), '')
+              print(f'- {name}: path={path.as_posix()} chars={chars} first_line={first_line[:120]!r}')
+          print(f'TOTAL_SECTION_CHARS: {total}')
+          print('CONTEXT_POLICY: downstream steps must read section files from disk and pass only paths/summaries to LLM prompts')
           PY
         workdir: "{{ inputs.workspace_dir }}"
         timeout: 30
@@ -917,53 +988,149 @@ composition:
           SEC_EXPERIMENTS: "{{ outputs.section_experiments }}"
           SEC_DISCUSSION:  "{{ outputs.section_discussion }}"
           SEC_CONCLUSION:  "{{ outputs.section_conclusion }}"
+    - id: assemble_manuscript_tex
+      kind: tool_call
+      tool: exec_command
+      tool_allowlist: [exec_command]
+      depends_on: [writing_plan, persist_sections, refbib]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
+      tool_args:
+        # Concatenate section artifact files into a full LaTeX document and
+        # write it to paper/paper.tex. Return a compact manifest instead of
+        # echoing the full manuscript back into the meta context.
+        command: |
+          python3 - <<'PY'
+          import os, re, sys
+          from pathlib import Path
+
+          section_dir = Path('paper') / 'sections'
+          sections = {
+              'abstract':     section_dir / 'abstract.tex',
+              'introduction': section_dir / 'introduction.tex',
+              'related_work': section_dir / 'related_work.tex',
+              'method':       section_dir / 'method.tex',
+              'experiments':  section_dir / 'experiments.tex',
+              'discussion':   section_dir / 'discussion.tex',
+              'conclusion':   section_dir / 'conclusion.tex',
+          }
+          section_text = {
+              name: path.read_text(encoding='utf-8') if path.is_file() else ''
+              for name, path in sections.items()
+          }
+          bib = os.environ.get('BIB_TEXT', '').strip()
+          # Extract TITLE from the writing_plan envelope. Falls back to the
+          # raw topic when the LLM omits a TITLE line so the PDF gets a
+          # meaningful title regardless.
+          writing_plan = os.environ.get('WRITING_PLAN', '')
+          topic_fallback = os.environ.get('TOPIC', 'Untitled Manuscript')
+          tm = re.search(r'^\s*TITLE\s*:\s*(.+?)\s*$', writing_plan, re.MULTILINE)
+          raw_title = (tm.group(1).strip() if tm else topic_fallback) or topic_fallback
+          # LaTeX-escape the title so user-provided text can't break the preamble.
+          def latex_escape(s):
+              s = s.replace('\\', r'\textbackslash{}')
+              for ch in '&%$#_{}':
+                  s = s.replace(ch, '\\' + ch)
+              s = s.replace('~', r'\textasciitilde{}')
+              s = s.replace('^', r'\textasciicircum{}')
+              return s
+          title_tex = latex_escape(raw_title)
+          # Build preamble — load xeCJK if title or any section has CJK
+          any_cjk = (re.search(r'[一-鿿]', raw_title) is not None) or any(
+              re.search(r'[一-鿿]', v) for v in section_text.values()
+          )
+          preamble = [
+              r"\documentclass{article}",
+              r"\usepackage{xeCJK}" if any_cjk else r"% no CJK",
+              r"\usepackage{graphicx}",
+              r"\usepackage{booktabs}",
+              r"\usepackage{amsmath,amssymb}",
+              r"\usepackage{hyperref}",
+              r"\usepackage{geometry}",
+              r"\geometry{margin=2.5cm}",
+              r"\title{" + title_tex + r"}",
+              r"\author{OpenSquilla meta-paper-write}",
+              r"\date{\today}",
+              r"\begin{document}",
+              r"\maketitle",
+          ]
+          body_parts = [
+              section_text['abstract'],     # \begin{abstract}...\end{abstract}
+              section_text['introduction'], # \section{Introduction}...
+              section_text['related_work'],
+              section_text['method'],
+              section_text['experiments'],
+              section_text['discussion'],
+              section_text['conclusion'],
+          ]
+          tail = [
+              r"\bibliographystyle{plain}",
+              r"\bibliography{references}",
+              r"\end{document}",
+          ]
+          tex = '\n'.join(preamble) + '\n\n' + '\n\n'.join(p for p in body_parts if p) + '\n\n' + '\n'.join(tail)
+          paper_dir = Path('paper')
+          paper_dir.mkdir(exist_ok=True)
+          tex_path = paper_dir / 'paper.tex'
+          bib_path = paper_dir / 'references.bib'
+          tex_path.write_text(tex, encoding='utf-8')
+          bib_path.write_text(bib if bib else '% no verified references', encoding='utf-8')
+          print(f'MANUSCRIPT_PATH: {tex_path.resolve()}')
+          print(f'REFERENCES_PATH: {bib_path.resolve()}')
+          print(f'MANUSCRIPT_CHARS: {len(tex)}')
+          print(f'REFERENCES_CHARS: {len(bib)}')
+          print('COMPILE_NOTES:')
+          print('- assembled section-by-section via paper-section-author')
+          print(f'- sections present: {", ".join(k for k, v in section_text.items() if v)}')
+          print(f'- total section chars: {sum(len(v) for v in section_text.values())}')
+          print('- context policy: full manuscript persisted on disk; downstream prompts should use path/summary only')
+          PY
+        workdir: "{{ inputs.workspace_dir }}"
+        timeout: 30
+        env:
           BIB_TEXT:        "{{ outputs.refbib }}"
+          WRITING_PLAN:    "{{ outputs.writing_plan }}"
+          TOPIC:           "{{ outputs.paper_contract | truncate(400) }}"
     - id: consistency_pass
       kind: llm_chat
       depends_on: [writing_plan, assemble_manuscript_tex]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
       with:
-        system: "You are the consistency editor. You only fix term/notation/number drift across an academic manuscript. You do NOT add new content, new claims, new citations, or new figures. Pure LaTeX in, pure LaTeX out."
+        system: "You are the consistency auditor for an academic manuscript. You inspect compact manifests and return actionable checks without rewriting the full manuscript."
         task: |
-          Scan the assembled manuscript for drift versus the writing plan
-          and produce a corrected copy. Do not invent content; only
-          unify what already exists.
+          Review the assembled manuscript manifest against the writing plan.
+          Do NOT request or reproduce the full manuscript text in this step.
+          The full manuscript is persisted on disk; keep this output compact
+          so long paper runs do not trigger repeated context compaction.
 
-          Drift to fix:
+          Drift to check:
           1. Terminology: any synonym variant of a TERMINOLOGY_LOCK term
-             gets replaced with the locked spelling.
+             should be flagged for later repair.
           2. Notation: any math symbol that disagrees with NOTATION_LOCK
-             gets normalized.
+             should be flagged.
           3. Numbers: if abstract / experiments / discussion mention the
-             same headline metric with different values, pick the
-             experiments-section value (authoritative) and propagate.
+             same headline metric with different values, flag the drift.
           4. Cite keys: ensure every \cite{...} key exists in the
-             REFERENCES_BIB block. Replace stray keys with the closest
-             match by ref# proximity; if none plausible, replace with
-             [citation needed].
+             REFERENCES_BIB block; citation_map performs the exact parse.
           5. Section ordering: keep abstract → intro → related → method →
              experiments → discussion → conclusion.
 
           Writing plan (authoritative):
           {{ outputs.writing_plan | truncate(8000) }}
 
-          Assembled draft (input):
-          {{ outputs.assemble_manuscript_tex | truncate(15000) }}
+          Assembled manuscript manifest:
+          {{ outputs.assemble_manuscript_tex | truncate(2000) }}
 
           Output EXACTLY:
-          MANUSCRIPT_TEX:
-          <corrected LaTeX, full \documentclass … \end{document} block>
-
-          REFERENCES_BIB:
-          <verbatim copy of the REFERENCES_BIB block from the input>
-
+          MANUSCRIPT_PATH: <copy MANUSCRIPT_PATH from assembled manifest>
+          REFERENCES_PATH: <copy REFERENCES_PATH from assembled manifest>
           COMPILE_NOTES:
-          - consistency_pass_changes: <one line per fix applied, OR "none">
+          - consistency_findings: <one line per possible drift, OR "none">
+          CONTEXT_POLICY: artifact-only; full manuscript omitted from prompt/output
 
     - id: final_manuscript_package
       kind: llm_chat
-      depends_on: [paper_collect, outline, citation_plan, refbib, figure_placeholders, table_placeholders, analysis_outline]
-      when: "inputs.collected.paper_collect.paper_mode in ('COMPACT_SKELETON', 'REPAIR_EXISTING')"
+      depends_on: [paper_contract, outline, citation_plan, refbib, figure_placeholders, table_placeholders, analysis_outline]
+      when: "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
       with:
         system: "You write clean LaTeX manuscripts. Output only the requested manuscript package. NEVER invent cite keys — every \\cite{...} you emit MUST exist verbatim in REFERENCES_BIB below."
         task: |
@@ -972,22 +1139,23 @@ composition:
           fences, chat commentary, progress notes, or tool logs.
 
           Paper mode:
-          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
+          TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
 
           Mode behavior:
           - FULL_MANUSCRIPT: produce enough substance for
-            TARGET_PAGES from paper_preferences as compiled
-            pages (default 10+ compiled pages), at least 20 references when
-            provided, and at least 20 distinct citation keys used across
+            TARGET_LENGTH from paper_preferences as compiled pages, using
+            the user-requested or derived CITATION_TARGET instead of a fixed
+            reference count. Distribute verified citation keys across
             abstract, introduction, related work, method, results, discussion,
             limitations, and conclusion.
           - COMPACT_SKELETON: produce a compact LaTeX-ready manuscript
             skeleton with section goals, planned citations, and expansion
-            notes; do not pretend it is a 10+ page finished paper. For this
+            notes; do not pretend it is a finished paper of the requested
+            length. For this
             mode, the final package MUST include an explicit manuscript plan,
-            a 10+ page expansion plan, limitations/threats-to-validity, and
-            at least 20 reference placeholders when verified BibTeX entries
-            are unavailable. Keep the compact package short enough that all
+            a target-length expansion plan, limitations/threats-to-validity,
+            and reference placeholders sized to the requested/derived citation
+            strategy when verified BibTeX entries are unavailable. Keep the compact package short enough that all
             required sections are visible before any evaluator truncation:
             put the plan and expansion plan before the LaTeX skeleton, and
             keep MANUSCRIPT_TEX under 2,500 words.
@@ -1002,7 +1170,8 @@ composition:
           - DO NOT cite a key that REFERENCES_BIB does not contain.
           - Every claim that needs evidence MUST cite at least one key from
             REFERENCES_BIB.
-          - Distribute citations: avoid citing the same key 10+ times.
+          - Distribute citations according to paper_preferences.CITATION_STRATEGY;
+            avoid repeatedly citing one key when enough verified sources exist.
           - If REFERENCES_BIB is empty or lacks enough verified entries, do
             not emit \cite{...}. Use visible placeholders such as
             [REF-01 needed: agent benchmark survey] in the LaTeX text and
@@ -1081,6 +1250,7 @@ composition:
           analysis_outline blocks verbatim where appropriate)
           \section{Discussion}...
           \section{Limitations}...
+          \section{Threats to Validity}...
           \section{Conclusion}...
           \bibliographystyle{plain}
           \bibliography{references}
@@ -1096,6 +1266,11 @@ composition:
             contribution. Skip this section if MANUSCRIPT_TEX is already
             tight on tokens.
 
+          TARGET_LENGTH_EXPANSION_PLAN:
+          - For COMPACT_SKELETON, list the concrete section expansions,
+            extra experiments, figures, tables, and citation work needed
+            to grow this package into the user-requested target length.
+
           REFERENCE_PLACEHOLDERS:
           - (optional) placeholder reference notes if REFERENCES_BIB is
             empty or sparse.
@@ -1103,87 +1278,162 @@ composition:
           COMPILE_NOTES:
           - <short note about figure/reference assumptions>
     - id: citation_map
-      kind: llm_chat
+      kind: tool_call
+      tool: exec_command
+      tool_allowlist: [exec_command]
       depends_on: [final_manuscript_package, consistency_pass, assemble_manuscript_tex, refbib]
-      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
-      with:
-        system: "You audit citation provenance. You read manuscript LaTeX and a BibTeX file and emit a strict markdown table. NEVER invent titles or URLs — copy fields verbatim from the BibTeX block."
-        task: |
-          Parse every \\cite{key} occurrence in MANUSCRIPT below, then
-          match each key against REFERENCES_BIB. Produce an exhaustive
-          audit table.
+      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
+      tool_args:
+        # Deterministically parse citations from artifact files instead of
+        # sending the full manuscript back through an LLM.
+        command: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
 
-          Manuscript:
-          {{ (outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '')) | truncate(12000) }}
+          pkg = os.environ.get('MANIFEST', '')
+          m = re.search(r'MANUSCRIPT_PATH:\s*(.+)', pkg)
+          b = re.search(r'REFERENCES_PATH:\s*(.+)', pkg)
+          tex_path = Path(m.group(1).strip()) if m else Path('paper/paper.tex')
+          bib_path = Path(b.group(1).strip()) if b else Path('paper/references.bib')
 
-          References bib (authoritative source for title/url/eprint/doi):
-          {{ outputs.refbib | truncate(8000) }}
+          tex = tex_path.read_text(encoding='utf-8', errors='ignore') if tex_path.is_file() else ''
+          bib = bib_path.read_text(encoding='utf-8', errors='ignore') if bib_path.is_file() else os.environ.get('REFBIB', '')
 
-          Reply with this exact structure (no preamble):
+          cite_counts = {}
+          for group in re.findall(r'\\cite\{([^}]+)\}', tex):
+              for key in [k.strip() for k in group.split(',') if k.strip()]:
+                  cite_counts[key] = cite_counts.get(key, 0) + 1
 
-          CITATION_MAP:
+          entries = {}
+          for match in re.finditer(r'@\w+\s*\{\s*([^,\s]+)\s*,(.*?)(?=\n@\w+\s*\{|\Z)', bib, re.DOTALL):
+              key = match.group(1).strip()
+              body = match.group(2)
+              title = re.search(r'title\s*=\s*[\{\"]([^}\"]+)', body, re.I)
+              url = re.search(r'(?:url|howpublished)\s*=\s*[\{\"]([^}\"]+)', body, re.I)
+              doi = re.search(r'doi\s*=\s*[\{\"]([^}\"]+)', body, re.I)
+              eprint = re.search(r'eprint\s*=\s*[\{\"]([^}\"]+)', body, re.I)
+              locator = (url.group(1) if url else '') or (f'doi:{doi.group(1)}' if doi else '') or (f'arXiv:{eprint.group(1)}' if eprint else '')
+              entries[key] = {
+                  'title': title.group(1).strip() if title else '',
+                  'locator': locator,
+              }
 
-          | Cite Key | Cited Times | Title | URL / DOI / arXiv | Source Quality |
-          |---|---|---|---|---|
-          | ref1 | 5 | Attention Is All You Need | https://arxiv.org/abs/1706.03762 (arXiv:1706.03762) | STRONG |
-          | ref7 | 2 | Some blog | https://medium.com/... | WEAK |
-          | ref42 | 1 | (MISSING IN BIB) | — | INVALID |
-          | refX | 0 | (declared but never cited) | https://... | UNUSED |
+          strong_domains = ('arxiv.org', 'aclanthology.org', 'dl.acm.org', 'openreview.net', 'ieee.org', 'nature.com', 'science.org', 'biorxiv.org', 'pnas.org')
+          weak_markers = ('medium.com', 'wikipedia.org', 'github.com', 'stackoverflow.com', 'twitter.com', 'x.com')
+          def quality(locator, invalid=False):
+              low = locator.lower()
+              if invalid:
+                  return 'INVALID'
+              if any(d in low for d in strong_domains) or 'doi:' in low or 'arxiv:' in low:
+                  return 'STRONG'
+              if any(w in low for w in weak_markers):
+                  return 'WEAK'
+              if locator:
+                  return 'OK'
+              return 'WEAK'
 
-          Source Quality buckets:
-          - STRONG: arxiv.org / aclanthology.org / dl.acm.org / openreview.net /
-                    ieee.org / nature.com / science.org / biorxiv.org / pnas.org /
-                    any URL with a real DOI or arXiv eprint identifier
-          - OK:     other .edu / .gov / .org venues, journal portals
-          - WEAK:   blog / medium / wikipedia / github / stackoverflow /
-                    social media / news / generic .com
-          - INVALID: cite key referenced in MANUSCRIPT but absent from REFERENCES_BIB
-          - UNUSED:  bib entry declared but no \\cite{...} occurrence in MANUSCRIPT
-
-          Strict rules:
-          - Read the URL from the howpublished/url/eprint/doi BibTeX fields
-            of the matching entry — do not invent.
-          - If a row is INVALID or WEAK or UNUSED, add a one-line bullet
-            after the table explaining what to do (replace, drop, find a
-            real arxiv/doi source).
-
-          After the table, emit a one-line summary:
-          SUMMARY: total_cite_keys=<N>, strong=<n>, ok=<n>, weak=<n>, invalid=<n>, unused=<n>
+          rows = []
+          invalid = weak = strong = ok = unused = 0
+          all_keys = sorted(set(cite_counts) | set(entries))
+          print('CITATION_MAP:')
+          print()
+          print('| Cite Key | Cited Times | Title | URL / DOI / arXiv | Source Quality |')
+          print('|---|---:|---|---|---|')
+          for key in all_keys:
+              count = cite_counts.get(key, 0)
+              entry = entries.get(key)
+              invalid_row = entry is None
+              q = quality(entry['locator'] if entry else '', invalid=invalid_row)
+              if invalid_row:
+                  invalid += 1
+              elif count == 0:
+                  unused += 1
+                  q = 'UNUSED'
+              elif q == 'STRONG':
+                  strong += 1
+              elif q == 'OK':
+                  ok += 1
+              elif q == 'WEAK':
+                  weak += 1
+              title = entry['title'] if entry else '(MISSING IN BIB)'
+              locator = entry['locator'] if entry else '-'
+              print(f'| {key} | {count} | {title} | {locator} | {q} |')
+          print()
+          print(f'SUMMARY: total_cite_keys={len(cite_counts)}, strong={strong}, ok={ok}, weak={weak}, invalid={invalid}, unused={unused}')
+          print(f'ARTIFACTS: manuscript={tex_path} references={bib_path}')
+          PY
+        workdir: "{{ inputs.workspace_dir }}"
+        timeout: 30
+        env:
+          MANIFEST: "{{ outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '') }}"
+          REFBIB: "{{ outputs.refbib }}"
     - id: paper_length_gate
-      kind: llm_chat
+      kind: tool_call
+      tool: exec_command
+      tool_allowlist: [exec_command]
       depends_on: [final_manuscript_package, consistency_pass, assemble_manuscript_tex, citation_plan, refbib]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
-      with:
-        system: "You verify manuscript length requirements without rewriting the paper."
-        task: |
-          Check whether the manuscript package is long enough before LaTeX
-          compilation. Estimate compiled pages and identify any section that
-          needs expansion. Do not include process commentary.
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
+      tool_args:
+        command: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
 
-          Requirements:
-          - target TARGET_PAGES from paper_preferences as compiled pages
-          - substantial introduction, method, results, and discussion sections
-          - no placeholder-only paragraphs (placeholder figures/tables ARE
-            allowed and expected — only flag if the text body around them is
-            also empty)
-
-          Manuscript:
-          {{ (outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '')) | truncate(12000) }}
-
-          Citation plan:
-          {{ outputs.citation_plan | truncate(4000) }}
+          pkg = os.environ.get('MANIFEST', '')
+          contract = os.environ.get('PAPER_CONTRACT', '')
+          m = re.search(r'MANUSCRIPT_PATH:\s*(.+)', pkg)
+          tex_path = Path(m.group(1).strip()) if m else Path('paper/paper.tex')
+          tex = tex_path.read_text(encoding='utf-8', errors='ignore') if tex_path.is_file() else pkg
+          body = re.sub(r'\\[a-zA-Z]+(?:\[[^\]]*\])?(?:\{[^}]*\})?', ' ', tex)
+          words = re.findall(r'[A-Za-z0-9_\-]+|[\u4e00-\u9fff]', body)
+          figures = len(re.findall(r'\\begin\{figure\}', tex))
+          tables = len(re.findall(r'\\begin\{table\}', tex))
+          est_pages = max(1, round(max(len(words), 1) / 500 + (figures + tables) * 0.25, 1))
+          target_match = re.search(r'TARGET_PAGES:\s*(\d+)', contract)
+          min_target_pages = int(target_match.group(1)) if target_match else 1
+          sections = re.findall(r'\\section\{([^}]+)\}', tex)
+          if est_pages < min_target_pages:
+              print('LENGTH_GATE: fail')
+              print(f'MANUSCRIPT_PATH: {tex_path}')
+              print(f'MIN_TARGET_PAGES: {min_target_pages}')
+              print(f'EST_WORD_UNITS: {len(words)}')
+              print(f'EST_COMPILED_PAGES: {est_pages}')
+              print(f'FIGURES: {figures}')
+              print(f'TABLES: {tables}')
+              print('SECTIONS: ' + ', '.join(sections))
+              print('ERROR: estimated compiled length is below the user-requested page target; expand section target_words before compiling')
+              print('CONTEXT_POLICY: artifact-only length check; full manuscript omitted from LLM context')
+              raise SystemExit(1)
+          print('LENGTH_GATE: pass')
+          print(f'MANUSCRIPT_PATH: {tex_path}')
+          print(f'MIN_TARGET_PAGES: {min_target_pages}')
+          print(f'EST_WORD_UNITS: {len(words)}')
+          print(f'EST_COMPILED_PAGES: {est_pages}')
+          print(f'FIGURES: {figures}')
+          print(f'TABLES: {tables}')
+          print('SECTIONS: ' + ', '.join(sections))
+          print('CONTEXT_POLICY: artifact-only length check; full manuscript omitted from LLM context')
+          PY
+        workdir: "{{ inputs.workspace_dir }}"
+        timeout: 30
+        env:
+          MANIFEST: "{{ outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '') }}"
+          PAPER_CONTRACT: "{{ outputs.paper_contract }}"
     - id: citation_integrity_gate
       kind: llm_chat
       depends_on: [final_manuscript_package, consistency_pass, assemble_manuscript_tex, citation_plan, refbib, citation_map]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON', 'REPAIR_EXISTING')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
       with:
         system: "You verify LaTeX/BibTeX citation integrity."
         task: |
           Validate citation integrity before LaTeX compilation.
 
           Requirements (LOAD-BEARING — block compilation if any fails):
-          - at least 20 references in REFERENCES_BIB when sources allow it
-          - at least 20 distinct citation keys used or planned in the body
+          - REFERENCES_BIB and body citations satisfy the user-requested or
+            derived CITATION_TARGET from paper_preferences when sources allow it
+          - distinct citation keys used/planned in the body match
+            paper_preferences.CITATION_STRATEGY; do not enforce a fixed count
           - NO citation keys absent from references.bib (citation_map column
             "INVALID" must be 0)
           - every cited entry MUST have a verifiable URL or DOI or arXiv
@@ -1201,11 +1451,11 @@ composition:
           Bibliography:
           {{ outputs.refbib | truncate(8000) }}
 
-          Manuscript:
-          {{ (outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '')) | truncate(12000) }}
-
           Citation audit table (read this — do NOT re-derive):
           {{ outputs.citation_map | truncate(4000) }}
+
+          Length gate:
+          {{ outputs.paper_length_gate | truncate(2000) }}
 
           Reply with:
           INTEGRITY: <pass|warn|block>
@@ -1219,7 +1469,7 @@ composition:
     - id: latex_sanitizer
       kind: llm_chat
       depends_on: [paper_length_gate, citation_integrity_gate]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON', 'REPAIR_EXISTING', 'COMPILE_ONLY')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract or 'PAPER_MODE: COMPILE_ONLY' in outputs.paper_contract"
       with:
         system: "You sanitize LaTeX deliverables and reject process text."
         task: |
@@ -1238,20 +1488,20 @@ composition:
     - id: compile_latex
       kind: llm_chat
       depends_on: [latex_sanitizer]
-      when: "inputs.collected.paper_collect.paper_mode == 'COMPILE_ONLY'"
+      when: "'PAPER_MODE: COMPILE_ONLY' in outputs.paper_contract"
       with:
-        system: "You prepare compile handoff notes without invoking LaTeX in the default path."
+        system: "You prepare compile-only handoff notes without invoking LaTeX in this step."
         task: |
-          Produce a concise compile handoff note. Do not run xelatex in the
-          default meta-skill path; the manuscript text is the user-facing
-          deliverable and real compilation is an explicit follow-up action.
+          Produce a concise compile handoff note. COMPILE_ONLY is for
+          assessing an existing LaTeX manuscript. The default FULL_MANUSCRIPT
+          path compiles a PDF via compile_pdf after quality gates pass.
 
           Sanitizer result:
           {{ outputs.latex_sanitizer | truncate(2000) }}
 
           Reply exactly:
           COMPILE_READY: <yes|blocked>
-          NEXT_STEP: run latex-compile explicitly when the user asks for a PDF
+          NEXT_STEP: provide or select an existing manuscript package to compile
           BLOCKERS:
             - <blocker or none>
     - id: compile_pdf
@@ -1259,18 +1509,22 @@ composition:
       tool: exec_command
       tool_allowlist: [exec_command]
       depends_on: [latex_sanitizer, consistency_pass, assemble_manuscript_tex, final_manuscript_package]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON', 'REPAIR_EXISTING')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
       tool_args:
         # Runs the actual xelatex × bibtex × xelatex × 2 cycle so the
         # user gets a real PDF, not just LaTeX source. Extracts
-        # MANUSCRIPT_TEX / REFERENCES_BIB from the final_manuscript_package
-        # contract (passed via env var to dodge shell-escape hell).
+        # MANUSCRIPT_TEX / REFERENCES_BIB from the consistency/assembly/final
+        # package contract (passed via env var to dodge shell-escape hell).
         command: |
           python3 - <<'PY'
           import os, re, subprocess, sys
           from pathlib import Path
 
           pkg = os.environ.get('MANUSCRIPT_PKG', '')
+          contract = os.environ.get('PAPER_CONTRACT', '')
+          target_match = re.search(r'TARGET_PAGES:\s*(\d+)', contract)
+          full_manuscript_mode = 'PAPER_MODE: FULL_MANUSCRIPT' in contract
+          min_target_pages = int(target_match.group(1)) if (full_manuscript_mode and target_match) else 1
 
           # 1. Try MANUSCRIPT_TEX: / REFERENCES_BIB: contract markers first.
           m = re.search(r'MANUSCRIPT_TEX:\s*(.+?)(?:REFERENCES_BIB:|COMPILE_NOTES:|\Z)', pkg, re.DOTALL)
@@ -1290,31 +1544,36 @@ composition:
               if raw:
                   tex_body = raw.group(1).strip()
 
-          # 4. Strip any leftover markdown fences from extracted bodies.
+          # 4. Fallback C: artifact-only FULL_MANUSCRIPT path. Read the
+          # persisted manuscript and bibliography from disk instead of
+          # requiring the full document to be present in the meta context.
+          manifest_tex_path = None
+          manifest_bib_path = None
+          if not tex_body:
+              pm = re.search(r'MANUSCRIPT_PATH:\s*(.+)', pkg)
+              bm = re.search(r'REFERENCES_PATH:\s*(.+)', pkg)
+              if pm:
+                  manifest_tex_path = Path(pm.group(1).strip())
+                  if manifest_tex_path.is_file():
+                      tex_body = manifest_tex_path.read_text(encoding='utf-8')
+              if bm:
+                  manifest_bib_path = Path(bm.group(1).strip())
+                  if manifest_bib_path.is_file():
+                      bib = manifest_bib_path.read_text(encoding='utf-8')
+
+          # 5. Strip any leftover markdown fences from extracted bodies.
           tex_body = re.sub(r'^```(?:latex|tex)?\s*\n', '', tex_body)
           tex_body = re.sub(r'\n```\s*$', '', tex_body)
 
-          # 5. If still empty, wrap whatever we got as a degraded skeleton so
-          #    the user sees SOMETHING (and an explicit warning in the PDF).
+          # 6. If still empty, fail loudly. Quality-first paper generation
+          # must not disguise a missing manuscript as a degraded PDF.
           if not tex_body:
-              snippet = pkg[:4000].replace('\\', r'\textbackslash{}')
-              for ch in '{}#$%_&^~':
-                  snippet = snippet.replace(ch, '\\' + ch)
-              tex_body = (
-                  r"\documentclass{article}" "\n"
-                  r"\usepackage{xeCJK}" "\n"
-                  r"\usepackage{geometry}\geometry{margin=2.5cm}" "\n"
-                  r"\title{Degraded Output: MANUSCRIPT\_TEX block not provided by LLM}" "\n"
-                  r"\author{meta-paper-write}" "\n"
-                  r"\begin{document}\maketitle" "\n"
-                  r"\section*{Warning}" "\n"
-                  r"The LLM did not emit a \texttt{MANUSCRIPT\_TEX:} section. "
-                  r"Raw output captured below for inspection." "\n\n"
-                  r"\begin{verbatim}" "\n" + pkg[:4000] + "\n" r"\end{verbatim}" "\n"
-                  r"\end{document}" "\n"
-              )
+              print('COMPILE_FAILED: MANUSCRIPT_TEX block missing; refusing to create degraded PDF')
+              print('PACKAGE_PREVIEW:')
+              print(pkg[:2000])
+              sys.exit(1)
 
-          # 6. Auto-wrap if the LLM gave a body fragment but no \documentclass.
+          # 7. Auto-wrap if the LLM gave a body fragment but no \documentclass.
           if '\\documentclass' not in tex_body:
               tex_body = (
                   r"\documentclass{article}" "\n"
@@ -1327,7 +1586,7 @@ composition:
                   r"\end{document}" "\n"
               )
 
-          # 7. Auto-add xeCJK if the body contains CJK chars but doesn't load it.
+          # 8. Auto-add xeCJK if the body contains CJK chars but doesn't load it.
           if re.search(r'[一-鿿]', tex_body) and 'xeCJK' not in tex_body:
               tex_body = tex_body.replace(
                   r'\documentclass{article}',
@@ -1354,6 +1613,13 @@ composition:
               log_text = (paper / 'paper.log').read_text(encoding='utf-8', errors='ignore') if (paper / 'paper.log').is_file() else ''
               pm = re.search(r'Output written on .+?\((\d+) pages?', log_text)
               pages = pm.group(1) if pm else '?'
+              if pages.isdigit() and int(pages) < min_target_pages:
+                  print('PDF_PAGE_TARGET_NOT_MET')
+                  print(f'PDF_PATH: {pdf}')
+                  print(f'PDF_PAGES: {pages}')
+                  print(f'MIN_TARGET_PAGES: {min_target_pages}')
+                  print('ERROR: compiled PDF is shorter than the user-requested page target; refusing to publish the undersized paper')
+                  sys.exit(1)
               print(f'PDF_PATH: {pdf}')
               print(f'PDF_PAGES: {pages}')
               print(f'PDF_BYTES: {pdf.stat().st_size}')
@@ -1371,12 +1637,13 @@ composition:
         timeout: 120
         env:
           MANUSCRIPT_PKG: "{{ outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '') }}"
+          PAPER_CONTRACT: "{{ outputs.paper_contract }}"
     - id: publish_pdf
       kind: tool_call
       tool: publish_artifact
       tool_allowlist: [publish_artifact]
       depends_on: [compile_pdf]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON', 'REPAIR_EXISTING')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
       tool_args:
         path: "paper/paper.pdf"
         name: "paper.pdf"
@@ -1384,7 +1651,7 @@ composition:
     - id: deliver_paper
       kind: llm_chat
       depends_on: [final_manuscript_package, compile_pdf, publish_pdf, citation_map]
-      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON', 'REPAIR_EXISTING')"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
       with:
         system: "You write a one-paragraph delivery note for a compiled academic paper. Output is concise — no LaTeX source, no markdown fences."
         task: |
@@ -1458,20 +1725,27 @@ DAG (in order):
     and Results to the figure/table plan.
 11. **`citation_plan`** — assigns concrete cite keys from `refbib` to
     claims; cannot invent keys.
-12. **`final_manuscript_package`** — produces MANUSCRIPT_TEX with the
-    figure/table/analysis blocks inlined verbatim, plus
-    REFERENCES_BIB containing only the entries actually cited.
-13. **`citation_map`** — strict markdown audit table:
+12. **`writing_plan` + section authors** — the default FULL_MANUSCRIPT path
+    writes section-by-section, then assembles and consistency-edits the
+    manuscript before quality gates.
+13. **`final_manuscript_package`** — compact / repair modes produce
+    MANUSCRIPT_TEX with the figure/table/analysis blocks inlined verbatim,
+    plus REFERENCES_BIB containing only the entries actually cited.
+14. **`citation_map`** — strict markdown audit table:
     ``Cite Key | Cited Times | Title | URL/DOI/arXiv | Source Quality``
     with INVALID / UNUSED / WEAK detection. Inlined into the final
     deliverable AND queryable per-run via
     ``opensquilla skills meta runs show``.
-14. **`paper_length_gate`** — page-count check (FULL_MANUSCRIPT only).
-15. **`citation_integrity_gate`** — reads `citation_map` directly; blocks
+15. **`paper_length_gate`** — page-count check (FULL_MANUSCRIPT only).
+16. **`citation_integrity_gate`** — reads `citation_map` directly; blocks
     when INVALID > 0 or any primary claim cites a WEAK source.
-16. **`latex_sanitizer`** — strips process text without rewriting the
+17. **`latex_sanitizer`** — strips process text without rewriting the
     paper.
-17. **`compile_latex`** — handoff note (COMPILE_ONLY mode).
+18. **`compile_pdf` / `publish_pdf` / `deliver_paper`** — compile and
+    publish the final PDF for FULL_MANUSCRIPT, COMPACT_SKELETON, and
+    REPAIR_EXISTING. The compiler refuses to create degraded PDFs when
+    MANUSCRIPT_TEX is missing.
+19. **`compile_latex`** — handoff note (COMPILE_ONLY mode).
 
 Removed from the previous version:
 
@@ -1483,8 +1757,7 @@ Removed from the previous version:
   superseded by `figure_placeholders` (zero-dependency LaTeX). The
   bundled `paper-plot-stub` skill was deleted with this rewrite.
 
-The default path intentionally returns `final_manuscript_package` instead
-of running `latex-compile`. This avoids timeout and prevents process
-text from being inserted into the paper. If the user explicitly asks
-for a compiled PDF, run `latex-compile` as the second-stage artifact
-step after inspecting the manuscript package.
+The default path is FULL_MANUSCRIPT and ends with a compiled PDF. If required
+paper details are missing, `paper_clarify` pauses and asks the user before
+generation continues. The compiler refuses to synthesize a degraded PDF when
+the manuscript contract is missing.
