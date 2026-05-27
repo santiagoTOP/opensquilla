@@ -453,6 +453,32 @@ def test_tool_result_handler_keeps_small_write_file_arguments() -> None:
     assert state.turn_segments[0]["input"] is arguments
 
 
+def test_tool_result_handler_updates_tool_use_name_after_runtime_coercion() -> None:
+    state = _make_state()
+    state.turn_segments.append(
+        {
+            "type": "tool_use",
+            "tool_use_id": "meta-1",
+            "name": "skill_view",
+            "input": "",
+        }
+    )
+
+    _ToolResultHandler().handle(
+        ToolResultEvent(
+            tool_use_id="meta-1",
+            tool_name="meta_invoke",
+            result="meta-skill 'meta-travel-planner' completed.",
+            arguments={"name": "meta-travel-planner"},
+        ),
+        state,
+    )
+
+    assert state.turn_segments[0]["name"] == "meta_invoke"
+    assert state.turn_segments[0]["input"] == {"name": "meta-travel-planner"}
+    assert state.turn_segments[1]["name"] == "meta_invoke"
+
+
 def test_artifact_handler_appends_payload() -> None:
     state = _make_state()
     handler = _ArtifactHandler()
@@ -838,3 +864,22 @@ async def test_outer_stage_empty_stream_still_notifies() -> None:
 
 def test_stage_name() -> None:
     assert StreamConsumerStage.name == "stream_consumer_stage"
+
+
+def test_turn_context_surface_kind_defaults_to_unknown() -> None:
+    """PR3: surface_kind is "unknown" unless gateway/CLI/channel sets it."""
+    from opensquilla.engine.pipeline import TurnContext
+
+    # TurnContext requires: message, session_key, config, provider, model,
+    # tool_defs, system_prompt — check the actual signature in pipeline.py
+    # if this construction fails; pass minimal-but-valid args.
+    ctx = TurnContext(
+        message="hi",
+        session_key="S",
+        config=None,
+        provider=None,
+        model="",
+        tool_defs=[],
+        system_prompt="",
+    )
+    assert ctx.surface_kind == "unknown"
