@@ -37,9 +37,9 @@ def test_parses_with_expected_topology(tmp_path: Path) -> None:
     assert plan is not None
 
     step_ids = [s.id for s in plan.steps]
-    # PR8 follow-up migration: classify_language (llm_classify) was
-    # replaced with trace_collect (user_input) so the user picks the
-    # language explicitly. Newly-added *_degraded fallback siblings
+    # trace_collect extracts the investigation brief from the same turn so a
+    # pasted traceback does not pause for a confirmation form. Newly-added
+    # *_degraded fallback siblings
     # (grep_repo_degraded, search_issues_degraded, git_history_degraded,
     # memory_recall_degraded) make the previous evidence-source order
     # explicit; they were present in the SKILL.md before this migration
@@ -67,7 +67,7 @@ def test_parses_with_expected_topology(tmp_path: Path) -> None:
     ]
 
     by_id = {s.id: s for s in plan.steps}
-    assert by_id["trace_collect"].kind == "user_input"
+    assert by_id["trace_collect"].kind == "llm_chat"
     assert by_id["parse_trace"].depends_on == ("trace_collect",)
     assert by_id["diff_context"].on_failure == "diff_context_degraded"
     assert by_id["diff_context_degraded"].depends_on == ()
@@ -125,19 +125,19 @@ def test_language_probe_routes_to_language_specific_skills(tmp_path: Path) -> No
     assert probe.depends_on == ("parse_trace",)
     assert [(case.when, case.to) for case in probe.route] == [
         (
-            "inputs.collected.trace_collect.language == 'python'",
+            "'\"language\":\"python\"' in outputs.parse_trace or '\"language\": \"python\"' in outputs.parse_trace or 'LANGUAGE: python' in outputs.trace_collect",
             "stack-trace-python-probe",
         ),
         (
-            "inputs.collected.trace_collect.language in ('javascript', 'typescript')",
+            "'\"language\":\"javascript\"' in outputs.parse_trace or '\"language\": \"javascript\"' in outputs.parse_trace or '\"language\":\"typescript\"' in outputs.parse_trace or '\"language\": \"typescript\"' in outputs.parse_trace or 'LANGUAGE: javascript' in outputs.trace_collect or 'LANGUAGE: typescript' in outputs.trace_collect",
             "stack-trace-js-probe",
         ),
         (
-            "inputs.collected.trace_collect.language == 'go'",
+            "'\"language\":\"go\"' in outputs.parse_trace or '\"language\": \"go\"' in outputs.parse_trace or 'LANGUAGE: go' in outputs.trace_collect",
             "stack-trace-go-probe",
         ),
         (
-            "inputs.collected.trace_collect.language == 'rust'",
+            "'\"language\":\"rust\"' in outputs.parse_trace or '\"language\": \"rust\"' in outputs.parse_trace or 'LANGUAGE: rust' in outputs.trace_collect",
             "stack-trace-rust-probe",
         ),
     ]
@@ -154,6 +154,8 @@ def test_language_probe_routes_to_language_specific_skills(tmp_path: Path) -> No
 
 
 def _classify(system: str, user_message: str) -> str:
+    if "Extract a compact investigation brief" in user_message:
+        return "trace_collect"
     if "trace parser" in user_message:
         return "parse_trace"
     if "Classify the stack trace language" in user_message:
@@ -213,7 +215,19 @@ async def test_happy_path_synthesizes_root_cause(tmp_path: Path) -> None:
 
     async def runner(_system: str, user_msg: str) -> AsyncIterator[AgentEvent]:
         which = _classify(_system, user_msg)
-        if which == "classify_language":
+        if which == "trace_collect":
+            yield TextDeltaEvent(
+                text=(
+                    "LANGUAGE: python\n"
+                    "EXPECTED_BEHAVIOR: ASSUMED: not provided\n"
+                    "RECENT_CHANGES: ASSUMED: not provided\n"
+                    "TRACE_PRESENT: yes\n"
+                    "PRIMARY_EXCEPTION: AttributeError\n"
+                    "PRIMARY_FILES:\n"
+                    "  - src/opensquilla/engine/agent.py:1234"
+                )
+            )
+        elif which == "classify_language":
             yield TextDeltaEvent(
                 text='{"language":"python","runtime":"cpython","confidence":"high"}'
             )
@@ -276,15 +290,6 @@ async def test_happy_path_synthesizes_root_cause(tmp_path: Path) -> None:
                     "  File \"src/opensquilla/engine/agent.py\", line 1234, in foo\n"
                     "AttributeError: 'NoneType' object has no attribute 'foo'"
                 ),
-                # Pre-populate trace_collect so its skip_if fires offline
-                # (no DAO / run_id wired in this fixture).
-                "collected": {
-                    "trace_collect": {
-                        "language": "python",
-                        "expected_behavior": "",
-                        "recent_changes": "",
-                    },
-                },
             },
         ),
     )
@@ -308,7 +313,9 @@ async def test_root_cause_fans_in_parallel_investigations(tmp_path: Path) -> Non
 
     async def runner(_system: str, user_msg: str) -> AsyncIterator[AgentEvent]:
         which = _classify(_system, user_msg)
-        if which == "parse_trace":
+        if which == "trace_collect":
+            yield TextDeltaEvent(text="LANGUAGE: python\nPRIMARY_EXCEPTION: RuntimeError")
+        elif which == "parse_trace":
             yield TextDeltaEvent(text="<<PARSE_RESULT>>")
         elif which == "classify_language":
             yield TextDeltaEvent(text="<<CLASSIFY_RESULT>>")
@@ -339,13 +346,6 @@ async def test_root_cause_fans_in_parallel_investigations(tmp_path: Path) -> Non
             plan=plan,
             inputs={
                 "user_message": "investigate stack trace",
-                "collected": {
-                    "trace_collect": {
-                        "language": "python",
-                        "expected_behavior": "",
-                        "recent_changes": "",
-                    },
-                },
             },
         ),
     )

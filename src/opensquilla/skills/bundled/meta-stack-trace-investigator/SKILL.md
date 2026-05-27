@@ -29,30 +29,29 @@ metadata:
 composition:
   steps:
     - id: trace_collect
-      kind: user_input
-      clarify:
-        mode: form
-        intro: |
-          开始诊断前，请确认 3 件事 / Before diagnosing, confirm 3 items.
-        skip_if: "inputs.collected.trace_collect is defined"
-        # Accept free-form replies — see meta-paper-write for context.
-        nl_extract: true
-        fields:
-          - name: language
-            type: enum
-            required: true
-            choices: [python, javascript, typescript, go, rust, unknown]
-            prompt: "语言 / Language"
-          - name: expected_behavior
-            type: string
-            max_chars: 300
-            prompt: "本应发生什么 / What was supposed to happen? (可留空)"
-          - name: recent_changes
-            type: string
-            max_chars: 300
-            prompt: "最近做了什么改动 / What changed recently? (可留空)"
-        cancel_keywords: ["算了", "取消", "cancel", "stop", "abort"]
-        timeout_hours: 24
+      kind: llm_chat
+      with:
+        system: "You extract stack-trace investigation facts without asking follow-up questions."
+        task: |
+          Extract a compact investigation brief from the original request.
+          Do NOT ask the user to confirm language, expected behavior, or
+          recent changes when the stack trace is enough to infer a useful
+          investigation direction. If a field is absent, write ASSUMED or
+          unknown and continue.
+
+          Original request:
+          ---
+          {{ inputs.user_message | xml_escape | truncate(3000) }}
+          ---
+
+          Return exactly this structure:
+          LANGUAGE: <python|javascript|typescript|go|rust|unknown>
+          EXPECTED_BEHAVIOR: <brief or ASSUMED: not provided>
+          RECENT_CHANGES: <brief or ASSUMED: not provided>
+          TRACE_PRESENT: <yes|no>
+          PRIMARY_EXCEPTION: <exception/error head or unknown>
+          PRIMARY_FILES:
+            - <path:line if present, otherwise unknown>
     - id: parse_trace
       kind: llm_chat
       depends_on: [trace_collect]
@@ -63,12 +62,8 @@ composition:
           Extract structured info from the stack trace below; do not speculate
           about root cause yet.
 
-          Language (user-confirmed):
-          {{ inputs.collected.trace_collect.language }}
-
-          User-supplied context (treat as hints, not authoritative):
-          - expected behavior: {{ inputs.collected.trace_collect.expected_behavior | default("") | xml_escape | truncate(300) }}
-          - recent changes: {{ inputs.collected.trace_collect.recent_changes | default("") | xml_escape | truncate(300) }}
+          Extracted investigation brief (treat as hints, not authoritative):
+          {{ outputs.trace_collect | xml_escape | truncate(1000) }}
 
           Traceback under investigation:
           ---
@@ -193,13 +188,13 @@ composition:
       skill: stack-trace-generic-probe
       depends_on: [parse_trace]
       route:
-        - when: "inputs.collected.trace_collect.language == 'python'"
+        - when: "'\"language\":\"python\"' in outputs.parse_trace or '\"language\": \"python\"' in outputs.parse_trace or 'LANGUAGE: python' in outputs.trace_collect"
           to: stack-trace-python-probe
-        - when: "inputs.collected.trace_collect.language in ('javascript', 'typescript')"
+        - when: "'\"language\":\"javascript\"' in outputs.parse_trace or '\"language\": \"javascript\"' in outputs.parse_trace or '\"language\":\"typescript\"' in outputs.parse_trace or '\"language\": \"typescript\"' in outputs.parse_trace or 'LANGUAGE: javascript' in outputs.trace_collect or 'LANGUAGE: typescript' in outputs.trace_collect"
           to: stack-trace-js-probe
-        - when: "inputs.collected.trace_collect.language == 'go'"
+        - when: "'\"language\":\"go\"' in outputs.parse_trace or '\"language\": \"go\"' in outputs.parse_trace or 'LANGUAGE: go' in outputs.trace_collect"
           to: stack-trace-go-probe
-        - when: "inputs.collected.trace_collect.language == 'rust'"
+        - when: "'\"language\":\"rust\"' in outputs.parse_trace or '\"language\": \"rust\"' in outputs.parse_trace or 'LANGUAGE: rust' in outputs.trace_collect"
           to: stack-trace-rust-probe
       with:
         task: |
@@ -209,7 +204,7 @@ composition:
           evidence that is absent.
 
           Language classification:
-          {{ inputs.collected.trace_collect.language | truncate(400) }}
+          {{ outputs.trace_collect | truncate(400) }}
 
           Trace parse:
           {{ outputs.parse_trace | truncate(1200) }}
@@ -308,7 +303,7 @@ composition:
           limited to read-only locate/history checks or existing test commands.
 
           Language classification:
-          {{ inputs.collected.trace_collect.language | truncate(400) }}
+          {{ outputs.trace_collect | truncate(400) }}
 
           Trace parse:
           {{ outputs.parse_trace | truncate(600) }}
@@ -464,7 +459,7 @@ composition:
           {{ outputs.parse_trace | truncate(800) }}
 
           Language classification:
-          {{ inputs.collected.trace_collect.language | truncate(400) }}
+          {{ outputs.trace_collect | truncate(400) }}
 
           Verification plan:
           {{ outputs.repro_suggestion | truncate(1000) }}
