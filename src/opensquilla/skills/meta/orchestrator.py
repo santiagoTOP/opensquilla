@@ -31,10 +31,15 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 from opensquilla.engine.types import AgentConfig, AgentEvent
 from opensquilla.provider.protocol import LLMProvider
 from opensquilla.skills.meta.events import _StepDone, yield_skill_view_preface
-from opensquilla.skills.meta.executors.agent import run_step_with_skill_stream
+from opensquilla.skills.meta.executors.agent import (
+    run_step_with_skill_stream,
+    run_step_with_skill_text_only,
+)
 from opensquilla.skills.meta.executors.llm_classify import (
     run_llm_chat_step,
     run_llm_classify_step,
@@ -56,6 +61,7 @@ if TYPE_CHECKING:
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
 
 log = logging.getLogger(__name__)
+slog = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Injected-dependency protocols
@@ -488,6 +494,17 @@ class MetaOrchestrator:
             )
             # Skip path only — pause path raises MetaPaused, which the
             # scheduler catches before we get here.
+            yield _StepDone(text=text)
+            return
+        if effective_skill == "paper-section-author" and self._llm_chat is not None:
+            text = await run_step_with_skill_text_only(
+                step,
+                effective_skill,
+                inputs,
+                outputs,
+                llm_chat=self._llm_chat,
+                skill_loader=self._skill_loader,
+            )
             yield _StepDone(text=text)
             return
         # agent kind: forward sub-Agent events as they arrive.
@@ -958,7 +975,59 @@ def make_agent_runner_from_parent(
     file tools against it (sub_config.workspace_dir).
     """
 
+    # Diagnostic: log the workspace_dir this factory was constructed with
+    # so we can verify the value flowing into sub-Agents matches the
+    # gateway-configured workspace (vs. falling through to
+    # default_workspace_dir()). structlog-based so the gateway's
+    # configured log pipeline doesn't swallow it (stdlib INFO is
+    # filtered out by the default root logger level).
+    slog.info(
+        "meta_orchestrator.agent_runner_factory",
+        workspace_dir=workspace_dir,
+        session_key=session_key,
+    )
+
+    # Last-mile safety: if the caller chain (Agent meta_invoke /
+    # meta_resume handlers) ended up resolving workspace_dir to None,
+    # the sub-Agent's system prompt would not have a ``## Workspace``
+    # section and the LLM would invent paths from its training prior
+    # (most commonly ``/root/.opensquilla/workspace/...`` for the root
+    # user). That tripped sandbox sensitive-path blocks repeatedly.
+    # Pull from ``current_tool_context`` as the authoritative fallback
+    # — the gateway always seeds it with the
+    # ``resolve_agent_workspace_dir`` value at turn start (see
+    # ``rpc_sessions._handle_chat_send`` and friends).
+    if not workspace_dir:
+        from opensquilla.tools.types import current_tool_context as _ctc
+        _ctx = _ctc.get()
+        ctc_ws = getattr(_ctx, "workspace_dir", None) if _ctx is not None else None
+        if ctc_ws:
+            workspace_dir = str(ctc_ws)
+            slog.warning(
+                "meta_orchestrator.agent_runner_factory_recovered_workspace",
+                workspace_dir=workspace_dir,
+                session_key=session_key,
+                source="current_tool_context",
+            )
+
     async def _runner(system_prompt: str, user_message: str) -> AsyncIterator[AgentEvent]:
+        # Per-call recovery: prefer the live tool_context's workspace_dir
+        # over the (possibly stale or None) factory closure value. The
+        # outer turn's tool_context is set by the gateway and is the
+        # single source of truth; trust it on every sub-Agent spawn.
+        # See ``rpc_sessions._handle_chat_send`` for where it's seeded
+        # with ``resolve_agent_workspace_dir`` from the gateway config.
+        from opensquilla.tools.types import current_tool_context as _ctc
+        _ctx = _ctc.get()
+        _live_ws = getattr(_ctx, "workspace_dir", None) if _ctx is not None else None
+        effective_workspace_dir = str(_live_ws) if _live_ws else workspace_dir
+        slog.info(
+            "meta_orchestrator.subagent_spawn",
+            factory_workspace_dir=workspace_dir,
+            live_workspace_dir=_live_ws,
+            effective_workspace_dir=effective_workspace_dir,
+            session_key=session_key,
+        )
         # Build a fresh AgentConfig keyed off the parent's settings but with
         # the skill body installed as the sub-turn's system prompt. The
         # iteration cap allows for multi-fetch flows (arxiv-deck pulls 6
@@ -986,10 +1055,10 @@ def make_agent_runner_from_parent(
         # TurnRunner._build_agent_for_turn; the live value lives only in
         # the per-call ToolContext and must be threaded through here.
         sub_system_prompt = system_prompt
-        if workspace_dir:
+        if effective_workspace_dir:
             sub_system_prompt = (
                 f"{system_prompt}\n\n## Workspace\n"
-                f"Your workspace directory is `{workspace_dir}`.\n"
+                f"Your workspace directory is `{effective_workspace_dir}`.\n"
                 f"When calling write_file / read_file / list_dir / "
                 f"publish_artifact, use absolute paths INSIDE this "
                 f"directory. Paths outside it may be blocked or require "

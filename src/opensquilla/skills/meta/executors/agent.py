@@ -11,7 +11,7 @@ output.
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from opensquilla.engine.types import AgentEvent, TextDeltaEvent, ToolResultEvent
@@ -134,4 +134,36 @@ async def run_step_with_skill_stream(
     )
 
 
-__all__ = ["run_step_with_skill_stream"]
+async def run_step_with_skill_text_only(
+    step: MetaStep,
+    effective_skill: str,
+    inputs: dict[str, Any],
+    outputs: dict[str, str],
+    *,
+    llm_chat: Callable[[str, str], Awaitable[str]],
+    skill_loader: Any,
+) -> str:
+    """Run an agent-kind text authoring step without exposing tools."""
+
+    skill_spec = skill_loader.get_by_name(effective_skill)
+    if skill_spec is None:
+        raise ValueError(
+            f"step {step.id!r}: skill {effective_skill!r} not found in loader",
+        )
+    if getattr(skill_spec, "kind", "skill") == "meta":
+        raise ValueError(
+            f"step {step.id!r}: cannot compose another meta-skill ({effective_skill!r})",
+        )
+
+    rendered_args = render_with_args(
+        step.with_args,
+        inputs=inputs,
+        outputs=outputs,
+    )
+    user_message = format_step_prompt(effective_skill, rendered_args)
+    system_prompt = _expand_skill_placeholders(skill_spec)
+    text = await llm_chat(system_prompt, user_message)
+    return _normalize_agent_step_output(effective_skill, text.strip())
+
+
+__all__ = ["run_step_with_skill_stream", "run_step_with_skill_text_only"]

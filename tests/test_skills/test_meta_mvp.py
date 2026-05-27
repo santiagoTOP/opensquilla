@@ -2113,6 +2113,60 @@ async def test_iter_events_forwards_subagent_tool_events_but_folds_text() -> Non
 
 
 @pytest.mark.asyncio
+async def test_paper_section_author_uses_llm_chat_without_subagent_tools() -> None:
+    """paper-section-author is a text-only section writer.
+
+    Running it as a full sub-Agent exposes shell/code tools, which can turn a
+    single section into a long write/check/rewrite loop. When the orchestrator
+    has an LLM-only dependency, this skill should bypass the sub-Agent runner.
+    """
+
+    spec = _make_meta_spec(
+        composition={
+            "steps": [
+                {
+                    "id": "abstract",
+                    "kind": "agent",
+                    "skill": "paper-section-author",
+                    "with": {"task": "Write the abstract."},
+                },
+            ],
+        },
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+
+    async def explode_runner(_s: str, _u: str) -> AsyncIterator[AgentEvent]:
+        raise AssertionError("paper-section-author must not use sub-Agent tools")
+        if False:
+            yield DoneEvent(text="")  # pragma: no cover
+
+    llm_calls: list[tuple[str, str]] = []
+
+    async def llm_chat(system_prompt: str, user_message: str) -> str:
+        llm_calls.append((system_prompt, user_message))
+        return "\\begin{abstract}\nFast section.\n\\end{abstract}"
+
+    orch = MetaOrchestrator(
+        agent_runner=explode_runner,
+        skill_loader=_FakeLoader([
+            _make_skill_spec("paper-section-author", content="SECTION BODY"),
+        ]),
+        llm_chat=llm_chat,
+    )
+
+    final: MetaResult | None = None
+    async for ev in orch.iter_events(MetaMatch(plan=plan, inputs={})):
+        if isinstance(ev, MetaResult):
+            final = ev
+
+    assert final is not None and final.ok
+    assert len(llm_calls) == 1
+    assert "SECTION BODY" in llm_calls[0][0]
+    assert "\\begin{abstract}" in final.final_text
+
+
+@pytest.mark.asyncio
 async def test_iter_events_emits_error_result_on_step_failure() -> None:
     from opensquilla.engine.types import ToolResultEvent
     from opensquilla.skills.meta.types import MetaResult
