@@ -23,21 +23,57 @@ provenance:
   license: Apache-2.0
 composition:
   steps:
+    - id: trip_collect
+      kind: user_input
+      clarify:
+        mode: form
+        intro: |
+          在开始规划之前，请先确认 4 件事 —— 我会用它生成完整行程。
+        fields:
+          - name: destination
+            type: string
+            required: true
+            prompt: "目的地（城市或地区）"
+            max_chars: 80
+          - name: days
+            type: int
+            required: true
+            min: 1
+            max: 30
+            prompt: "行程天数（1–30）"
+          - name: party_size
+            type: int
+            required: true
+            min: 1
+            max: 20
+            prompt: "出行人数（1–20）"
+          - name: budget
+            type: enum
+            choices: [budget, mid, premium]
+            default: mid
+            prompt: "预算档次（budget / mid / premium）"
+        cancel_keywords: ["算了", "取消", "cancel", "stop"]
+        timeout_hours: 24
     - id: trip_preferences
       kind: llm_chat
+      depends_on: [trip_collect]
       with:
-        system: "You infer practical travel-planning constraints. Return only the requested contract."
+        system: "You expand user-confirmed travel facts into a structured planning contract."
         task: |
-          Infer the travel-planning contract from the request. If date, party
-          size, budget, pace, or interests are missing, choose practical
-          defaults and list them as assumptions.
+          Expand the user-confirmed travel facts into a full planning contract.
 
-          User request:
+          User-confirmed facts:
+          DESTINATION: {{ inputs.collected.trip_collect.destination | xml_escape }}
+          DAYS: {{ inputs.collected.trip_collect.days }}
+          PARTY: {{ inputs.collected.trip_collect.party_size }}
+          BUDGET: {{ inputs.collected.trip_collect.budget }}
+
+          Original user request (context only, do NOT override confirmed facts):
           {{ inputs.user_message | xml_escape | truncate(1200) }}
 
           Return exactly:
           DESTINATION: <city/region>
-          DATES: <dates or assumed trip length>
+          DATES: <duration or date range>
           PARTY: <party size/type>
           BUDGET: <budget level>
           PACE: <relaxed|balanced|packed>
@@ -122,7 +158,7 @@ composition:
 
           Required sections:
           1. Assumptions
-          2. Primary 3-day itinerary
+          2. Primary itinerary matching the requested or inferred trip length
           3. Weather-aware risks and rain backups
           4. Variants
           5. Budget and booking notes
@@ -130,14 +166,26 @@ composition:
           7. Next steps
 
           Preserve concrete timings, neighborhoods, transit grouping, food
-          ideas, weather constraints, and budget constraints. Keep each day to
-          5-7 highly actionable bullets or a compact schedule. Include:
+          ideas, weather constraints, and budget constraints. Do not open with
+          "I researched" or imply live verification unless a tool result is
+          shown in the evidence notes. Keep each day to 5-7 highly actionable
+          bullets or a compact schedule. Include:
+          - a Route spine line for each day, e.g. Neighborhood A -> B -> C
+          - no more than 2-3 main anchors per day unless the user requested a
+            packed pace
+          - an explicit pacing note: relaxed/balanced/packed and what to skip
+            if tired
+          - transit-coherent neighborhood adjacency; avoid cross-city zigzags
           - relaxed version
           - efficient/packed version
           - bad-weather backup
+          - weather switch points: if rain/heavy heat, swap X for Y
           - rough daily budget notes
           - specific checks before booking, including opening-hours checks,
             timed-entry reservations, and transit-pass choice
+          - mark specific restaurants, opening hours, and seasonal events as
+            "verify before booking" unless they came from explicit search
+            evidence in this run
           - a short note that a styled HTML itinerary can be generated only if
             the user explicitly asks for a file
 
