@@ -115,15 +115,28 @@ def test_meta_paper_write_declares_long_paper_generation_contract() -> None:
 def test_meta_paper_write_declares_quality_pipeline_stages() -> None:
     meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
 
+    # Search + bibliography pipeline.
     assert "multi-search-engine" in meta
-    assert "paper-experiment-stub" in meta
     assert "paper-refbib-stub" in meta
-    assert "paper-plot-stub" in meta
-    assert "Save as `paper_preferences`" in meta
+    assert "site:arxiv.org" in meta  # academic-site bias on search query
+    # Core LLM-driven design stages.
+    assert "paper_preferences" in meta
     assert "{{ outputs.paper_preferences | truncate(2000) }}" in meta
-    assert "Save as `source_pack`" in meta
-    assert "Save as `citation_plan`" in meta
+    assert "source_pack" in meta
+    assert "experiment_design" in meta
+    assert "FIGURE_PLAN:" in meta
+    assert "TABLE_PLAN:" in meta
+    assert "ANALYSIS_DIMENSIONS:" in meta
+    assert "figure_placeholders" in meta
+    assert "table_placeholders" in meta
+    assert "analysis_outline" in meta
+    assert "citation_plan" in meta
     assert "final_manuscript_package" in meta
+    # Citation provenance audit + strict citation contract.
+    assert "citation_map" in meta
+    assert "DO NOT invent cite keys" in meta
+    assert "Source Quality" in meta
+    # Quality bar / mode behavior.
     assert "10+ compiled pages" in meta
     assert "20 distinct citation keys" in meta
     assert "Do not run xelatex in the" in meta

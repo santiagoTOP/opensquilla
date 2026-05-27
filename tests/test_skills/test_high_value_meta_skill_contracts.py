@@ -196,36 +196,54 @@ def test_paper_meta_skill_uses_compact_default_manuscript_path(
         "REPAIR_EXISTING",
         "COMPILE_ONLY",
     }
-    assert steps["experiment"].when == (
-        "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
+    # Pipeline rewrite: experiment/plot (skill_exec stubs producing fake
+    # CSV + matplotlib chart) replaced with 4 LLM steps that design the
+    # experiments and emit LaTeX placeholder figures/tables/analysis.
+    assert "experiment" not in steps
+    assert "plot" not in steps
+    assert steps["experiment_design"].when == (
+        "inputs.collected.paper_collect.paper_mode in "
+        "('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
     )
-    assert steps["plot"].when == (
-        "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
-    )
+    assert steps["figure_placeholders"].when == steps["experiment_design"].when
+    assert steps["table_placeholders"].when == steps["experiment_design"].when
+    assert steps["analysis_outline"].when == steps["experiment_design"].when
     assert steps["compile_latex"].when == (
         "inputs.collected.paper_collect.paper_mode == 'COMPILE_ONLY'"
     )
     for step_id in (
         "paper_preferences",
         "source_pack",
+        "experiment_design",
+        "figure_placeholders",
+        "table_placeholders",
+        "analysis_outline",
         "outline",
         "citation_plan",
         "final_manuscript_package",
+        "citation_map",
         "paper_length_gate",
         "citation_integrity_gate",
         "latex_sanitizer",
         "compile_latex",
     ):
-        assert steps[step_id].kind == "llm_chat"
-    for step_id in ("search_papers", "experiment", "refbib", "plot"):
+        assert steps[step_id].kind == "llm_chat", step_id
+    for step_id in ("search_papers", "refbib"):
         assert steps[step_id].kind == "skill_exec"
     assert steps["compile_latex"].depends_on == ("latex_sanitizer",)
+    # New citation-provenance contract — the manuscript prompt must
+    # carry the strict "do not invent cite keys" instructions.
     final_prompt = str(steps["final_manuscript_package"].with_args)
-    assert "never omit REFERENCES_BIB" in final_prompt
-    assert "at least 20 reference entries" in final_prompt
-    assert "roughly 1,500 words before REFERENCES_BIB" in final_prompt
-    assert "citation integrity beats prose length" in final_prompt
-    assert "placeholder BibTeX stubs" in final_prompt
+    assert "DO NOT invent cite keys" in final_prompt
+    assert "verbatim in REFERENCES_BIB" in final_prompt
+    assert "figure_placeholders" in final_prompt
+    assert "table_placeholders" in final_prompt
+    assert "analysis_outline" in final_prompt
+    # citation_map step exposes the per-key audit table.
+    citation_map_prompt = str(steps["citation_map"].with_args)
+    assert "Source Quality" in citation_map_prompt
+    assert "INVALID" in citation_map_prompt
+    assert "STRONG" in citation_map_prompt
 
 
 def test_pdf_intelligence_preserves_traceable_multi_document_structure(
@@ -289,10 +307,15 @@ def test_stack_trace_investigator_supports_language_routing_and_degraded_output(
     assert spec is not None
     raw = str(spec.composition_raw)
 
-    # PR8 follow-up migration: classify_language (llm_classify) was
-    # replaced with trace_collect (user_input) so the user picks the
-    # language explicitly.
     assert {"trace_collect", "repro_suggestion", "degraded_summary"} <= ids
+    steps = {step["id"]: step for step in spec.composition_raw["steps"]}
+    assert steps["trace_collect"]["kind"] == "llm_chat"
+    trace_collect = str(steps["trace_collect"]["with"])
+    assert "Do NOT ask the user to confirm" in trace_collect
+    assert "ASSUMED" in trace_collect
+    assert "PRIMARY_EXCEPTION" in trace_collect
+    assert "inputs.collected.trace_collect" not in raw
+    assert "outputs.trace_collect" in raw
     assert "javascript" in raw
     assert "typescript" in raw
     assert "go" in raw
@@ -373,7 +396,10 @@ def test_stack_trace_final_report_requires_patch_target_checklist(
 def test_travel_planner_collects_preferences_constraints_and_variants(
     tmp_path: Path,
 ) -> None:
-    ids = _step_ids(_loader(tmp_path), "meta-travel-planner")
+    loader = _loader(tmp_path)
+    spec = loader.get_by_name("meta-travel-planner")
+    assert spec is not None
+    ids = _step_ids(loader, "meta-travel-planner")
 
     assert {
         "trip_preferences",
@@ -384,6 +410,10 @@ def test_travel_planner_collects_preferences_constraints_and_variants(
         "final_plan",
     } <= ids
     assert "export" not in ids
+    triggers = {trigger.lower() for trigger in spec.triggers}
+    assert "days in" in triggers
+    assert "plan a trip" in triggers
+    assert "itinerary for" in triggers
 
 
 def test_travel_planner_uses_fast_final_itinerary_path(tmp_path: Path) -> None:
@@ -392,7 +422,10 @@ def test_travel_planner_uses_fast_final_itinerary_path(tmp_path: Path) -> None:
     steps, plan = _steps_by_id(loader, "meta-travel-planner")
 
     assert plan.final_text_mode == "step:final_plan"
+    assert steps["trip_collect"].kind == "llm_chat"
+    assert steps["trip_collect"].clarify_config is None
     for step_id in (
+        "trip_collect",
         "trip_preferences",
         "constraints",
         "itinerary",
@@ -404,18 +437,34 @@ def test_travel_planner_uses_fast_final_itinerary_path(tmp_path: Path) -> None:
     assert steps["poi"].skill == "multi-search-engine"
     assert steps["poi"].kind == "skill_exec"
     assert steps["final_plan"].depends_on == ("itinerary", "constraints", "weather", "poi")
+    collect_prompt = str(steps["trip_collect"].with_args)
+    preference_prompt = str(steps["trip_preferences"].with_args)
+    constraint_prompt = str(steps["constraints"].with_args)
     final_plan_prompt = str(steps["final_plan"].with_args)
+    assert "Do NOT ask the user to confirm details" in collect_prompt
+    assert "safely inferable" in collect_prompt
+    assert "Do not invent exact calendar dates" in collect_prompt
+    assert "outputs.trip_collect" in preference_prompt
+    assert "Never return a clarification question" in preference_prompt
+    assert "short-range/current forecasts" in constraint_prompt
+    assert "seasonal risk language" in constraint_prompt
+    assert "mobility, dietary, fixed-booking" in constraint_prompt
     assert "Primary 3-day itinerary" not in final_plan_prompt
     assert "requested or inferred trip length" in final_plan_prompt
     assert "Variants" in str(steps["final_plan"].with_args)
     assert "Evidence and source notes" in str(steps["final_plan"].with_args)
     assert "Next steps" in str(steps["final_plan"].with_args)
-    assert "explicitly asks for a file" in str(steps["final_plan"].with_args)
+    assert "artifact or file" in final_plan_prompt
     assert "Route spine" in final_plan_prompt
     assert "Do not open with" in final_plan_prompt
+    assert "Do not invent exact trip calendar dates" in final_plan_prompt
+    assert "seasonal planning assumption" in final_plan_prompt
+    assert "one rest block or pacing reset per day" in final_plan_prompt
     assert "weather switch points" in final_plan_prompt
     assert "verify before booking" in final_plan_prompt
     assert "avoid cross-city zigzags" in final_plan_prompt
+    assert "ranges and flex levers" in final_plan_prompt
+    assert "omit artifact generation suggestions" in final_plan_prompt
     assert "ARTIFACT_READY" not in str(plan.steps)
 
 
@@ -521,7 +570,17 @@ def test_migration_assistant_routes_guides_and_optional_repo_context(
         "repo_context",
     }
     assert steps["write_plan"].kind == "llm_chat"
+    classify_prompt = str(steps["classify"].with_args)
+    fetch_prompt = str(steps["fetch_guide"].with_args)
     write_plan_prompt = str(steps["write_plan"].with_args)
+    assert "Ignore benchmark wrappers" in classify_prompt
+    assert "truncate(1400)" in classify_prompt
+    assert "after benchmark constraints" in classify_prompt
+    assert "CommonJS" in classify_prompt and "native ESM" in classify_prompt
+    assert "return exactly" in classify_prompt and "CJS_TO_ESM" in classify_prompt
+    assert "Ignore benchmark preambles" in fetch_prompt
+    assert "package.json type/exports" in fetch_prompt
+    assert "directory imports" in fetch_prompt
     assert "Answer the user's requested" in write_plan_prompt
     assert "EFFECTIVE_KIND=CJS_TO_ESM" in write_plan_prompt
     assert "CommonJS to native ES Modules" in write_plan_prompt
@@ -544,7 +603,19 @@ def test_migration_assistant_routes_guides_and_optional_repo_context(
     assert "semver-major trigger" in write_plan_prompt
     assert "canary/internal" in write_plan_prompt
     assert "Avoid file-creation" in write_plan_prompt
+    assert "Benchmark/no-write constraint" in write_plan_prompt
+    assert "`cat >`" in write_plan_prompt
+    assert "`tee`" in write_plan_prompt
+    assert "`node -e` snippets that write files" in write_plan_prompt
+    assert "Never ask the user to create `tmp-smoke.*` files" in write_plan_prompt
+    assert "JSON-module/import-attributes support" in write_plan_prompt
+    assert "Avoid invented loader placeholders" in write_plan_prompt
     assert "exports` takes precedence" in write_plan_prompt
+    assert "1,200-1,800 words" in write_plan_prompt
+    assert "directory `index.js` imports" in write_plan_prompt
+    assert "default export shape changes" in write_plan_prompt
+    assert "subpath whitelisting" in write_plan_prompt
+    assert "Do not include brittle placeholder commands" in write_plan_prompt
     assert "dual-package hazards" in write_plan_prompt
     assert "eslint --fix" in write_plan_prompt
     assert "Avoid obsolete Node flags" in write_plan_prompt

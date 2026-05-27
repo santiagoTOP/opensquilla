@@ -3429,17 +3429,17 @@ class TurnRunner:
         """
         if provider is None:
             return None
+        # Lazy import keeps the runtime cold-start independent of meta.
         from opensquilla.engine.types import AgentConfig
         from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
 
-        base_config = (
-            self._config
-            if isinstance(self._config, AgentConfig)
-            else AgentConfig()
-        )
+        # ``make_llm_chat_from_provider`` only reads ``model_id`` /
+        # ``metadata`` off base_config (via getattr). ``self._config`` is
+        # the GatewayConfig (different shape — no .model_id), so build a
+        # minimal AgentConfig() rather than passing the wrong type.
         return make_llm_chat_from_provider(
             provider=provider,
-            base_config=base_config,
+            base_config=AgentConfig(),
             usage_tracker=getattr(self, "_usage_tracker", None),
             session_key=session_key,
         )

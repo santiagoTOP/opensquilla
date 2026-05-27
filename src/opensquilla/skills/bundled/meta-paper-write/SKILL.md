@@ -1,6 +1,6 @@
 ---
 name: meta-paper-write
-description: "Use this meta-skill instead of answering directly when the user needs a research paper, academic paper, or long-form LaTeX manuscript that benefits from multi-skill orchestration across source search, citation planning, section drafting, length checks, bibliography integrity, and LaTeX compilation."
+description: "Use this meta-skill instead of answering directly when the user needs a research paper, academic paper, or long-form LaTeX manuscript that benefits from multi-skill orchestration across source search, citation planning, experiment design, placeholder figures/tables, section drafting, length checks, citation integrity, and LaTeX compilation."
 kind: meta
 meta_priority: 50
 always: false
@@ -32,13 +32,7 @@ composition:
         intro: |
           开始之前，请确认 5 件事 —— 我会用它生成完整论文 / Before drafting,
           please confirm 5 items — I'll use them to generate the manuscript.
-        # skip_if lets E2E tests pre-populate inputs.collected.paper_collect
-        # and bypass the live pause; production turns leave it empty so the
-        # form fires.
         skip_if: "inputs.collected.paper_collect is defined"
-        # Accept natural-language replies — when the deterministic
-        # parser fails the runtime falls through to an LLM extractor
-        # that maps free-form prose onto the schema fields.
         nl_extract: true
         fields:
           - name: topic
@@ -109,16 +103,12 @@ composition:
       depends_on: [paper_preferences]
       when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
-        query: "{{ inputs.collected.paper_collect.topic | xml_escape | truncate(512) }}"
+        # Academic-site bias: search results favour real paper venues so
+        # the refbib step gets URLs that translate into arxiv eprint /
+        # doi identifiers — not blog posts or wikipedia.
+        query: "{{ inputs.collected.paper_collect.topic | xml_escape | truncate(400) }} (site:arxiv.org OR site:aclanthology.org OR site:dl.acm.org OR site:openreview.net OR site:ieee.org OR site:nature.com OR site:science.org)"
         engines: [brave, duckduckgo, tavily]
         max_results: 25
-    - id: experiment
-      kind: skill_exec
-      skill: paper-experiment-stub
-      depends_on: [paper_preferences]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
-      with:
-        topic: "{{ inputs.collected.paper_collect.topic | xml_escape | truncate(200) }}"
     - id: refbib
       kind: skill_exec
       skill: paper-refbib-stub
@@ -154,9 +144,239 @@ composition:
             - refN | title | supported claim
           COVERAGE_GAPS:
             - <gap or none>
+    - id: experiment_design
+      kind: llm_chat
+      depends_on: [paper_preferences, source_pack]
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      with:
+        system: "You design rigorous, falsifiable experiments. You also decide how many figures and tables the paper needs based on the target page budget, the research questions, and the analysis dimensions — do not over- or under-provision."
+        task: |
+          Design the experiments and supporting figures/tables for this
+          paper. The design must be tight enough that downstream LaTeX
+          generation can render placeholder figure/table environments
+          straight from your output.
+
+          Paper facts:
+          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}
+          PAPER_MODE: {{ inputs.collected.paper_collect.paper_mode }}
+          TARGET_PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
+          AUDIENCE: {{ inputs.collected.paper_collect.audience }}
+
+          Preferences:
+          {{ outputs.paper_preferences | truncate(2000) }}
+
+          Source pack (cite keys must come from here):
+          {{ outputs.source_pack | truncate(6000) }}
+
+          Provisioning rules (you decide the actual count within these):
+          - target ≤8 pages    → 1–2 figures, 0–1 tables
+          - target 9–14 pages  → 2–4 figures, 1–2 tables
+          - target 15–24 pages → 4–6 figures, 2–3 tables
+          - target ≥25 pages   → 6–10 figures, 3–5 tables
+          Every figure/table MUST trace to a research question or an
+          analysis dimension. Do not invent purely decorative figures.
+
+          Reply with EXACTLY this structure (verbatim section headers, no
+          markdown fences):
+
+          RESEARCH_QUESTIONS:
+            - id: RQ1
+              question: <one sentence>
+            - id: RQ2
+              question: <one sentence>
+            - id: RQ3
+              question: <one sentence>
+
+          HYPOTHESES:
+            - id: H1; supports: RQ1; statement: <one sentence>
+            - id: H2; supports: RQ2; statement: <one sentence>
+
+          VARIABLES:
+            independent: <list>
+            dependent: <list>
+            controlled: <list>
+
+          DATASETS:
+            - name; size; split; license/source; rationale
+
+          BASELINES:
+            - name; rationale; cite_key (from source_pack); ablation_relationship
+
+          METRICS:
+            - name; definition; supports: RQ#
+
+          FIGURE_PLAN:
+            - id: fig1
+              type: <line|bar|scatter|heatmap|violin|timeline|cdf|box|matrix>
+              x_axis: <semantic + unit>
+              y_axis: <semantic + unit>
+              comparison_groups: <list>
+              supports: <RQ#|H#>
+              caption_hint: <short, factual>
+            - id: fig2
+              ... (repeat per provisioning rules)
+
+          TABLE_PLAN:
+            - id: tab1
+              columns: <list of column headers>
+              rows_shape: <e.g. "one row per baseline + ours + 2 ablations">
+              supports: <RQ#|H#>
+              caption_hint: <short, factual>
+            - id: tab2
+              ... (repeat per provisioning rules)
+
+          ANALYSIS_DIMENSIONS:
+            - dimension: performance; figures: [fig1]; tables: [tab1]; coverage_note: <why this matters>
+            - dimension: ablation; figures: [fig2]; tables: [tab2]; coverage_note: <...>
+            - dimension: sensitivity_or_robustness; figures: [...]; tables: [...]; coverage_note: <...>
+            - dimension: efficiency; figures: [...]; tables: [...]; coverage_note: <...>
+            - dimension: failure_analysis_or_qualitative; figures: [...]; tables: [...]; coverage_note: <...>
+
+          Strict rules:
+          - Every figure/table id appears in at least one ANALYSIS_DIMENSIONS row.
+          - Every RESEARCH_QUESTION is supported by ≥1 figure AND/OR ≥1 table.
+          - cite_key fields must reference IDs that exist in source_pack;
+            do not invent new ref keys here.
+    - id: figure_placeholders
+      kind: llm_chat
+      depends_on: [experiment_design]
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      with:
+        system: "You render LaTeX placeholder figure environments from a structured figure plan. Output is pure LaTeX, ready to inline into a manuscript."
+        task: |
+          For EACH figure listed in FIGURE_PLAN below, emit one LaTeX
+          ``figure`` environment. Use ``\fbox{\parbox{0.8\linewidth}{...}}``
+          as the placeholder body — DO NOT use ``\includegraphics``
+          because no PDFs exist yet.
+
+          Body of each placeholder MUST list:
+            * the figure's id (fig1, fig2, …)
+            * the chart type
+            * x_axis / y_axis labels with units
+            * comparison_groups
+            * RQ/H it supports
+
+          Caption must come from caption_hint verbatim (escape LaTeX
+          specials). Label MUST be ``\label{fig:<id>}`` so analysis_outline
+          and final_manuscript_package can ``\ref{fig:<id>}`` them.
+
+          Experiment design:
+          {{ outputs.experiment_design | truncate(8000) }}
+
+          Reply with ONLY the concatenated LaTeX figure environments,
+          one per FIGURE_PLAN entry, separated by a blank line. No
+          preamble, no markdown, no commentary. Wrap the entire block
+          between sentinel comments so downstream sanitizer can locate
+          it:
+
+          % BEGIN_FIGURE_PLACEHOLDERS
+          \begin{figure}[t]
+            \centering
+            \fbox{\parbox{0.8\linewidth}{\centering\vspace{1em}
+              \textbf{[Placeholder] fig1: line plot}\\
+              x: training step (1k iter); y: validation accuracy (\%)\\
+              groups: ours / baseline-A / baseline-B\\
+              supports: RQ1
+              \vspace{1em}}}
+            \caption{<caption_hint>}
+            \label{fig:fig1}
+          \end{figure}
+
+          \begin{figure}[t]
+            ... (repeat per FIGURE_PLAN entry)
+          \end{figure}
+          % END_FIGURE_PLACEHOLDERS
+    - id: table_placeholders
+      kind: llm_chat
+      depends_on: [experiment_design]
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      with:
+        system: "You render LaTeX placeholder table environments from a structured table plan. Output is pure LaTeX, ready to inline into a manuscript."
+        task: |
+          For EACH table listed in TABLE_PLAN below, emit one LaTeX
+          ``table`` environment with a ``tabular`` body. Use ``---`` or
+          ``<TBD>`` for cells (DO NOT fabricate numbers). Use booktabs
+          (``\toprule``, ``\midrule``, ``\bottomrule``) for clean spacing.
+
+          Header row comes from TABLE_PLAN columns; row labels come from
+          rows_shape (expand the shape into concrete row names like
+          "Baseline-A", "Baseline-B", "Ours", "Ours w/o module X", …).
+          Caption is caption_hint verbatim. Label MUST be
+          ``\label{tab:<id>}``.
+
+          Experiment design:
+          {{ outputs.experiment_design | truncate(8000) }}
+
+          Reply with ONLY the concatenated LaTeX table environments,
+          one per TABLE_PLAN entry, between sentinel comments:
+
+          % BEGIN_TABLE_PLACEHOLDERS
+          \begin{table}[t]
+            \centering
+            \begin{tabular}{lccc}
+              \toprule
+              Method & Acc & F1 & Latency \\
+              \midrule
+              Baseline-A & --- & --- & --- \\
+              Baseline-B & --- & --- & --- \\
+              Ours       & --- & --- & --- \\
+              \bottomrule
+            \end{tabular}
+            \caption{<caption_hint>}
+            \label{tab:tab1}
+          \end{table}
+          ... (repeat per TABLE_PLAN entry)
+          % END_TABLE_PLACEHOLDERS
+    - id: analysis_outline
+      kind: llm_chat
+      depends_on: [experiment_design, figure_placeholders, table_placeholders]
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
+      with:
+        system: "You design analysis-chapter outlines that bind every figure/table to a claim and an analysis dimension."
+        task: |
+          Produce the Analysis chapter outline. Each subsection must
+          ``\ref{fig:...}`` or ``\ref{tab:...}`` AT LEAST ONE artefact
+          you actually have (do not reference figures/tables that don't
+          exist in the placeholders below). Cover every ANALYSIS_DIMENSION
+          from experiment_design.
+
+          Experiment design:
+          {{ outputs.experiment_design | truncate(8000) }}
+
+          Figure placeholders (label IDs you may \ref):
+          {{ outputs.figure_placeholders | truncate(3000) }}
+
+          Table placeholders (label IDs you may \ref):
+          {{ outputs.table_placeholders | truncate(3000) }}
+
+          PAPER_MODE depth control:
+          - FULL_MANUSCRIPT: 1 subsection per analysis dimension; each
+            with potential_findings (3 bullets) + threats_to_validity
+            (1–2 bullets).
+          - COMPACT_SKELETON: 1 subsection per dimension; potential_findings
+            (1 bullet); skip threats_to_validity.
+
+          Reply in this exact shape between sentinels:
+
+          % BEGIN_ANALYSIS_OUTLINE
+          \subsection{Performance}
+          \label{sec:analysis-performance}
+          References: \ref{fig:fig1}, \ref{tab:tab1}.
+          Potential findings:
+          \begin{itemize}
+            \item ...
+          \end{itemize}
+          Threats to validity:
+          \begin{itemize}
+            \item ...
+          \end{itemize}
+
+          \subsection{Ablation}
+          ... (repeat per ANALYSIS_DIMENSION)
+          % END_ANALYSIS_OUTLINE
     - id: outline
       kind: llm_chat
-      depends_on: [source_pack]
+      depends_on: [source_pack, experiment_design]
       when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         system: "You design long-form LaTeX paper outlines with citation plans."
@@ -164,13 +384,18 @@ composition:
           Create a {{ inputs.collected.paper_collect.target_length_pages }}+ page
           research-paper outline with enough section depth for a substantial
           manuscript. Every section must name planned cite keys from the
-          bibliography.
+          bibliography. Tie the Method section to experiment_design's
+          variables/datasets/baselines and the Results section to the
+          figure/table plan (by id).
 
           Paper preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
 
           Source pack:
-          {{ outputs.source_pack | truncate(8000) }}
+          {{ outputs.source_pack | truncate(6000) }}
+
+          Experiment design:
+          {{ outputs.experiment_design | truncate(6000) }}
 
           Cite keys hint:
           {{ outputs.refbib | truncate(8000) }}
@@ -179,11 +404,13 @@ composition:
       depends_on: [outline, source_pack, refbib]
       when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
-        system: "You plan citation placement for clean BibTeX/LaTeX manuscripts."
+        system: "You plan citation placement for clean BibTeX/LaTeX manuscripts. You ONLY use cite keys that exist in the provided bibliography — never invent keys."
         task: |
           Build a citation plan that uses at least 20 distinct citation keys
           when the bibliography provides them. Use only keys that appear in
-          the BibTeX below. Attach citations to claims, not paragraphs in bulk.
+          the BibTeX below (every key must be present verbatim — verify by
+          string match before you write it). Attach citations to claims,
+          not paragraphs in bulk.
 
           Topic:
           {{ inputs.collected.paper_collect.topic | xml_escape | truncate(200) }}
@@ -194,20 +421,13 @@ composition:
           Source pack:
           {{ outputs.source_pack | truncate(8000) }}
 
-          Bibliography:
+          Bibliography (authoritative — cite keys MUST come from here):
           {{ outputs.refbib | truncate(8000) }}
-    - id: plot
-      kind: skill_exec
-      skill: paper-plot-stub
-      depends_on: [experiment]
-      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
-      with:
-        results_csv: "paper/results.csv"
     - id: final_manuscript_package
       kind: llm_chat
-      depends_on: [paper_collect, outline, citation_plan, refbib, plot]
+      depends_on: [paper_collect, outline, citation_plan, refbib, figure_placeholders, table_placeholders, analysis_outline]
       with:
-        system: "You write clean LaTeX manuscripts. Output only the requested manuscript package."
+        system: "You write clean LaTeX manuscripts. Output only the requested manuscript package. NEVER invent cite keys — every \\cite{...} you emit MUST exist verbatim in REFERENCES_BIB below."
         task: |
           Draft a full manuscript package. The default output must be clean
           LaTeX-ready paper text, not planning notes. Do not include markdown
@@ -225,26 +445,28 @@ composition:
             limitations, and conclusion.
           - COMPACT_SKELETON: produce a compact LaTeX-ready manuscript
             skeleton with section goals, planned citations, and expansion
-            notes; do not pretend it is a 10+ page finished paper. Keep
-            MANUSCRIPT_TEX short enough that the output always includes a
-            complete REFERENCES_BIB block and COMPILE_NOTES. For compact
-            skeletons, prefer concise section stubs over long prose and cap
-            the manuscript body at roughly 1,500 words before REFERENCES_BIB.
+            notes; do not pretend it is a 10+ page finished paper.
           - REPAIR_EXISTING: return a repaired clean LaTeX package focused on
             citation integrity, structure, and removal of process text.
           - COMPILE_ONLY: return a compile handoff package and blockers only;
             do not invent missing manuscript body.
 
-          Shared requirements:
-          - include Figure~\ref{fig:main} only if the plot step produced a figure
-          - keep every \cite{...} key present in the bibliography
-          - never omit REFERENCES_BIB; if the provided bibliography has fewer
-            than 20 usable entries, include all provided entries and add clearly
-            marked placeholder BibTeX stubs such as @misc{placeholderNN,...}
-            until the output contains at least 20 reference entries
-          - in COMPACT_SKELETON mode, citation integrity beats prose length:
-            output a complete skeleton plus complete REFERENCES_BIB rather than
-            an overlong body without references
+          CITATION CONTRACT (load-bearing):
+          - DO NOT invent cite keys. Use ONLY keys that appear verbatim in
+            REFERENCES_BIB below.
+          - DO NOT cite a key that REFERENCES_BIB does not contain.
+          - Every claim that needs evidence MUST cite at least one key from
+            REFERENCES_BIB.
+          - Distribute citations: avoid citing the same key 10+ times.
+
+          FIGURE/TABLE CONTRACT:
+          - Inline the figure_placeholders block verbatim into Results.
+          - Inline the table_placeholders block verbatim into Method or
+            Results (split by purpose).
+          - Inline the analysis_outline block verbatim into Discussion.
+          - Reference figures/tables via \\ref{fig:<id>} and \\ref{tab:<id>}
+            where they appear in the body; never reference an id not present
+            in the placeholders.
 
           Paper preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
@@ -255,24 +477,76 @@ composition:
           Citation plan:
           {{ outputs.citation_plan | truncate(8000) }}
 
-          Plot artifact:
-          {{ outputs.plot | truncate(1000) }}
+          Figure placeholders (inline this verbatim somewhere in Results):
+          {{ outputs.figure_placeholders | truncate(4000) }}
 
-          Bibliography:
+          Table placeholders (inline this verbatim in Method/Results):
+          {{ outputs.table_placeholders | truncate(4000) }}
+
+          Analysis outline (inline this verbatim in Discussion):
+          {{ outputs.analysis_outline | truncate(4000) }}
+
+          Bibliography (cite keys MUST come from here):
           {{ outputs.refbib | truncate(8000) }}
 
           Return exactly:
           MANUSCRIPT_TEX:
           <clean LaTeX body, starting with \begin{abstract} and continuing
-          through conclusion; compact mode must include all requested sections
-          but stay brief enough to leave room for references>
+          through conclusion, with placeholders inlined>
 
           REFERENCES_BIB:
-          <at least 20 BibTeX entries or clearly marked placeholder BibTeX
-          stubs; every \cite{...} key in MANUSCRIPT_TEX must appear here>
+          <BibTeX entries copied verbatim from the provided bibliography —
+          only the entries actually cited in MANUSCRIPT_TEX>
 
           COMPILE_NOTES:
           - <short note about figure/reference assumptions>
+    - id: citation_map
+      kind: llm_chat
+      depends_on: [final_manuscript_package, refbib]
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
+      with:
+        system: "You audit citation provenance. You read manuscript LaTeX and a BibTeX file and emit a strict markdown table. NEVER invent titles or URLs — copy fields verbatim from the BibTeX block."
+        task: |
+          Parse every \\cite{key} occurrence in MANUSCRIPT below, then
+          match each key against REFERENCES_BIB. Produce an exhaustive
+          audit table.
+
+          Manuscript:
+          {{ outputs.final_manuscript_package | truncate(12000) }}
+
+          References bib (authoritative source for title/url/eprint/doi):
+          {{ outputs.refbib | truncate(8000) }}
+
+          Reply with this exact structure (no preamble):
+
+          CITATION_MAP:
+
+          | Cite Key | Cited Times | Title | URL / DOI / arXiv | Source Quality |
+          |---|---|---|---|---|
+          | ref1 | 5 | Attention Is All You Need | https://arxiv.org/abs/1706.03762 (arXiv:1706.03762) | STRONG |
+          | ref7 | 2 | Some blog | https://medium.com/... | WEAK |
+          | ref42 | 1 | (MISSING IN BIB) | — | INVALID |
+          | refX | 0 | (declared but never cited) | https://... | UNUSED |
+
+          Source Quality buckets:
+          - STRONG: arxiv.org / aclanthology.org / dl.acm.org / openreview.net /
+                    ieee.org / nature.com / science.org / biorxiv.org / pnas.org /
+                    any URL with a real DOI or arXiv eprint identifier
+          - OK:     other .edu / .gov / .org venues, journal portals
+          - WEAK:   blog / medium / wikipedia / github / stackoverflow /
+                    social media / news / generic .com
+          - INVALID: cite key referenced in MANUSCRIPT but absent from REFERENCES_BIB
+          - UNUSED:  bib entry declared but no \\cite{...} occurrence in MANUSCRIPT
+
+          Strict rules:
+          - Read the URL from the howpublished/url/eprint/doi BibTeX fields
+            of the matching entry — do not invent.
+          - If a row is INVALID or WEAK or UNUSED, add a one-line bullet
+            after the table explaining what to do (replace, drop, find a
+            real arxiv/doi source).
+
+          After the table, emit a one-line summary:
+          SUMMARY: total_cite_keys=<N>, strong=<n>, ok=<n>, weak=<n>, invalid=<n>, unused=<n>
     - id: paper_length_gate
       kind: llm_chat
       depends_on: [final_manuscript_package, citation_plan, refbib]
@@ -287,7 +561,9 @@ composition:
           Requirements:
           - target {{ inputs.collected.paper_collect.target_length_pages }}+ compiled pages
           - substantial introduction, method, results, and discussion sections
-          - no placeholder-only paragraphs
+          - no placeholder-only paragraphs (placeholder figures/tables ARE
+            allowed and expected — only flag if the text body around them is
+            also empty)
 
           Manuscript:
           {{ outputs.final_manuscript_package | truncate(12000) }}
@@ -296,17 +572,25 @@ composition:
           {{ outputs.citation_plan | truncate(4000) }}
     - id: citation_integrity_gate
       kind: llm_chat
-      depends_on: [final_manuscript_package, citation_plan, refbib]
+      depends_on: [final_manuscript_package, citation_plan, refbib, citation_map]
       when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'REPAIR_EXISTING')"
       with:
         system: "You verify LaTeX/BibTeX citation integrity."
         task: |
           Validate citation integrity before LaTeX compilation.
 
-          Requirements:
+          Requirements (LOAD-BEARING — block compilation if any fails):
           - at least 20 references in REFERENCES_BIB when sources allow it
           - at least 20 distinct citation keys used or planned in the body
-          - no citation keys absent from references.bib
+          - NO citation keys absent from references.bib (citation_map column
+            "INVALID" must be 0)
+          - every cited entry MUST have a verifiable URL or DOI or arXiv
+            eprint field in REFERENCES_BIB; entries with only howpublished
+            text are degraded but acceptable; entries with no URL/DOI/eprint
+            at all are blockers
+          - no Source Quality == WEAK in citation_map for primary claims
+            (introduction headline / method core / results headline);
+            warn but do not block for related-work / motivation context
           - every major claim has nearby citation support or an explicit caveat
 
           Citation plan:
@@ -317,6 +601,19 @@ composition:
 
           Manuscript:
           {{ outputs.final_manuscript_package | truncate(12000) }}
+
+          Citation audit table (read this — do NOT re-derive):
+          {{ outputs.citation_map | truncate(4000) }}
+
+          Reply with:
+          INTEGRITY: <pass|warn|block>
+          INVALID_COUNT: <int>
+          WEAK_PRIMARY_COUNT: <int>
+          UNUSED_COUNT: <int>
+          BLOCKERS:
+            - <blocker or none>
+          WARNINGS:
+            - <warning or none>
     - id: latex_sanitizer
       kind: llm_chat
       depends_on: [paper_length_gate, citation_integrity_gate]
@@ -327,9 +624,9 @@ composition:
           Sanitize the final LaTeX package contract before compilation. Confirm
           that process commentary, markdown fences, chat preambles, debug logs,
           and non-paper text are absent from MANUSCRIPT_TEX and REFERENCES_BIB.
-          Preserve valid LaTeX, CJK text, citations, figure references, and
-          section content. Reply with a concise readiness note and any blocking
-          issue only.
+          Preserve valid LaTeX, CJK text, citations, figure references,
+          placeholder figure/table blocks (\fbox + tabular), and section content.
+          Reply with a concise readiness note and any blocking issue only.
 
           Length gate:
           {{ outputs.paper_length_gate | truncate(2000) }}
@@ -360,38 +657,71 @@ composition:
 # meta-paper-write (Meta-Skill)
 
 Draft a long LaTeX manuscript by orchestrating paper-specific skills and
-bounded LLM synthesis:
+bounded LLM synthesis. The pipeline now leads with explicit experiment
+design + placeholder figures/tables + citation provenance audit so the
+deliverable can be reviewed for academic rigor, not just length.
 
-1. **`paper_collect`** (user_input) — confirm topic, mode, language, target
-   length, and audience with the user before any DAG branching. Replaces
-   the previous `paper_mode` (llm_classify) + `paper_preferences`
-   inference of these same facts; the model no longer guesses what the
-   user wanted.
-2. Save as `paper_preferences` (now expands the collected facts into a
-   planning contract).
-3. Run `multi-search-engine` and `paper-experiment-stub`.
-4. Run `paper-refbib-stub` to create references from search output.
-5. Build a source pack. Save as `source_pack`.
-6. Build an outline and citation plan. Save as `citation_plan`.
-7. Build the manuscript package. Save as `final_manuscript_package`.
-8. Run `paper-plot-stub` for a deterministic figure artifact.
-9. Run length, citation-integrity, sanitizer, and compile-readiness gates.
+DAG (in order):
 
-The default path intentionally returns `final_manuscript_package` instead of
-running `latex-compile`. This avoids timeout and prevents process text from
-being inserted into the paper. If the user explicitly asks for a compiled PDF,
-run `latex-compile` as the second-stage artifact step after inspecting the
-manuscript package.
+1. **`paper_collect`** (user_input) — confirm topic, mode, language,
+   target length, audience. Replaces the previous `paper_mode`
+   (llm_classify) + `paper_preferences` inference so the model no
+   longer guesses fundamental paper requirements.
+2. **`paper_preferences`** — expand the collected facts into a planning
+   contract.
+3. **`search_papers`** — `multi-search-engine` query biased toward arXiv
+   / ACL Anthology / ACM DL / OpenReview / IEEE / Nature / Science so
+   the returned URLs translate into real bibliographic identifiers.
+4. **`refbib`** — `paper-refbib-stub` now extracts ``eprint``/``doi``
+   from arXiv/DOI URLs and tags each entry with ``note = {source: <domain>}``
+   so downstream gates can classify provenance without re-fetching.
+5. **`source_pack`** — curate references and enforce ≥20-source coverage.
+6. **`experiment_design`** — **decides** how many figures and tables the
+   paper needs based on RQs, hypotheses, analysis dimensions, and the
+   target page budget. Every figure/table is tied to an RQ or analysis
+   dimension; no decorative artefacts.
+7. **`figure_placeholders`** — render LaTeX ``\fbox{\parbox{...}}``
+   placeholder figure environments for each entry in FIGURE_PLAN. Zero
+   matplotlib dependency.
+8. **`table_placeholders`** — render LaTeX ``\begin{tabular}`` placeholder
+   tables for each entry in TABLE_PLAN. Cells contain ``---``/``<TBD>``;
+   no fabricated numbers.
+9. **`analysis_outline`** — bind every figure/table id to a Discussion
+   subsection that names potential findings + threats to validity, and
+   covers every ANALYSIS_DIMENSION.
+10. **`outline`** — paper outline that ties Method to experiment design
+    and Results to the figure/table plan.
+11. **`citation_plan`** — assigns concrete cite keys from `refbib` to
+    claims; cannot invent keys.
+12. **`final_manuscript_package`** — produces MANUSCRIPT_TEX with the
+    figure/table/analysis blocks inlined verbatim, plus
+    REFERENCES_BIB containing only the entries actually cited.
+13. **`citation_map`** — strict markdown audit table:
+    ``Cite Key | Cited Times | Title | URL/DOI/arXiv | Source Quality``
+    with INVALID / UNUSED / WEAK detection. Inlined into the final
+    deliverable AND queryable per-run via
+    ``opensquilla skills meta runs show``.
+14. **`paper_length_gate`** — page-count check (FULL_MANUSCRIPT only).
+15. **`citation_integrity_gate`** — reads `citation_map` directly; blocks
+    when INVALID > 0 or any primary claim cites a WEAK source.
+16. **`latex_sanitizer`** — strips process text without rewriting the
+    paper.
+17. **`compile_latex`** — handoff note (COMPILE_ONLY mode).
 
-Compatibility notes for older contract readers:
-- `paper-preference-planner`, `paper-source-curator`,
-  `paper-citation-planner`, `paper-revision-author`, and
-  `paper-abstract-author` were the original heavy sub-agent stages.
-- The compact path keeps their responsibilities but performs them as bounded
-  `llm_chat` glue around the real skill outputs.
-- Citation templates still use `{{ outputs.refbib | truncate(8000) }}` and
-  the quality gates preserve `paper_length_gate`, `citation_integrity_gate`,
-  `latex_sanitizer`, and `compile_latex`.
-- The `paper_mode` step (llm_classify) was removed; downstream `when:`
-  clauses now reference `inputs.collected.paper_collect.paper_mode`
-  instead of `outputs.paper_mode`.
+Removed from the previous version:
+
+- `paper_mode` (llm_classify) — superseded by `paper_collect.paper_mode`
+- `experiment` (skill_exec → `paper-experiment-stub`, fake CSV) —
+  superseded by `experiment_design` (real plan, not data)
+- `plot` (skill_exec → `paper-plot-stub`, matplotlib line chart) —
+  superseded by `figure_placeholders` (zero-dependency LaTeX)
+
+The bundled `paper-experiment-stub` and `paper-plot-stub` skills
+remain on disk for backward compatibility with anything that still
+references them, but `meta-paper-write` no longer invokes them.
+
+The default path intentionally returns `final_manuscript_package` instead
+of running `latex-compile`. This avoids timeout and prevents process
+text from being inserted into the paper. If the user explicitly asks
+for a compiled PDF, run `latex-compile` as the second-stage artifact
+step after inspecting the manuscript package.

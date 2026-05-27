@@ -608,8 +608,13 @@ async def test_pattern_fully_covered_by_existing_meta_skill_is_skipped(
 ) -> None:
     log_dir = tmp_path / "logs"
     proposals_dir = tmp_path / "proposals"
-    # meta-paper-write already composes paper-experiment-stub + paper-plot-stub
-    _seed_decision_log(log_dir, ["paper-experiment-stub", "paper-plot-stub"], count=5)
+    # meta-paper-write composes multi-search-engine + paper-refbib-stub.
+    # (The previous paper-experiment-stub + paper-plot-stub pair was
+    # removed from the meta-skill after the experiment_design pipeline
+    # rewrite, so we use the search→refbib pair which is still there.)
+    _seed_decision_log(
+        log_dir, ["multi-search-engine", "paper-refbib-stub"], count=5,
+    )
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(proposals_dir, proposal_ids=["aaaaaaaa"])
 
