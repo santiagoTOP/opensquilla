@@ -479,7 +479,13 @@ def create_memory_tools(
                 )
 
         max_files = getattr(memory_config, "max_files", 0)
-        if max_files > 0 and not mem_path.exists():
+        is_raw_fallback = False
+        try:
+            rel_path = mem_path.resolve().relative_to(workspace_dir.resolve()).as_posix()
+            is_raw_fallback = _is_raw_fallback_save_path(rel_path)
+        except ValueError:
+            is_raw_fallback = False
+        if max_files > 0 and not mem_path.exists() and not is_raw_fallback:
             file_count = len(list(workspace_dir.rglob("*.md")))
             if file_count >= max_files:
                 raise ToolError(f"max file count reached ({max_files}).")

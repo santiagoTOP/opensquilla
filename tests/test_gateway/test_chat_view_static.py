@@ -150,6 +150,53 @@ def test_chat_resets_stream_timeout_on_run_heartbeat() -> None:
     assert "webui_stream_idle_grace_ms" in source
 
 
+def test_chat_long_running_thinking_does_not_append_waiting_message() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    start = source.index("function _showThinkingIndicatorNow()")
+    end = source.index("  function _hideThinkingIndicator", start)
+    body = source[start:end]
+
+    assert "Still waiting for agent response" not in body
+    assert "_addMessage('system'" not in body
+    assert '_addMessage("system"' not in body
+
+
+def test_chat_stream_idle_timeout_checks_server_run_state_before_error() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    start = source.index("function _resetStreamIdleTimer()")
+    end = source.index("  function _serverRunStateIsActive", start)
+    body = source[start:end]
+
+    assert "_handleStreamIdleTimeout" in body
+    assert "_endStreaming();" not in body
+    assert "Response timed out" not in body
+
+    handler_start = source.index("async function _handleStreamIdleTimeout()")
+    handler_end = source.index("  function _applyRpcPolicy", handler_start)
+    handler = source[handler_start:handler_end]
+
+    assert "_refreshSessionRunState" in handler
+    assert "Response timed out" in handler
+    catch_start = handler.index("catch (err)")
+    retry_after_check_failure = handler.index("_resetStreamIdleTimer();", catch_start)
+    assert retry_after_check_failure < handler.index("_endStreaming();")
+
+    state_start = source.index("function _serverRunStateIsActive(payload)")
+    state_end = source.index("  async function _refreshSessionRunState()", state_start)
+    state = source[state_start:state_end]
+
+    assert "run_status" in state
+    assert "active_task" in state
+    assert "running" in state
+    assert "queued" in state
+
+    refresh_start = source.index("async function _refreshSessionRunState()")
+    refresh_end = source.index("  async function _handleStreamIdleTimeout()", refresh_start)
+    refresh = source[refresh_start:refresh_end]
+
+    assert "sessions.messages.subscribe" in refresh
+
+
 def test_chat_tool_results_use_execution_status_for_state() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
 
@@ -632,8 +679,8 @@ def test_chat_surfaces_persisted_run_state_in_header_and_session_picker() -> Non
 
 def test_chat_resets_replay_cursor_after_stream_gap() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
-    start = source.index("async function _subscribeSession() {")
-    end = source.index("  async function _unsubscribeSession()", start)
+    start = source.index("async function _refreshSessionRunState() {")
+    end = source.index("  async function _handleStreamIdleTimeout()", start)
     body = source[start:end]
 
     assert "if (res && res.replay_complete === false)" in body
@@ -799,6 +846,23 @@ def test_chat_compact_blocking_failure_preserves_pending_queue() -> None:
     assert "options && options.preservePending" in settle_body
     assert "_popAllPendingIntoComposer();" in settle_body
     assert "recovered = _pendingQueue.length > 0;" in settle_body
+
+
+def test_chat_send_business_failure_ends_streaming_without_waiting_for_events() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    send_start = source.index("async function _onSend()")
+    send_end = source.index("  /* ── Streaming", send_start)
+    send_body = source[send_start:send_end]
+
+    assert "function _chatSendFailureMessage(payload)" in source
+    assert "if (res && res.ok === false) {" in send_body
+    failure_idx = send_body.index("if (res && res.ok === false) {")
+    failure_block = send_body[failure_idx : send_body.index("return;", failure_idx)]
+    assert "_endStreaming();" in failure_block
+    assert "_addMessage('error', _chatSendFailureMessage(res));" in failure_block
+    assert "_applySessionRunState({ run_status: 'failed'" in failure_block
+    assert "_scheduleHistorySync();" in failure_block
+    assert "payload?.user_message" in source
 
 
 def test_chat_clears_background_task_groups_on_state_reset_paths() -> None:

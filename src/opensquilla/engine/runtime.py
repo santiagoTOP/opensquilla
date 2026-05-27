@@ -2081,6 +2081,7 @@ class TurnRunner:
                     session_id_for_log=session_id_for_log,
                     tool_handler=tool_handler,
                     turn_call_logger=turn_call_logger,
+                    tool_context=tool_context,
                     session_key=session_key,
                     agent_id=agent_id,
                     timeout=timeout,
@@ -4480,6 +4481,19 @@ class TurnRunner:
                 ),
             )
             return
+        if not result:
+            emergency_applied = await self._record_emergency_ephemeral_compaction(
+                session_key,
+                transcript,
+                context_window_tokens,
+                compaction_id=compaction_id,
+                phase="preflight",
+                reason="empty_summary",
+            )
+            if emergency_applied:
+                self._record_compaction_success(session_key)
+                return
+
         self._record_compaction_success(session_key)
         if result:
             completed_payload = {"tokens_before": total_tokens}

@@ -176,10 +176,9 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     mgr = _require_chat_session_manager(ctx)
     intent = params.get("intent")
 
-    # Gate the turn on the configured context-overflow policy.
-    refusal = await _enforce_context_overflow(ctx, session_key, message)
-    if refusal is not None:
-        return {"ok": False, "sessionKey": session_key, **refusal}
+    # WebChat must accept the turn even when existing history is oversized.
+    # Context shaping happens inside TurnRunner so it can produce a request-scoped
+    # sendable view instead of making the RPC layer a terminal overflow gate.
 
     try:
         if intent != "new_chat":

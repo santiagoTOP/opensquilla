@@ -9,6 +9,7 @@ from opensquilla.memory.types import MemorySearchResult, MemorySource, SearchInt
 from opensquilla.tools.builtin.memory_tools import create_memory_tools
 from opensquilla.tools.builtin.session_search import create_session_search_tool
 from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import ToolError
 
 
 class _FakeRetriever:
@@ -209,6 +210,60 @@ async def test_memory_save_redacts_secrets_before_disk_and_index(tmp_path):
     assert "plain-secret" not in indexed_text
     assert "sk-or-v1-abcdefghijklmnopqrstuvwxyz" not in indexed_text
     assert "[REDACTED]" in disk_text
+
+
+@pytest.mark.asyncio
+async def test_memory_save_raw_fallback_bypasses_workspace_file_count_limit(tmp_path):
+    class IndexingStore:
+        def __init__(self) -> None:
+            self.indexed: list[tuple[str, str, MemorySource]] = []
+
+        async def index_file(self, *, path, content, source):
+            self.indexed.append((path, content, source))
+            return 1
+
+        async def remove_file(self, _path):
+            return None
+
+        async def total_size(self):
+            return 0
+
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "MEMORY.md").write_text("long-term", encoding="utf-8")
+    (tmp_path / "memory" / "existing.md").write_text("daily", encoding="utf-8")
+
+    registry = ToolRegistry()
+    store = IndexingStore()
+    create_memory_tools(
+        stores=store,  # type: ignore[arg-type]
+        retrievers=_FakeRetriever(),
+        memory_dir=str(tmp_path),
+        registry=registry,
+        memory_config=SimpleNamespace(
+            max_files=2,
+            max_file_size_kb=0,
+            max_total_size_kb=0,
+            entry_ttl_days=0,
+        ),
+    )
+
+    registered = registry.get("memory_save")
+    assert registered is not None
+
+    with pytest.raises(ToolError, match="max file count reached"):
+        await registered.handler(content="ordinary", path="memory/new.md")
+
+    result = await registered.handler(
+        content="raw transcript",
+        path="memory/.raw_fallbacks/raw.md",
+    )
+
+    assert "Saved to memory/.raw_fallbacks/raw.md" in result
+    assert "0 chunks indexed" in result
+    assert (tmp_path / "memory" / ".raw_fallbacks" / "raw.md").read_text(
+        encoding="utf-8"
+    ) == "raw transcript"
+    assert store.indexed == []
 
 
 def test_memory_tool_descriptions_name_nested_memory_sources(tmp_path):

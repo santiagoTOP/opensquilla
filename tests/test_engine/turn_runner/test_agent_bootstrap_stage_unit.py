@@ -168,6 +168,7 @@ def _make_input(
     session_id_for_log="sess-1",
     tool_handler=None,
     turn_call_logger=None,
+    tool_context=None,
     session_key="agent:main:s1",
     agent_id="agent:main",
     timeout=None,
@@ -189,6 +190,7 @@ def _make_input(
         session_id_for_log=session_id_for_log,
         tool_handler=tool_handler,
         turn_call_logger=turn_call_logger,
+        tool_context=tool_context,
         session_key=session_key,
         agent_id=agent_id,
         timeout=timeout,
@@ -417,6 +419,7 @@ async def test_agent_factory_receives_typed_inputs() -> None:
     factory = _RecordingAgentFactory()
     handler = SimpleNamespace(name="handler")
     logger = SimpleNamespace(name="logger")
+    tool_context = SimpleNamespace(name="tool-context")
     stage = _make_stage(factory=factory)
     turn = _make_turn(metadata={"cache_mode": "automatic"}, tool_defs=[1, 2, 3])
     inp = _make_input(
@@ -424,11 +427,13 @@ async def test_agent_factory_receives_typed_inputs() -> None:
         turn=turn,
         tool_handler=handler,
         turn_call_logger=logger,
+        tool_context=tool_context,
     )
     await stage.run(inp)
     kw = factory.last_kwargs
     assert kw["tool_handler"] is handler
     assert kw["turn_call_logger"] is logger
+    assert kw["tool_context"] is tool_context
     assert kw["session_key"] == "agent:main:s1"
     assert kw["tool_definitions"] == [1, 2, 3]
     assert kw["config"].cache_mode == "automatic"

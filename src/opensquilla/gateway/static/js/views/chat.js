@@ -150,7 +150,6 @@ const ChatView = (() => {
   let _thinkingTimerInterval = null;
   let _thinkingDelayTimer = null;
   const _THINKING_DELAY_MS = 400;  // don't show for fast responses
-  const _THINKING_TTL_MS = 60000;  // 60s auto-hide
   // kept in sync with stream.py WaitingIndicator._verbs
   const SQUILLA_VERBS = ['Watching','Tracking','Sensing','Pulsing','Thinking','Drafting','Polishing'];
   const SQUILLA_DWELL_MS = 2500;
@@ -2359,21 +2358,7 @@ const ChatView = (() => {
   async function _subscribeSession() {
     if (!_rpc || !_sessionKey) return;
     try {
-      await _rpc.waitForConnection();
-      const params = { key: _sessionKey };
-      params.since_stream_seq = _lastStreamSeq;
-      const res = await _rpc.call('sessions.messages.subscribe', params);
-      if (res && res.subscribed === false) throw new Error('No subscription manager available');
-      _applySessionRunState(res);
-      if (res && res.replay_complete === false) {
-        _lastStreamSeq = typeof res.current_stream_seq === 'number'
-          ? Math.max(_lastStreamSeq, res.current_stream_seq)
-          : _lastStreamSeq;
-        UI.toast('Session stream gap detected; reloading transcript.', 'warn', 5000);
-        _loadHistory();
-      } else if (res && typeof res.current_stream_seq === 'number') {
-        _lastStreamSeq = Math.max(_lastStreamSeq, res.current_stream_seq);
-      }
+      await _refreshSessionRunState();
       if (_isStreaming) _resetStreamIdleTimer();
     } catch (err) {
       UI.toast('Session stream subscription failed: ' + (err?.message || err), 'err', 6000);
@@ -4065,6 +4050,7 @@ const ChatView = (() => {
     const now = new Date().toISOString();
     const userText = text;
     const providerText = text || 'Describe these attachments';
+    const sentAttachments = _pendingAttachments.slice();
     _messages.push({ role: 'user', text: userText, ts: now });
 
     // Show user message
@@ -4114,6 +4100,21 @@ const ChatView = (() => {
 
     // Send
     _rpc.call('chat.send', params).then((res) => {
+      if (res && res.ok === false) {
+        _endStreaming();
+        if (!_textarea.value.trim() && userText) {
+          _textarea.value = userText;
+          _autoResizeTextarea();
+        }
+        if (_pendingAttachments.length === 0 && sentAttachments.length > 0) {
+          _pendingAttachments = sentAttachments;
+          _renderAttachmentPreview();
+        }
+        _addMessage('error', _chatSendFailureMessage(res));
+        _applySessionRunState({ run_status: 'failed', last_task: { ...(res || {}), status: 'failed' } });
+        _scheduleHistorySync();
+        return;
+      }
       if (res && res.sessionKey && res.sessionKey !== _sessionKey) _persistSession(res.sessionKey);
     }).catch((err) => {
       _endStreaming();
@@ -4143,12 +4144,57 @@ const ChatView = (() => {
     _clearStreamIdleTimer();
     if (!_isStreaming || _streamIdlePausedForApproval) return;
     _streamIdleTimer = setTimeout(() => {
-      if (_isStreaming && !_streamIdlePausedForApproval) {
-        _endStreaming();
-        const seconds = Math.round(_streamIdleTimeoutMs / 1000);
-        _addMessage('error', `Response timed out — no events received for ${seconds}s`);
-      }
+      void _handleStreamIdleTimeout();
     }, _streamIdleTimeoutMs);
+  }
+
+  function _serverRunStateIsActive(payload) {
+    const runStatus = String(payload?.run_status || '').toLowerCase();
+    const taskStatus = String(payload?.active_task?.status || '').toLowerCase();
+    return runStatus === 'running'
+      || runStatus === 'queued'
+      || taskStatus === 'running'
+      || taskStatus === 'queued';
+  }
+
+  async function _refreshSessionRunState() {
+    if (!_rpc || !_sessionKey) return null;
+    await _rpc.waitForConnection();
+    const params = { key: _sessionKey };
+    params.since_stream_seq = _lastStreamSeq;
+    const res = await _rpc.call('sessions.messages.subscribe', params);
+    if (res && res.subscribed === false) throw new Error('No subscription manager available');
+    _applySessionRunState(res);
+    if (res && res.replay_complete === false) {
+      _lastStreamSeq = typeof res.current_stream_seq === 'number'
+        ? Math.max(_lastStreamSeq, res.current_stream_seq)
+        : _lastStreamSeq;
+      UI.toast('Session stream gap detected; reloading transcript.', 'warn', 5000);
+      _loadHistory();
+    } else if (res && typeof res.current_stream_seq === 'number') {
+      _lastStreamSeq = Math.max(_lastStreamSeq, res.current_stream_seq);
+    }
+    return res;
+  }
+
+  async function _handleStreamIdleTimeout() {
+    if (!_isStreaming || _streamIdlePausedForApproval) return;
+    try {
+      const res = await _refreshSessionRunState();
+      if (!_isStreaming || _streamIdlePausedForApproval) return;
+      if (_serverRunStateIsActive(res)) {
+        _resetStreamIdleTimer();
+        return;
+      }
+    } catch (err) {
+      UI.toast('Session stream status check failed: ' + (err?.message || err), 'warn', 5000);
+      if (!_isStreaming || _streamIdlePausedForApproval) return;
+      _resetStreamIdleTimer();
+      return;
+    }
+    _endStreaming();
+    const seconds = Math.round(_streamIdleTimeoutMs / 1000);
+    _addMessage('error', `Response timed out — no events received for ${seconds}s`);
   }
 
   function _applyRpcPolicy(policy) {
@@ -4237,6 +4283,34 @@ const ChatView = (() => {
     return 'Agent error';
   }
 
+  function _chatSendFailureMessage(payload) {
+    if (typeof payload?.user_message === 'string' && payload.user_message.trim()) {
+      return payload.user_message.trim();
+    }
+    if (typeof payload?.message === 'string' && payload.message.trim()) {
+      return payload.message.trim();
+    }
+    const error = payload?.error;
+    if (error && typeof error === 'object') {
+      if (typeof error.message === 'string' && error.message.trim()) {
+        return error.message.trim();
+      }
+      if (typeof error.reason === 'string' && error.reason.trim()) {
+        return error.reason.trim();
+      }
+      if (typeof error.code === 'string' && error.code.trim()) {
+        return error.code.trim();
+      }
+    }
+    if (typeof payload?.reason === 'string' && payload.reason.trim()) {
+      return payload.reason.trim();
+    }
+    if (typeof payload?.error_class === 'string' && payload.error_class.trim()) {
+      return payload.error_class.trim();
+    }
+    return 'Send failed before the agent task started.';
+  }
+
   function _acceptStreamSeq(payload) {
     const seq = payload && payload.stream_seq;
     if (typeof seq !== 'number' || !Number.isFinite(seq)) return true;
@@ -4323,11 +4397,6 @@ const ChatView = (() => {
       const v = SQUILLA_VERBS[Math.floor(eMs / SQUILLA_DWELL_MS) % SQUILLA_VERBS.length];
       const label = _thinkingEl.querySelector('.thinking-elapsed');
       if (label) label.textContent = `${v} (${s}s)`;
-
-      if (s >= _THINKING_TTL_MS / 1000) {
-        _hideThinkingIndicator();
-        _addMessage('system', 'Still waiting for agent response\u2026');
-      }
     }, 1000);
   }
 

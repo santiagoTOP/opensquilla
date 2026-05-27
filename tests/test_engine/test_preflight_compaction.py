@@ -620,6 +620,66 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
 
 
 @pytest.mark.asyncio
+async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -> None:
+    session_key = "agent:ops:preflight-empty-summary"
+    context_window = 1000
+    entries = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key=session_key,
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"historic message {index} " + ("x" * 500),
+            token_count=300,
+        )
+        for index in range(8)
+    ]
+
+    class _EmptySummarySessionManager(_ResultCompactionSessionManager):
+        async def compact_with_result(
+            self,
+            session_key: str,
+            context_window_tokens: int,
+            config: object | None = None,
+            **kwargs,
+        ) -> SimpleNamespace:
+            self.compact_with_result_calls.append((session_key, context_window_tokens, config))
+            self.compact_with_result_kwargs.append(dict(kwargs))
+            return SimpleNamespace(
+                summary="",
+                kept_entries=entries,
+                removed_count=0,
+                chunks_processed=0,
+                summary_source="skipped",
+                tokens_before=2400,
+                tokens_after=2400,
+                remaining_budget_tokens=0,
+            )
+
+    sm = _EmptySummarySessionManager(entries)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(session_key, context_window)
+
+    class _HistoryCapture:
+        provider = SimpleNamespace(provider_name="test")
+
+        def __init__(self) -> None:
+            self.history: list[Any] = []
+
+        def set_history(self, history: list[Any]) -> None:
+            self.history = history
+
+    agent = _HistoryCapture()
+    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
+
+    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
+    assert len(await sm.get_transcript(session_key)) == len(entries)
+    assert 0 < len(agent.history) < len(entries)
+    assert summary_context is not None
+    assert "emergency request-scoped compaction" in summary_context.lower()
+
+
+@pytest.mark.asyncio
 async def test_preflight_backfilled_flush_receipt_allows_compact() -> None:
     context_window = 1000
     entries = [_make_entry("early durable fact " + ("a" * 4000))]

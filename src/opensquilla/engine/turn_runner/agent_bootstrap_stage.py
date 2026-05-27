@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from opensquilla.observability.turn_call_log import TurnCallLogger
     from opensquilla.provider.protocol import LLMProvider
     from opensquilla.provider.types import ModelCapabilities
+    from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Value objects returned by the ports — typed frozen tuples that collapse
@@ -218,6 +219,7 @@ class AgentFactoryPort(Protocol):
         session_key: str,
         turn_call_logger: TurnCallLogger | None,
         memory_sync_manager: Any | None,
+        tool_context: ToolContext | None,
     ) -> Agent: ...
 
 # ---------------------------------------------------------------------------
@@ -248,6 +250,7 @@ class AgentBootstrapStageInput:
     session_id_for_log: str | None
     tool_handler: ToolHandler | None
     turn_call_logger: TurnCallLogger | None
+    tool_context: ToolContext | None
 
     # Per-turn inputs from _run_turn locals
     session_key: str
@@ -430,6 +433,7 @@ class AgentBootstrapStage:
             session_key=inp.session_key,
             turn_call_logger=inp.turn_call_logger,
             memory_sync_manager=memory.sync_manager,
+            tool_context=inp.tool_context,
         )
 
         return StageOutcome.success(

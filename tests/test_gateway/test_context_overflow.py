@@ -16,7 +16,7 @@ from opensquilla.gateway.context_overflow import (
     OverflowOutcome,
     apply_context_overflow_policy,
 )
-from opensquilla.gateway.rpc_chat import _enforce_context_overflow
+from opensquilla.gateway.rpc_chat import _enforce_context_overflow, _handle_chat_send
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
@@ -861,6 +861,50 @@ async def test_auto_summarize_keeps_legacy_compact_manager_compatible() -> None:
 
     assert outcome.summarized is True
     assert sm.compact_calls == [("s-auto", 10, None)]
+
+
+@pytest.mark.asyncio
+async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10)
+    sm = SimpleNamespace(
+        get_or_create=AsyncMock(return_value=SimpleNamespace(session_key="s-auto")),
+    )
+    ctx = SimpleNamespace(
+        config=cfg,
+        session_manager=sm,
+        principal=SimpleNamespace(role="owner"),
+    )
+    accepted: dict[str, Any] = {}
+
+    async def _unexpected_gate(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("chat.send must not synchronously refuse overflow")
+
+    async def _fake_sessions_send(params: dict[str, Any], _ctx: Any) -> dict[str, Any]:
+        accepted.update(params)
+        return {"status": "accepted", "key": params["key"], "task_id": "task-long-context"}
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_chat._enforce_context_overflow",
+        _unexpected_gate,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
+        _fake_sessions_send,
+    )
+
+    result = await _handle_chat_send({"message": "m", "sessionKey": "s-auto"}, ctx)
+
+    assert result == {
+        "ok": True,
+        "sessionKey": "s-auto",
+        "status": "accepted",
+        "key": "s-auto",
+        "task_id": "task-long-context",
+    }
+    assert accepted["message"] == "m"
+    assert accepted["key"] == "s-auto"
 
 
 @pytest.mark.asyncio
