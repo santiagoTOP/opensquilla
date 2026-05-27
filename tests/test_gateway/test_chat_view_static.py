@@ -22,17 +22,18 @@ def test_chat_toolbar_has_no_tool_compress_selector() -> None:
     assert "tool-compress" not in source
 
 
-def test_chat_run_modes_keep_bypass_visible_and_accessible() -> None:
+def test_chat_run_modes_keep_icon_button_shape_while_exposing_bypass_state() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     css = CHAT_CSS.read_text(encoding="utf-8")
 
-    assert 'id="chat-toolbar-trigger-label"' in source
-    assert "triggerLabel.textContent = bypassLabel;" in source
-    assert "has-bypass-signal" in source
+    assert 'id="chat-toolbar-trigger-label"' not in source
+    assert "triggerLabel.textContent = bypassLabel;" not in source
+    assert "has-bypass-signal" not in source
+    assert "has-dot-bypass" in source
     assert "`${bypassLabel}: Approvals bypassed`" in source
     assert "`${bypassLabel}: Full permission mode active`" in source
-    assert ".chat-toolbar-trigger.has-bypass-signal" in css
-    assert ".chat-toolbar-trigger-label" in css
+    assert ".chat-toolbar-trigger.has-bypass-signal" not in css
+    assert ".chat-toolbar-trigger-label" not in css
 
 
 def test_chat_session_chip_accessible_name_includes_visible_key() -> None:
@@ -600,6 +601,19 @@ def test_chat_stream_handlers_drop_replayed_duplicate_frames() -> None:
     assert "_noteStreamSeq(payload);" not in body
 
 
+def test_chat_router_decision_handler_consumes_stream_seq() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    start = source.index("_rpc.on('session.event.router_decision'")
+    end = source.index("    // Text delta:", start)
+    body = source[start:end]
+
+    assert "if (_isStaleEpoch(payload)) return;" in body
+    assert "if (!_acceptStreamSeq(payload)) return;" in body
+    assert body.index("if (!_acceptStreamSeq(payload)) return;") < body.index(
+        "_handleRouterDecision(payload);"
+    )
+
+
 def test_chat_surfaces_persisted_run_state_in_header_and_session_picker() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     css = CHAT_CSS.read_text(encoding="utf-8")
@@ -859,6 +873,35 @@ def test_savings_popup_persists_cache_hit_active_to_turn_meta() -> None:
     assert "model: u.model || _usageModel || null," in source
     assert "routed_model: u.routed_model || null," in source
     assert "__savings_ui_suppressed: !!u.__savings_ui_suppressed," in source
+
+
+def test_router_fx_history_and_turn_meta_preserve_observe_rollout_state() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    history_start = source.index("function _buildRouterFxFromUsage(usage, seedKey) {")
+    history_end = source.index("  /* ── RPC Event Subscriptions", history_start)
+    history_body = source[history_start:history_end]
+    store_start = source.index("_storeTurnMeta(_sessionKey, _metaIdx")
+    store_end = source.index("          });", store_start)
+    store_body = source[store_start:store_end]
+
+    assert "routing_applied: usage.routing_applied !== false," in history_body
+    assert "rollout_phase: usage.rollout_phase || 'full'," in history_body
+    assert "const observeMode = decision && decision.routing_applied === false;" in source
+    assert "routing_applied: u.routing_applied !== false," in store_body
+    assert "rollout_phase: u.rollout_phase || 'full'," in store_body
+
+
+def test_router_fx_mobile_grid_keeps_twelve_explicit_cells() -> None:
+    css = CHAT_CSS.read_text(encoding="utf-8")
+    mobile_start = css.index("@media (max-width: 640px)")
+    tiny_start = css.index("@media (max-width: 380px)")
+    mobile_body = css[mobile_start:tiny_start]
+    tiny_body = css[tiny_start:]
+
+    assert "grid-template-columns: repeat(3, 1fr);" in mobile_body
+    assert "grid-template-rows: repeat(4, 28px);" in mobile_body
+    assert "grid-template-columns: repeat(2, 1fr);" in tiny_body
+    assert "grid-template-rows: repeat(6, 26px);" in tiny_body
 
 
 def test_chat_history_replays_turn_meta_to_restore_combo_streak() -> None:

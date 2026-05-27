@@ -970,7 +970,7 @@ const ChatView = (() => {
                       title="Run modes — approvals, router"
                       aria-label="Run modes"
                       aria-haspopup="dialog"
-                      aria-expanded="false">${_iconGear()}<span class="chat-toolbar-trigger-label" id="chat-toolbar-trigger-label"></span><span class="chat-toolbar-trigger-dots" aria-hidden="true"><i data-dot="bypass"></i><i data-dot="router"></i></span></button>
+                      aria-expanded="false">${_iconGear()}<span class="chat-toolbar-trigger-dots" aria-hidden="true"><i data-dot="bypass"></i><i data-dot="router"></i></span></button>
               <div class="chat-toolbar-popover hidden" id="chat-toolbar-popover" role="dialog" aria-label="Composer settings">
                 <div class="chat-toolbar-popover-arrow" aria-hidden="true"></div>
                 <div class="chat-toolbar-popover-inner" id="chat-toolbar">
@@ -1666,7 +1666,6 @@ const ChatView = (() => {
   function _refreshToolbarTriggerGlow() {
     const trigger = _el && _el.querySelector('#chat-toolbar-trigger');
     if (!trigger) return;
-    const triggerLabel = trigger.querySelector('#chat-toolbar-trigger-label');
     trigger.classList.toggle('is-glowing', _toolbarTriggerActive());
     // Per-toggle status dots — each lights independently so a glance at the
     // composer reveals which mode is non-default, not just that something is.
@@ -1675,12 +1674,7 @@ const ChatView = (() => {
     const routerOff = _toolbarState.router === false;
     trigger.classList.toggle('has-dot-bypass', bypass);
     trigger.classList.toggle('has-dot-router', routerOff);
-    trigger.classList.toggle('has-bypass-signal', bypass);
     const bypassLabel = effectiveMode === 'full' ? 'FULL' : 'BYPASS';
-    if (triggerLabel) {
-      triggerLabel.textContent = '';
-      if (bypass) triggerLabel.textContent = bypassLabel;
-    }
     const signalParts = [];
     if (effectiveMode === 'full') {
       signalParts.push(`${bypassLabel}: Full permission mode active`);
@@ -2826,6 +2820,13 @@ const ChatView = (() => {
     wrap.dataset.state = 'idle';
     wrap.dataset.tier = decision.tier || '';
     wrap.dataset.source = decision.source || 'none';
+    const observeMode = decision && decision.routing_applied === false;
+    if (observeMode) {
+      wrap.dataset.observe = 'true';
+      wrap.dataset.rolloutPhase = typeof decision.rollout_phase === 'string'
+        ? decision.rollout_phase
+        : 'observe';
+    }
 
     const header = document.createElement('div');
     header.className = 'router-fx-header';
@@ -3187,6 +3188,8 @@ const ChatView = (() => {
       source: usage.routing_source || 'none',
       confidence: typeof usage.routing_confidence === 'number' ? usage.routing_confidence : 0,
       fallback: usage.routing_source === 'fallback',
+      routing_applied: usage.routing_applied !== false,
+      rollout_phase: usage.rollout_phase || 'full',
     };
     if (decision.model) _routerFxModels[tier.toLowerCase()] = decision.model;
     // The cached seed from _routerFxResolveSeed already encodes
@@ -3220,6 +3223,7 @@ const ChatView = (() => {
     // will appear and sweeps the selector onto the routed tier.
     _unsubs.push(_rpc.on('session.event.router_decision', (payload) => {
       if (_isStaleEpoch(payload)) return;
+      if (!_acceptStreamSeq(payload)) return;
       _handleRouterDecision(payload);
     }));
 
@@ -3502,6 +3506,8 @@ const ChatView = (() => {
             routed_model: u.routed_model || null,
             routed_tier: u.routed_tier || null,
             routing_source: u.routing_source || 'none',
+            routing_applied: u.routing_applied !== false,
+            rollout_phase: u.rollout_phase || 'full',
             total_savings_pct: u.total_savings_pct || 0,
             __savings_ui_suppressed: !!u.__savings_ui_suppressed,
           });

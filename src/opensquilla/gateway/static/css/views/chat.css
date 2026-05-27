@@ -1575,21 +1575,6 @@
 }
 .chat-toolbar-trigger:hover { color: var(--accent); }
 .chat-toolbar-trigger.is-active { color: var(--accent); }
-.chat-toolbar-trigger.has-bypass-signal {
-  min-width: 76px;
-  padding-inline: 8px 10px;
-  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
-  background: color-mix(in srgb, var(--danger) 12%, var(--bg-surface));
-  color: var(--danger);
-}
-.chat-toolbar-trigger-label {
-  display: none;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  line-height: 1;
-}
-.chat-toolbar-trigger.has-bypass-signal .chat-toolbar-trigger-label { display: inline; }
 
 /* Per-toggle status dots reveal which runtime mode is non-default. */
 .chat-toolbar-trigger-dots {
@@ -2716,12 +2701,12 @@
   }
 }
 
-/* Mobile: collapse to 3 columns × 3 rows + smaller type. The hammer
+/* Mobile: collapse to 3 columns x 4 rows + smaller type. The hammer
  * still hops; the grid just gets denser. */
 @media (max-width: 640px) {
   .router-fx-grid {
     grid-template-columns: repeat(3, 1fr);
-    grid-template-rows: repeat(3, 28px);
+    grid-template-rows: repeat(4, 28px);
     padding: 6px;
     gap: 3px;
   }
@@ -2731,7 +2716,7 @@
 @media (max-width: 380px) {
   .router-fx-grid {
     grid-template-columns: repeat(2, 1fr);
-    grid-template-rows: repeat(4, 26px);
+    grid-template-rows: repeat(6, 26px);
   }
   .router-fx-cell { font-size: 9.5px; }
 }

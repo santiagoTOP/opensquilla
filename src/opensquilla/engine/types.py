@@ -162,6 +162,8 @@ class DoneEvent:
     cache_write_tokens: int = 0
     reasoning_content: str | None = None
     session_totals: SessionTotalsSnapshot | None = None
+    routing_applied: bool = True
+    rollout_phase: str = "full"
 
     @property
     def upstream_cost_usd(self) -> float:
