@@ -25,7 +25,9 @@ large_outputs/artifact_ref, retries, when conditions, persistence to
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -103,6 +105,12 @@ class MetaOrchestrator:
         turn_id: str | None = None,
         memory_persist_enabled: bool = True,
         usage_tracker: Any | None = None,
+        # PR3: ``dao`` is the preferred alias for ``run_writer`` when the
+        # caller only needs the DAO surface (try_claim_resume /
+        # finish_run_sync). Defaults to ``None``; if both are supplied
+        # ``dao`` takes precedence so tests can inject a writer without
+        # disturbing the existing ``run_writer`` plumbing.
+        dao: MetaRunWriter | None = None,
     ) -> None:
         self._agent_runner = agent_runner
         self._skill_loader = skill_loader
@@ -126,6 +134,12 @@ class MetaOrchestrator:
         # cancellation vs. terminal MetaResult). ``None`` keeps the
         # legacy path unchanged — zero rows written.
         self._run_writer = run_writer
+        # ``_dao`` is the unified DAO handle used by PR3 resume/dispatch
+        # helpers. Prefers the explicit ``dao`` kwarg; falls back to the
+        # ``run_writer`` passed to the original persistence path so that
+        # production callers that only set ``run_writer`` also get resume
+        # capability without any changes.
+        self._dao: MetaRunWriter | None = dao if dao is not None else run_writer
         self._triggered_by = triggered_by
         self._session_key = session_key
         self._turn_id = turn_id
@@ -432,6 +446,165 @@ class MetaOrchestrator:
             skill_loader=self._skill_loader,
         ):
             yield item
+
+    async def _dispatch_one_step(
+        self,
+        step: MetaStep,
+        effective_skill: str,
+        inputs: dict[str, Any],
+        outputs: dict[str, str],
+        *,
+        run_id: str,
+        session_id: str,
+    ) -> AsyncIterator[AgentEvent | _StepDone]:
+        """Single-step dispatcher exposing kind=user_input wiring for tests.
+
+        Production scheduler still uses its inline dispatch builders;
+        this method specifically supports the PR3 resume test harness
+        + future PR3 surface integration which needs to invoke
+        user_input dispatch from outside the orchestrator.
+        """
+        if step.kind == "user_input":
+            from opensquilla.skills.meta.executors.user_input import (
+                run_user_input_step,
+            )
+
+            if self._dao is None:
+                raise RuntimeError(
+                    f"user_input step {step.id!r} requires a DAO; "
+                    f"construct MetaOrchestrator with dao= or run_writer=",
+                )
+            text = await run_user_input_step(
+                step,
+                inputs=inputs,
+                outputs=outputs,
+                run_id=run_id,
+                session_id=session_id,
+                dao=self._dao,
+                now=time.time,
+            )
+            # Pass-through path: yields no events (skip_if was true).
+            yield _StepDone(text=text, status="ok")
+            return
+        # For other kinds, the test harness's outer dispatch handles them.
+        # Production orchestration uses its existing inline builders.
+        raise NotImplementedError(
+            f"_dispatch_one_step direct dispatch for kind={step.kind!r} "
+            f"is not needed in PR3 — the test harness's outer _dispatch "
+            f"handles these kinds.",
+        )
+
+    async def run_once(
+        self,
+        match: MetaMatch,
+        *,
+        run_id: str,
+        session_id: str,
+        dispatch_step_stream: Any,
+        yield_skill_view_preface: Any,
+    ) -> MetaResult:
+        """Drive ``run_dag`` to completion; return the terminal MetaResult.
+
+        Test-friendly wrapper that does NOT consume agent events. Production
+        surfaces continue to use the existing ``iter_events`` API.
+        """
+        final: MetaResult | None = None
+        async for ev in run_dag(
+            match,
+            dispatch_step_stream=dispatch_step_stream,
+            yield_skill_view_preface=yield_skill_view_preface,
+        ):
+            if isinstance(ev, MetaResult):
+                final = ev
+        if final is None:
+            return MetaResult(ok=False, error="run_dag yielded no MetaResult")
+        return final
+
+    async def resume(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        filled_fields: dict[str, Any],
+        dispatch_step_stream: Any,
+        yield_skill_view_preface: Any,
+    ) -> MetaResult:
+        """Resume an awaiting run with collected field values.
+
+        Atomic transition awaiting_user → running via DAO.try_claim_resume.
+        On race-lost: returns MetaResult(ok=False, error=...).
+        On win: rehydrates plan/inputs/outputs, injects collected fields and
+        a clarify-summary markdown, then reenters run_dag with seed_outputs.
+        Calls finish_run_sync to finalize unless the DAG re-pauses.
+        """
+        from opensquilla.skills.meta.clarify_summary import render_clarify_summary
+        from opensquilla.skills.meta.plan_serde import (
+            clarify_config_from_jsonable,
+            from_jsonable,
+        )
+
+        if self._dao is None:
+            return MetaResult(
+                ok=False,
+                error="MetaOrchestrator has no DAO; resume requires PR2",
+            )
+
+        payload = await asyncio.to_thread(
+            self._dao.try_claim_resume,
+            run_id=run_id,
+            session_id=session_id,
+        )
+        if payload is None:
+            return MetaResult(
+                ok=False,
+                error=f"resume failed: run {run_id!r} not found or race lost",
+            )
+
+        plan = from_jsonable(json.loads(payload.plan_snapshot_json))
+        inputs = json.loads(payload.inputs_json or "{}")
+        outputs = json.loads(payload.step_outputs_json or "{}")
+
+        schema_dict = json.loads(payload.awaiting_schema_json or "{}")
+        allowed = {f["name"] for f in schema_dict.get("fields", []) or []}
+        filled_clean = {k: v for k, v in filled_fields.items() if k in allowed}
+
+        inputs.setdefault("collected", {})
+        inputs["collected"][payload.awaiting_step_id] = filled_clean
+
+        cfg = clarify_config_from_jsonable(schema_dict)
+        outputs[payload.awaiting_step_id] = render_clarify_summary(
+            schema=cfg, filled=filled_clean,
+        )
+
+        match = MetaMatch(plan=plan, inputs=inputs)
+
+        final: MetaResult | None = None
+        async for ev in run_dag(
+            match,
+            dispatch_step_stream=dispatch_step_stream,
+            yield_skill_view_preface=yield_skill_view_preface,
+            seed_outputs=outputs,
+        ):
+            if isinstance(ev, MetaResult):
+                final = ev
+        if final is None:
+            final = MetaResult(ok=False, error="resume run_dag yielded no MetaResult")
+
+        # Finalize the run lifecycle unless re-paused. If re-paused,
+        # try_claim_awaiting has already moved the row back to
+        # 'awaiting_user' — calling finish_run_sync would corrupt state.
+        if not final.paused:
+            from typing import Literal
+            finish_status: Literal["ok", "failed", "cancelled"] = (
+                "ok" if final.ok else "failed"
+            )
+            await asyncio.to_thread(
+                self._dao.finish_run_sync,
+                run_id=run_id,
+                result=final,
+                status=finish_status,
+            )
+        return final
 
     async def _resolve_final_text(
         self,
