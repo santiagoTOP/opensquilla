@@ -872,6 +872,39 @@ async def test_memory_repair_admin_list_scopes_durable_queue_by_agent_id(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_memory_repair_admin_list_treats_agent_scope_prefix_as_literal(tmp_path):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:ops:webchat:s1",
+                session_id="session-ops",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/ops.md",
+                idempotency_key="repair:wildcard-ops.md",
+                status="repair_pending",
+                reason="parse_failed_archived",
+                created_at=1,
+            )
+        )
+        session_manager = FakeStorageRepairSessionManager(storage)
+        ctx = _ctx(session_manager=session_manager)
+
+        listed = await get_dispatcher().dispatch(
+            "rr-agent-literal-scope",
+            "memory.repair.list",
+            {"agentId": "op_", "limit": 10},
+            ctx,
+        )
+
+        assert listed.error is None, listed.error
+        assert listed.payload["count"] == 0
+        assert listed.payload["items"] == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_doctor_memory_status_deep_surfaces_repair_and_raw_sidecars(tmp_path):
     raw_dir = tmp_path / "memory" / ".raw_fallbacks"
     raw_dir.mkdir(parents=True)

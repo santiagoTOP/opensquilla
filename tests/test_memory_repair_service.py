@@ -381,6 +381,56 @@ async def test_memory_repair_run_scopes_durable_queue_and_legacy_import_by_agent
 
 
 @pytest.mark.asyncio
+async def test_memory_repair_run_treats_agent_scope_prefix_as_literal(tmp_path):
+    from opensquilla.gateway.memory_repair_service import run_memory_repair_once
+
+    op_root = tmp_path / "op_"
+    op_raw_dir = op_root / "memory" / ".raw_fallbacks"
+    op_raw_dir.mkdir(parents=True)
+    (op_raw_dir / "raw.md").write_text(
+        "# Raw flush (timeout)\n\nuser: op underscore marker\n",
+        encoding="utf-8",
+    )
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    flush_service = _FlushService()
+
+    class _SessionManager:
+        def __init__(self) -> None:
+            self.storage = storage
+
+    try:
+        await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:ops:webchat:s1",
+                session_id="session-ops",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/raw.md",
+                idempotency_key="repair:ops-raw.md",
+                status="repair_pending",
+                reason="timeout",
+            )
+        )
+
+        results = await run_memory_repair_once(
+            session_manager=_SessionManager(),
+            flush_service=flush_service,
+            memory_roots={"op_": op_root},
+            agent_id="op_",
+            limit=5,
+        )
+        rows = await storage.list_memory_durable_receipts(limit=10)
+        by_session = {row.session_key: row for row in rows}
+
+        assert [result["status"] for result in results] == ["repaired"]
+        assert len(flush_service.calls) == 1
+        assert flush_service.calls[0][0][0].content == "op underscore marker"
+        assert by_session["agent:ops:webchat:s1"].status == "repair_pending"
+        assert by_session["agent:op_:memory-repair:legacy-raw"].status == "repair_done"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_memory_repair_run_uses_target_path_for_task7_flush_receipt(tmp_path):
     from opensquilla.gateway.memory_repair_service import run_memory_repair_once
 

@@ -285,8 +285,8 @@ async def list_repair_queue(
         agent_clause = ""
         agent_prefix = _agent_session_key_prefix(agent_id)
         if agent_prefix is not None:
-            agent_clause = "AND session_key LIKE ?"
-            params.append(f"{agent_prefix}%")
+            agent_clause = "AND substr(session_key, 1, ?) = ?"
+            params.extend((len(agent_prefix), agent_prefix))
         params.append(limit)
         async with conn.execute(
             f"""
@@ -442,8 +442,8 @@ async def _repair_receipt_exists_for_path(
         agent_clause = ""
         params: list[Any] = [path, path]
         if agent_prefix is not None:
-            agent_clause = "AND session_key LIKE ?"
-            params.append(f"{agent_prefix}%")
+            agent_clause = "AND substr(session_key, 1, ?) = ?"
+            params.extend((len(agent_prefix), agent_prefix))
         async with conn.execute(
             f"""
             SELECT 1 FROM memory_durable_receipts
