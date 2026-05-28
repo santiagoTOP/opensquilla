@@ -851,6 +851,20 @@ def test_chat_semantic_memory_degraded_is_non_blocking_and_path_safe() -> None:
     assert "payload.message ? ': ' + payload.message" not in body
 
 
+def test_chat_distill_failures_do_not_surface_as_blocking_memory_errors() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    start = source.index("function _showCompactionToast(payload, meta = {})")
+    end = source.index("  /* ── RPC Event Subscriptions", start)
+    body = source[start:end]
+    semantic_notice = body.index("const semanticNotice = _compactSemanticMemoryNotice")
+    failure_branch = body.index("if (status === 'failed' || status === 'error')")
+
+    assert semantic_notice < failure_branch
+    assert "Memory saved; organizing" in source
+    assert "flush failed" not in source.lower()
+    assert "bad json" not in source.lower()
+
+
 def test_chat_compact_inflight_uses_pending_queue_and_safe_terminal_drain() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     send_start = source.index("async function _onSend()")

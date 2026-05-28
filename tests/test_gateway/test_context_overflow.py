@@ -661,6 +661,34 @@ async def test_auto_summarize_compacts_after_degraded_flush_receipt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_summarize_compacts_when_distill_fails_after_checkpoint() -> None:
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=True)
+    sm = _CheckpointingSessionManager(_history(6, 40))
+    flush_service = SimpleNamespace(
+        execute=AsyncMock(side_effect=RuntimeError("bad json"))
+    )
+
+    outcome = await apply_context_overflow_policy(
+        config=cfg,
+        message="m",
+        transcript=sm._transcript,
+        session_key="agent:main:s-distill-fails",
+        session_manager=sm,
+        flush_service=flush_service,
+    )
+
+    assert outcome.over_budget is True
+    assert outcome.summarized is True
+    assert outcome.retried is True
+    assert outcome.reason is None
+    assert outcome.refusal is None
+    assert outcome.flush_receipt is None
+    assert sm.calls == ["checkpoint", "compact"]
+    assert sm.compact_calls == [("agent:main:s-distill-fails", 10, None)]
+    assert flush_service.execute.await_args.kwargs["message_window"] == 0
+
+
+@pytest.mark.asyncio
 async def test_auto_summarize_strict_flush_receipt_refuses_before_compaction() -> None:
     cfg = _cfg(
         ContextOverflowPolicy.AUTO_SUMMARIZE,
