@@ -25,6 +25,7 @@ from opensquilla.memory.flush import (
     build_flush_user_prompt_with_audit,
     dump_transcript_excerpt_with_audit,
     resolve_flush_plan,
+    validate_flush_save_arguments,
 )
 from opensquilla.memory.protocols import MemoryProviderCapability, MemoryToolHandler
 from opensquilla.provider.protocol import provider_metadata
@@ -1898,8 +1899,10 @@ def _proposal_markdown(
 
 def _make_flush_read_only_handler(
     inner: MemoryToolHandler,
+    *,
+    relative_path: str,
 ) -> MemoryToolHandler:
-    """Wrap a tool handler so ``memory_save`` can only write under ``memory/``.
+    """Wrap a tool handler so ``memory_save`` can only append to the flush path.
 
     The flush sub-agent must never rewrite MEMORY.md / USER.md / AGENTS.md /
     SOUL.md — those are curated sources. Non-``memory_save`` tools pass through
@@ -1909,12 +1912,16 @@ def _make_flush_read_only_handler(
 
     async def _handler(tc: ToolCall):
         if tc.tool_name == "memory_save":
-            path = tc.arguments.get("path", "") if isinstance(tc.arguments, dict) else ""
-            if not isinstance(path, str) or not path.startswith("memory/"):
+            reason = (
+                validate_flush_save_arguments(tc.arguments, relative_path=relative_path)
+                if isinstance(tc.arguments, dict)
+                else f"Flush may only append to {relative_path}."
+            )
+            if reason is not None:
                 return ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name=tc.tool_name,
-                    content="MEMORY.md is read-only during flush.",
+                    content=reason,
                     is_error=True,
                 )
         return await inner(tc)
@@ -2742,7 +2749,10 @@ class SessionFlushService:
                     selected_start_index=selected_start_index,
                 ),
             )
-        handler = _make_flush_read_only_handler(self._tool_handler)
+        handler = _make_flush_read_only_handler(
+            self._tool_handler,
+            relative_path=path,
+        )
         _ctx_token = current_tool_context.set(
             _flush_tool_context(agent_id, source_name="pure-extract")
         )
@@ -2937,7 +2947,10 @@ class SessionFlushService:
             provider=provider,
             config=cfg,
             tool_definitions=flush_tools,
-            tool_handler=_make_flush_read_only_handler(self._tool_handler),
+            tool_handler=_make_flush_read_only_handler(
+                self._tool_handler,
+                relative_path=plan.relative_path,
+            ),
         )
 
         save_results: list[_MemorySaveResult] = []
