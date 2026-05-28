@@ -34,10 +34,10 @@ from opensquilla.session.compaction_lifecycle import (
     COMPACTION_PERSISTED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
+    compaction_memory_status,
     compaction_lifecycle_payload,
     compaction_result_payload,
     durable_receipt_allows_destructive_compaction,
-    flush_receipt_allows_destructive_compaction,
     flush_receipt_is_successful_flush,
     flush_receipt_status_for_compaction,
     flush_receipt_to_dict,
@@ -1513,14 +1513,18 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
                 },
             ) from exc
 
-        if not flush_receipt_allows_destructive_compaction(
-            receipt
-        ) and not await _durable_receipt_allows_covered_destructive_compaction(
+        durable_receipt_safe = await _durable_receipt_allows_covered_destructive_compaction(
             storage,
             key,
             previous_session_id,
             transcript,
-        ):
+        )
+        memory_status = compaction_memory_status(
+            receipt,
+            deterministic_receipt_safe=durable_receipt_safe,
+            required=True,
+        )
+        if not memory_status.allows_destructive_compaction:
             flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
             raise RpcHandlerError(
                 code="flush_disk_error",
@@ -1534,6 +1538,8 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
                     "session_id": previous_session_id,
                     "reason": "destructive_reset_requires_safe_flush",
                     "flush_receipt_status": flush_status,
+                    "memory_safety_status": memory_status.safety_status,
+                    "semantic_memory_status": memory_status.semantic_status,
                 },
             )
 
@@ -1809,18 +1815,23 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 flush_enabled
                 and transcript
                 and pre_compaction_flush_requires_safe_receipt(ctx.config)
-                and not flush_receipt_allows_destructive_compaction(receipt)
             ):
-                durable_receipt_safe = (
-                    storage is not None
-                    and await _durable_receipt_allows_covered_destructive_compaction(
-                        storage,
-                        key,
-                        getattr(session, "session_id", None) if session else None,
-                        transcript,
+                durable_receipt_safe = False
+                if storage is not None:
+                    durable_receipt_safe = (
+                        await _durable_receipt_allows_covered_destructive_compaction(
+                            storage,
+                            key,
+                            getattr(session, "session_id", None) if session else None,
+                            transcript,
+                        )
                     )
+                memory_status = compaction_memory_status(
+                    receipt,
+                    deterministic_receipt_safe=durable_receipt_safe,
+                    required=flush_enabled,
                 )
-                if not durable_receipt_safe:
+                if not memory_status.allows_destructive_compaction:
                     raise RpcHandlerError(
                         code="CONTEXT_FLUSH_FAILED",
                         message=(
@@ -1833,6 +1844,8 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                             "session_id": getattr(session, "session_id", None),
                             "reason": "destructive_manual_compact_requires_safe_flush",
                             "flush_receipt_status": flush_receipt_status,
+                            "memory_safety_status": memory_status.safety_status,
+                            "semantic_memory_status": memory_status.semantic_status,
                         },
                     )
 
@@ -2088,14 +2101,18 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
                         },
                     ) from exc
 
-                if not flush_receipt_allows_destructive_compaction(
-                    receipt
-                ) and not await _durable_receipt_allows_covered_destructive_compaction(
+                durable_receipt_safe = await _durable_receipt_allows_covered_destructive_compaction(
                     storage,
                     key,
                     previous_session_id,
                     _truncate_checkpoint_scope_entries(transcript, max_messages),
-                ):
+                )
+                memory_status = compaction_memory_status(
+                    receipt,
+                    deterministic_receipt_safe=durable_receipt_safe,
+                    required=True,
+                )
+                if not memory_status.allows_destructive_compaction:
                     flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
                     raise RpcHandlerError(
                         code="CONTEXT_FLUSH_FAILED",
@@ -2109,6 +2126,8 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
                             "session_id": previous_session_id,
                             "reason": "destructive_truncate_requires_safe_flush",
                             "flush_receipt_status": flush_status,
+                            "memory_safety_status": memory_status.safety_status,
+                            "semantic_memory_status": memory_status.semantic_status,
                         },
                     )
             else:

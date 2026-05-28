@@ -1254,12 +1254,22 @@ class TestSessionsReset:
             execute=AsyncMock(
                 return_value=SimpleNamespace(
                     mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    result_status="parse_failed_archived",
+                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
-                    to_dict=lambda: {"mode": "raw"},
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "raw",
+                        "result_status": "parse_failed_archived",
+                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1270,6 +1280,7 @@ class TestSessionsReset:
         )
 
         assert res.ok is True
+        assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
         assert manager.applied_intents == [(session.session_key, "reset_same_key")]
 
     @pytest.mark.asyncio
@@ -1291,13 +1302,23 @@ class TestSessionsReset:
         flush_service = SimpleNamespace(
             execute=AsyncMock(
                 return_value=SimpleNamespace(
-                    mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    mode="error",
+                    result_status="archive_failed",
+                    flushed_paths=[],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
-                    to_dict=lambda: {"mode": "raw"},
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "error",
+                        "result_status": "archive_failed",
+                        "flushed_paths": [],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1309,6 +1330,8 @@ class TestSessionsReset:
 
         assert res.ok is False
         assert res.error.code == "flush_disk_error"
+        assert res.error.details["memory_safety_status"] == "unsafe"
+        assert res.error.details["semantic_memory_status"] == "failed"
         assert manager.applied_intents == []
 
     @pytest.mark.asyncio
@@ -1495,11 +1518,22 @@ class TestSessionsTruncate:
             execute=AsyncMock(
                 return_value=SimpleNamespace(
                     mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    result_status="parse_failed_archived",
+                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "raw",
+                        "result_status": "parse_failed_archived",
+                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1513,6 +1547,7 @@ class TestSessionsTruncate:
         )
 
         assert res.ok is True
+        assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
         assert manager.truncate_calls == [(session.session_key, 1)]
 
     @pytest.mark.asyncio
@@ -1534,12 +1569,23 @@ class TestSessionsTruncate:
         flush_service = SimpleNamespace(
             execute=AsyncMock(
                 return_value=SimpleNamespace(
-                    mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    mode="error",
+                    result_status="archive_failed",
+                    flushed_paths=[],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "error",
+                        "result_status": "archive_failed",
+                        "flushed_paths": [],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1554,6 +1600,8 @@ class TestSessionsTruncate:
 
         assert res.ok is False
         assert res.error.code == "CONTEXT_FLUSH_FAILED"
+        assert res.error.details["memory_safety_status"] == "unsafe"
+        assert res.error.details["semantic_memory_status"] == "failed"
         assert manager.truncate_calls == []
 
     @pytest.mark.asyncio
@@ -1601,12 +1649,23 @@ class TestSessionsTruncate:
         flush_service = SimpleNamespace(
             execute=AsyncMock(
                 return_value=SimpleNamespace(
-                    mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    mode="error",
+                    result_status="archive_failed",
+                    flushed_paths=[],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "error",
+                        "result_status": "archive_failed",
+                        "flushed_paths": [],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1618,6 +1677,8 @@ class TestSessionsTruncate:
 
         assert res.ok is False
         assert res.error.code == "CONTEXT_FLUSH_FAILED"
+        assert res.error.details["memory_safety_status"] == "unsafe"
+        assert res.error.details["semantic_memory_status"] == "failed"
         assert manager.truncate_calls == []
 
 
@@ -1868,11 +1929,22 @@ class TestSessionsContextCompact:
             execute=AsyncMock(
                 return_value=SimpleNamespace(
                     mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    result_status="parse_failed_archived",
+                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "raw",
+                        "result_status": "parse_failed_archived",
+                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1905,11 +1977,22 @@ class TestSessionsContextCompact:
             execute=AsyncMock(
                 return_value=SimpleNamespace(
                     mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    result_status="parse_failed_archived",
+                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "raw",
+                        "result_status": "parse_failed_archived",
+                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1929,6 +2012,8 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
+        assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
+        assert res.payload["flush_receipt_status"] == "unsafe"
         assert manager.compact_calls[0][:2] == (session.session_key, 100000)
 
     @pytest.mark.asyncio
@@ -1950,12 +2035,23 @@ class TestSessionsContextCompact:
         flush_service = SimpleNamespace(
             execute=AsyncMock(
                 return_value=SimpleNamespace(
-                    mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
+                    mode="error",
+                    result_status="archive_failed",
+                    flushed_paths=[],
+                    content_hash="h1",
+                    indexed_chunk_count=0,
+                    integrity_status="unverified",
+                    output_coverage_status="unverified",
                     invalid_candidate_count=0,
-                    obligation_status="ok",
+                    candidate_missing_ids=[],
+                    obligation_status="unverified",
+                    obligation_missing_ids=[],
+                    to_dict=lambda: {
+                        "mode": "error",
+                        "result_status": "archive_failed",
+                        "flushed_paths": [],
+                        "content_hash": "h1",
+                    },
                 )
             )
         )
@@ -1976,6 +2072,8 @@ class TestSessionsContextCompact:
 
         assert res.ok is False
         assert res.error.code == "CONTEXT_FLUSH_FAILED"
+        assert res.error.details["memory_safety_status"] == "unsafe"
+        assert res.error.details["semantic_memory_status"] == "failed"
         assert manager.compact_calls == []
 
     @pytest.mark.asyncio
