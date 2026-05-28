@@ -13,16 +13,37 @@ from typing import Any
 import structlog
 
 from opensquilla.asyncio_utils import create_background_task
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.session.compaction_lifecycle import (
     flush_receipt_allows_destructive_compaction,
     flush_receipt_to_dict,
 )
+from opensquilla.session.models import MemoryDurableReceipt
 
 log = structlog.get_logger(__name__)
 
 _RAW_FALLBACK_REPAIR_DIR = ".repair_receipts"
 _RAW_FALLBACK_LINE_RE = re.compile(r"^(user|assistant|system):\s?(.*)$")
 _RAW_FALLBACK_HEADER_RE = re.compile(r"^# Raw flush \(([^)]+)\)")
+_REPAIR_QUEUE_STATUSES = ("repair_pending", "distill_failed", "flush_failed")
+_REPAIR_BACKOFF_MS = {
+    1: 5 * 60 * 1000,
+    2: 30 * 60 * 1000,
+    3: 6 * 60 * 60 * 1000,
+}
+
+
+def repair_receipt_path(receipt: Any) -> str | None:
+    source_path = getattr(receipt, "source_path", None)
+    target_path = getattr(receipt, "target_path", None)
+    for path in (source_path, target_path):
+        if isinstance(path, str) and path.startswith("memory/.raw_fallbacks/"):
+            return path
+    if isinstance(source_path, str) and source_path:
+        return source_path
+    if isinstance(target_path, str) and target_path:
+        return target_path
+    return None
 
 
 def _summary_to_repair_wire(summary: Any) -> dict[str, Any]:
@@ -37,6 +58,33 @@ def _summary_to_repair_wire(summary: Any) -> dict[str, Any]:
         "removedCount": getattr(summary, "removed_count", None),
         "coveredThroughId": getattr(summary, "covered_through_id", None),
         "createdAt": getattr(summary, "created_at", None),
+    }
+
+
+def repair_receipt_to_wire(receipt: Any) -> dict[str, Any]:
+    path = repair_receipt_path(receipt)
+    source_type = (
+        "raw_fallback"
+        if isinstance(path, str) and path.startswith("memory/.raw_fallbacks/")
+        else "durable_receipt"
+    )
+    return {
+        "sourceType": source_type,
+        "receiptId": getattr(receipt, "receipt_id", None),
+        "sessionId": getattr(receipt, "session_id", None),
+        "sessionKey": getattr(receipt, "session_key", None),
+        "turnId": getattr(receipt, "turn_id", None),
+        "scope": getattr(receipt, "scope", None),
+        "path": path,
+        "sourcePath": getattr(receipt, "source_path", None),
+        "targetPath": getattr(receipt, "target_path", None),
+        "contentHash": getattr(receipt, "content_hash", None),
+        "repairStatus": getattr(receipt, "status", None),
+        "reason": getattr(receipt, "reason", None),
+        "attemptCount": getattr(receipt, "attempt_count", None),
+        "nextRetryAtMs": getattr(receipt, "next_retry_at_ms", None),
+        "createdAt": getattr(receipt, "created_at", None),
+        "updatedAt": getattr(receipt, "updated_at", None),
     }
 
 
@@ -203,6 +251,153 @@ def raw_fallback_rows(root: Path, *, include_repaired: bool = False) -> list[dic
     return rows
 
 
+async def list_repair_queue(storage: Any, limit: int = 100) -> list[MemoryDurableReceipt]:
+    limit = max(0, int(limit))
+    if limit == 0:
+        return []
+    conn = getattr(storage, "conn", None)
+    if conn is not None:
+        placeholders = ", ".join("?" for _ in _REPAIR_QUEUE_STATUSES)
+        async with conn.execute(
+            f"""
+            SELECT * FROM memory_durable_receipts
+            WHERE status IN ({placeholders})
+            ORDER BY
+                next_retry_at_ms IS NOT NULL ASC,
+                next_retry_at_ms ASC,
+                created_at ASC,
+                rowid ASC
+            LIMIT ?
+            """,
+            (*_REPAIR_QUEUE_STATUSES, limit),
+        ) as cur:
+            sql_rows = await cur.fetchall()
+        return [MemoryDurableReceipt(**dict(row)) for row in sql_rows]
+
+    list_receipts = getattr(storage, "list_memory_durable_receipts", None)
+    if not callable(list_receipts):
+        return []
+    receipt_rows: list[Any] = []
+    scan_limit = max(limit, 1000)
+    for status in _REPAIR_QUEUE_STATUSES:
+        receipt_rows.extend(await list_receipts(status=status, limit=scan_limit))
+    receipt_rows.sort(
+        key=lambda row: (
+            getattr(row, "next_retry_at_ms", None) is not None,
+            getattr(row, "next_retry_at_ms", None) or 0,
+            getattr(row, "created_at", 0) or 0,
+            getattr(row, "receipt_id", "") or "",
+        )
+    )
+    return list(receipt_rows[:limit])
+
+
+async def _repair_receipt_exists_for_path(storage: Any, path: str) -> bool:
+    conn = getattr(storage, "conn", None)
+    if conn is not None:
+        async with conn.execute(
+            """
+            SELECT 1 FROM memory_durable_receipts
+            WHERE source_path = ? OR target_path = ?
+            LIMIT 1
+            """,
+            (path, path),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    list_receipts = getattr(storage, "list_memory_durable_receipts", None)
+    if not callable(list_receipts):
+        return False
+    for status in (*_REPAIR_QUEUE_STATUSES, "repair_done", "repair_abandoned"):
+        rows = await list_receipts(status=status, limit=1000)
+        if any(
+            getattr(row, "source_path", None) == path
+            or getattr(row, "target_path", None) == path
+            for row in rows
+        ):
+            return True
+    return False
+
+
+async def import_legacy_raw_fallback_receipts(
+    storage: Any | None,
+    root: Path | None,
+    *,
+    agent_id: str,
+) -> None:
+    if storage is None or root is None:
+        return
+    upsert = getattr(storage, "upsert_memory_durable_receipt", None)
+    if not callable(upsert):
+        return
+    for row in raw_fallback_rows(root):
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        if await _repair_receipt_exists_for_path(storage, path):
+            continue
+        await upsert(
+            MemoryDurableReceipt(
+                session_key=f"agent:{agent_id}:memory-repair:legacy-raw",
+                session_id=f"legacy-raw:{agent_id}",
+                scope="repair",
+                source_path=path,
+                idempotency_key=f"repair-legacy-raw:{agent_id}:{path}",
+                status="repair_pending",
+                reason=str(row.get("reason") or "legacy_raw_fallback"),
+                created_at=int(row.get("modifiedAt") or time.time() * 1000),
+            )
+        )
+
+
+async def mark_repair_attempt_failed(
+    storage: Any,
+    receipt: Any,
+    *,
+    reason: str,
+    now_ms: int | None = None,
+) -> Any:
+    update = getattr(storage, "update_memory_durable_receipt", None)
+    if not callable(update):
+        return receipt
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    previous_attempts = int(getattr(receipt, "attempt_count", 0) or 0)
+    if (
+        previous_attempts == 1
+        and getattr(receipt, "status", None) == "repair_pending"
+        and getattr(receipt, "next_retry_at_ms", None) is None
+    ):
+        attempt_count = 1
+    else:
+        attempt_count = previous_attempts + 1
+    if attempt_count >= 4:
+        return await update(
+            getattr(receipt, "receipt_id"),
+            status="repair_abandoned",
+            reason=reason,
+            attempt_count=attempt_count,
+            next_retry_at_ms=None,
+        )
+    return await update(
+        getattr(receipt, "receipt_id"),
+        status="repair_pending",
+        reason=reason,
+        attempt_count=attempt_count,
+        next_retry_at_ms=now_ms + _REPAIR_BACKOFF_MS[attempt_count],
+    )
+
+
+async def mark_repair_attempt_done(storage: Any, receipt: Any) -> Any:
+    update = getattr(storage, "update_memory_durable_receipt", None)
+    if not callable(update):
+        return receipt
+    return await update(
+        getattr(receipt, "receipt_id"),
+        status="repair_done",
+        next_retry_at_ms=None,
+    )
+
+
 def _raw_path_matches(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
     path = params.get("path")
     return path is None or str(row.get("path") or "") == raw_fallback_rel_path(str(path)).as_posix()
@@ -304,6 +499,35 @@ async def repair_raw_fallback_source(
     return {**base, "status": status, "receipt": flush_receipt_to_dict(receipt)}
 
 
+async def repair_durable_receipt_source(
+    storage: Any,
+    receipt: Any,
+    *,
+    root: Path,
+    flush_service: Any,
+    agent_id: str,
+) -> dict[str, Any]:
+    base = repair_receipt_to_wire(receipt)
+    path = repair_receipt_path(receipt)
+    if not isinstance(path, str) or not path.startswith("memory/.raw_fallbacks/"):
+        return {**base, "status": "skipped", "reason": "unsupported_repair_source"}
+    result = await repair_raw_fallback_source(
+        root,
+        {**base, "path": path},
+        flush_service=flush_service,
+        agent_id=agent_id,
+    )
+    if result.get("status") == "repaired":
+        await mark_repair_attempt_done(storage, receipt)
+    else:
+        await mark_repair_attempt_failed(
+            storage,
+            receipt,
+            reason=str(result.get("reason") or "repair_failed"),
+        )
+    return result
+
+
 async def run_memory_repair_once(
     *,
     session_manager: Any,
@@ -318,8 +542,45 @@ async def run_memory_repair_once(
     if not callable(getattr(flush_service, "execute", None)):
         raise RuntimeError("Session flush service is not configured")
     results: list[dict[str, Any]] = []
+    root = _memory_root(memory_roots, agent_id)
+    storage = get_session_storage(session_manager)
+    if root is not None:
+        await import_legacy_raw_fallback_receipts(storage, root, agent_id=agent_id)
+    if storage is not None:
+        queue_rows = await list_repair_queue(storage, limit=scan_limit)
+        if "path" in params:
+            selected = raw_fallback_rel_path(str(params.get("path") or "")).as_posix()
+            queue_rows = [
+                row
+                for row in queue_rows
+                if repair_receipt_path(row) == selected
+            ]
+        for receipt in queue_rows:
+            if len(results) >= limit:
+                return results
+            if root is None:
+                results.append(
+                    {
+                        **repair_receipt_to_wire(receipt),
+                        "status": "failed_retryable",
+                        "reason": "memory_root_unavailable",
+                    }
+                )
+                continue
+            results.append(
+                await repair_durable_receipt_source(
+                    storage,
+                    receipt,
+                    root=root,
+                    flush_service=flush_service,
+                    agent_id=agent_id,
+                )
+            )
+        if "path" in params or results:
+            return results
+
     compaction_sources = []
-    if "path" not in params:
+    if storage is None and "path" not in params:
         compaction_sources = await list_compaction_repair_sources(
             session_manager,
             agent_id=agent_id,
@@ -339,7 +600,6 @@ async def run_memory_repair_once(
             )
         )
 
-    root = _memory_root(memory_roots, agent_id)
     if root is None:
         return results
     include_repaired = "path" in params

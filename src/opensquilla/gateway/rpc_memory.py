@@ -8,13 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.gateway.memory_repair_service import (
+    import_legacy_raw_fallback_receipts,
+    list_repair_queue,
     parse_raw_fallback_entries,
+    repair_receipt_path,
+    repair_receipt_to_wire,
     run_memory_repair_once,
 )
 from opensquilla.gateway.memory_repair_service import (
     raw_fallback_rows as repair_raw_fallback_rows,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.memory.types import (
     DEFAULT_MEMORY_SEARCH_MIN_SCORE,
     DEFAULT_MEMORY_SEARCH_RESULTS,
@@ -534,10 +539,27 @@ async def _handle_memory_repair_list(
     agent_id = normalize_agent_id(str(params.get("agentId") or "main"))
     limit = _int_param(params, "limit", 50, minimum=1, maximum=_MAX_REPAIR_LIST_LIMIT)
     manager = _require_session_manager(ctx)
-    rows = await _repair_summaries(manager, agent_id=agent_id, params=params, limit=limit)
-    items = [_summary_to_repair_wire(row) for row in rows]
+    storage = get_session_storage(manager)
+    items: list[dict[str, Any]] = []
     has_compaction_selector = any(k in params for k in ("summaryId", "sessionKey", "compactionId"))
-    if not has_compaction_selector or "path" in params:
+    memory_manager = (getattr(ctx, "memory_managers", None) or {}).get(agent_id)
+    if memory_manager is not None:
+        root = _memory_root(memory_manager).resolve()
+        await import_legacy_raw_fallback_receipts(storage, root, agent_id=agent_id)
+    if storage is not None and not has_compaction_selector:
+        rows = await list_repair_queue(storage, limit=limit)
+        if "path" in params:
+            selected = _raw_fallback_rel_path(str(params.get("path") or ""))
+            rows = [
+                row
+                for row in rows
+                if repair_receipt_path(row) == selected
+            ]
+        items = [repair_receipt_to_wire(row) for row in rows[:limit]]
+    else:
+        rows = await _repair_summaries(manager, agent_id=agent_id, params=params, limit=limit)
+        items = [_summary_to_repair_wire(row) for row in rows]
+    if storage is None and (not has_compaction_selector or "path" in params):
         memory_manager = (getattr(ctx, "memory_managers", None) or {}).get(agent_id)
         if memory_manager is not None:
             raw_rows = repair_raw_fallback_rows(_memory_root(memory_manager).resolve())

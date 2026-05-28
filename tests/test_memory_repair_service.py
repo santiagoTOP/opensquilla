@@ -6,6 +6,9 @@ from typing import Any
 
 import pytest
 
+from opensquilla.session.models import MemoryDurableReceipt
+from opensquilla.session.storage import SessionStorage
+
 
 def test_parse_raw_fallback_entries_preserves_multiline_message_body():
     from opensquilla.gateway.memory_repair_service import parse_raw_fallback_entries
@@ -23,6 +26,160 @@ def test_parse_raw_fallback_entries_preserves_multiline_message_body():
     assert "# Keep this heading" in entries[0].content
     assert "Wei: Yesterday" in entries[0].content
     assert entries[1].content == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_list_repair_queue_returns_pending_durable_receipts(tmp_path):
+    from opensquilla.gateway.memory_repair_service import list_repair_queue
+
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/raw.md",
+                idempotency_key="repair:raw.md",
+                status="repair_pending",
+                reason="parse_failed_archived",
+                created_at=20,
+                next_retry_at_ms=None,
+            )
+        )
+        await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/failed.md",
+                idempotency_key="repair:failed.md",
+                status="distill_failed",
+                reason="distill_failed",
+                created_at=10,
+                next_retry_at_ms=None,
+            )
+        )
+        await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/retry-later.md",
+                idempotency_key="repair:retry-later.md",
+                status="flush_failed",
+                reason="flush_failed",
+                created_at=1,
+                next_retry_at_ms=999,
+            )
+        )
+
+        rows = await list_repair_queue(storage, limit=10)
+
+        assert [row.source_path for row in rows] == [
+            "memory/.raw_fallbacks/failed.md",
+            "memory/.raw_fallbacks/raw.md",
+            "memory/.raw_fallbacks/retry-later.md",
+        ]
+        assert [row.status for row in rows] == [
+            "distill_failed",
+            "repair_pending",
+            "flush_failed",
+        ]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_failure_backoff_abandons_after_fourth_attempt(tmp_path):
+    from opensquilla.gateway.memory_repair_service import mark_repair_attempt_failed
+
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        receipt = await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/raw.md",
+                idempotency_key="repair:raw.md",
+                status="repair_pending",
+                reason="parse_failed_archived",
+            )
+        )
+
+        first = await mark_repair_attempt_failed(
+            storage,
+            receipt,
+            reason="RuntimeError",
+            now_ms=1_000,
+        )
+        second = await mark_repair_attempt_failed(
+            storage,
+            first,
+            reason="RuntimeError",
+            now_ms=2_000,
+        )
+        third = await mark_repair_attempt_failed(
+            storage,
+            second,
+            reason="RuntimeError",
+            now_ms=3_000,
+        )
+        fourth = await mark_repair_attempt_failed(
+            storage,
+            third,
+            reason="RuntimeError",
+            now_ms=4_000,
+        )
+
+        assert first.attempt_count == 1
+        assert first.next_retry_at_ms == 301_000
+        assert second.attempt_count == 2
+        assert second.next_retry_at_ms == 1_802_000
+        assert third.attempt_count == 3
+        assert third.next_retry_at_ms == 21_603_000
+        assert fourth.attempt_count == 4
+        assert fourth.status == "repair_abandoned"
+        assert fourth.next_retry_at_ms is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_failure_backoff_treats_task7_pending_as_first_repair_attempt(
+    tmp_path,
+):
+    from opensquilla.gateway.memory_repair_service import mark_repair_attempt_failed
+
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        receipt = await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="session:agent:main:webchat:s1:flush:1-1",
+                target_path="memory/.raw_fallbacks/raw.md",
+                idempotency_key="repair:task7-raw.md",
+                status="repair_pending",
+                reason="parse_failed_archived",
+                attempt_count=1,
+                next_retry_at_ms=None,
+            )
+        )
+
+        first = await mark_repair_attempt_failed(
+            storage,
+            receipt,
+            reason="RuntimeError",
+            now_ms=1_000,
+        )
+
+        assert first.attempt_count == 1
+        assert first.next_retry_at_ms == 301_000
+    finally:
+        await storage.close()
 
 
 class _RepairSessionManager:
@@ -123,6 +280,99 @@ async def test_memory_repair_service_run_once_repairs_preimage_and_raw_fallback(
     assert session_manager.status_updates == [(17, "repaired")]
     assert flush_service.calls[0][1] == "agent:main:repair-service"
     assert flush_service.calls[1][0][0].content == "raw service marker"
+
+
+@pytest.mark.asyncio
+async def test_memory_repair_run_imports_legacy_raw_fallback_to_ledger(tmp_path):
+    from opensquilla.gateway.memory_repair_service import run_memory_repair_once
+
+    raw_dir = tmp_path / "memory" / ".raw_fallbacks"
+    raw_dir.mkdir(parents=True)
+    raw_path = raw_dir / "raw.md"
+    raw_path.write_text(
+        "# Raw flush (timeout)\n\nuser: legacy raw marker\n",
+        encoding="utf-8",
+    )
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    flush_service = _FlushService()
+
+    class _SessionManager:
+        def __init__(self) -> None:
+            self.storage = storage
+
+    try:
+        results = await run_memory_repair_once(
+            session_manager=_SessionManager(),
+            flush_service=flush_service,
+            memory_roots={"main": tmp_path},
+            agent_id="main",
+            limit=5,
+        )
+        rows = await storage.list_memory_durable_receipts(
+            session_key="agent:main:memory-repair:legacy-raw",
+            limit=10,
+        )
+
+        assert results[0]["status"] == "repaired"
+        assert rows[0].source_path == "memory/.raw_fallbacks/raw.md"
+        assert rows[0].status == "repair_done"
+        assert raw_path.exists()
+        assert flush_service.calls[0][0][0].content == "legacy raw marker"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_repair_run_uses_target_path_for_task7_flush_receipt(tmp_path):
+    from opensquilla.gateway.memory_repair_service import run_memory_repair_once
+
+    raw_dir = tmp_path / "memory" / ".raw_fallbacks"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "raw.md").write_text(
+        "# Raw flush (parse_failed_archived)\n\nuser: task7 marker\n",
+        encoding="utf-8",
+    )
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    flush_service = _FlushService()
+
+    class _SessionManager:
+        def __init__(self) -> None:
+            self.storage = storage
+
+    try:
+        saved = await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="session:agent:main:webchat:s1:flush:1-1",
+                target_path="memory/.raw_fallbacks/raw.md",
+                idempotency_key="repair:task7-raw.md",
+                status="repair_pending",
+                reason="parse_failed_archived",
+                attempt_count=1,
+            )
+        )
+
+        results = await run_memory_repair_once(
+            session_manager=_SessionManager(),
+            flush_service=flush_service,
+            memory_roots={"main": tmp_path},
+            agent_id="main",
+            limit=5,
+        )
+        rows = await storage.list_memory_durable_receipts(
+            idempotency_key=saved.idempotency_key,
+            limit=1,
+        )
+
+        assert results[0]["status"] == "repaired"
+        assert rows[0].source_path == "session:agent:main:webchat:s1:flush:1-1"
+        assert rows[0].target_path == "memory/.raw_fallbacks/raw.md"
+        assert rows[0].status == "repair_done"
+        assert flush_service.calls[0][0][0].content == "task7 marker"
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

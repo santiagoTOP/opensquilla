@@ -13,6 +13,8 @@ from opensquilla.gateway.scopes import ADMIN_SCOPE, METHOD_SCOPES, READ_SCOPE, W
 from opensquilla.memory.types import MemorySearchResult, MemorySource, SearchIntent
 from opensquilla.search.registry import register_provider
 from opensquilla.search.types import SearchProviderError, SearchProviderSpec, SearchResult
+from opensquilla.session.models import MemoryDurableReceipt
+from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin.web import configure_search, run_web_search_payload
 
 
@@ -615,6 +617,12 @@ class FakeEmptyRepairSessionManager(FakeRepairSessionManager):
         return []
 
 
+class FakeStorageRepairSessionManager(FakeEmptyRepairSessionManager):
+    def __init__(self, storage: Any) -> None:
+        super().__init__()
+        self.storage = storage
+
+
 class FakeRepairFlushService:
     def __init__(self) -> None:
         self.calls: list[tuple[list[Any], str, dict[str, Any]]] = []
@@ -732,6 +740,40 @@ async def test_memory_repair_admin_lists_shows_and_runs_raw_fallback(tmp_path):
     assert repaired.payload["results"][0]["status"] == "repaired"
     assert flush_service.calls[0][0][0].content == "remember raw repair marker RR-1"
     assert flush_service.calls[0][2]["message_window"] == 0
+
+
+@pytest.mark.asyncio
+async def test_memory_repair_admin_list_uses_durable_ledger_queue(tmp_path):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                session_key="agent:main:webchat:s1",
+                session_id="session-1",
+                scope="repair",
+                source_path="memory/.raw_fallbacks/raw.md",
+                idempotency_key="repair:raw.md",
+                status="repair_pending",
+                reason="parse_failed_archived",
+                created_at=20,
+            )
+        )
+        session_manager = FakeStorageRepairSessionManager(storage)
+        ctx = _ctx(session_manager=session_manager)
+
+        listed = await get_dispatcher().dispatch(
+            "rr-ledger",
+            "memory.repair.list",
+            {"agentId": "main", "limit": 10},
+            ctx,
+        )
+
+        assert listed.error is None, listed.error
+        assert listed.payload["items"][0]["sourceType"] == "raw_fallback"
+        assert listed.payload["items"][0]["path"] == "memory/.raw_fallbacks/raw.md"
+        assert listed.payload["items"][0]["repairStatus"] == "repair_pending"
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
