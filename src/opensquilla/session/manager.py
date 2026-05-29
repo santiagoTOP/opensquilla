@@ -373,7 +373,11 @@ class SessionManager:
                 continue
             if self._task_runtime is not None:
                 try:
-                    await self._task_runtime.cancel(session_key=child_key)
+                    await self._task_runtime.cancel(
+                        session_key=child_key,
+                        source="parent_session_kill",
+                        reason="parent_session_kill",
+                    )
                 except Exception:
                     pass
             try:

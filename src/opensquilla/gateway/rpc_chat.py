@@ -249,7 +249,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
 
 @_d.method("chat.abort", scope="operator.write")
 async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
-    session_key = _canonical_webchat_session_key((params or {}).get("sessionKey"))
+    raw_params = params or {}
+    session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
     # Fresh-WebUI / smoke path: abort always returns an ok envelope keyed by
     # sessionKey, regardless of whether a live task exists to cancel.
     if ctx.session_manager is None:
@@ -257,7 +258,13 @@ async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
     _require_chat_session_manager(ctx)
     from opensquilla.gateway.rpc_sessions import _handle_sessions_abort
 
-    result = await _handle_sessions_abort({"key": session_key}, ctx)
+    result = await _handle_sessions_abort(
+        {
+            "key": session_key,
+            "source": raw_params.get("source") or "webui_abort",
+        },
+        ctx,
+    )
     return {"sessionKey": session_key, **result}
 
 

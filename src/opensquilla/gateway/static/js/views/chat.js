@@ -1957,7 +1957,7 @@ const ChatView = (() => {
 
     // Send
     _sendBtn.addEventListener('click', _onSend);
-    if (_stopBtn) _stopBtn.addEventListener('click', _onStop);
+    if (_stopBtn) _stopBtn.addEventListener('click', () => _onStop('webui_stop_button'));
     if (_pendingArea) _pendingArea.addEventListener('click', _onPendingAreaClick);
 
     // Session key is now managed via chip + switch (see _bindSessionChip).
@@ -2012,8 +2012,8 @@ const ChatView = (() => {
     });
 
     // Keyboard: Enter to send; slash navigation; ↑/↓ history; Alt+↑/↓ pending edit.
-    // ESC streaming abort lives on the document-level handler below so it works
-    // regardless of focus.
+    // ESC streaming abort lives on the document-level handler below, except in
+    // editable targets where ESC belongs to text editing / menu dismissal.
     _textarea.addEventListener('keydown', (e) => {
       if (_composing || e.isComposing || e.keyCode === 229) return;
 
@@ -2099,7 +2099,7 @@ const ChatView = (() => {
       }
     });
 
-    // Document-level ESC: works regardless of focus. Priority chain:
+    // Document-level ESC: works outside editable targets. Priority chain:
     //   1. streaming  → _onStop (which also recovers pending)
     //   2. pending    → _popAllPendingIntoComposer
     //   3. otherwise drop through to the textarea handler / popovers / no-op
@@ -2119,11 +2119,6 @@ const ChatView = (() => {
       if (typeof Router !== 'undefined' && Router.currentPath && Router.currentPath() !== '/chat') return;
       if (e.defaultPrevented) return;
       if (_chatOverlayVisible()) return;
-      if (_isStreaming) {
-        e.preventDefault();
-        _onStop();
-        return;
-      }
       const target = e.target;
       const inEditable = target && (
         target === _textarea
@@ -2132,6 +2127,11 @@ const ChatView = (() => {
         || target.isContentEditable
       );
       if (inEditable) return; // textarea handler will deal with the empty-clear case
+      if (_isStreaming) {
+        e.preventDefault();
+        _onStop('webui_escape');
+        return;
+      }
       if (_pendingQueue.length > 0) {
         e.preventDefault();
         _popAllPendingIntoComposer();
@@ -6024,11 +6024,12 @@ const ChatView = (() => {
 
   /* ── Pending Queue ──────────────────────────────────────────────────── */
 
-  function _onStop() {
+  function _onStop(source = 'webui_stop_button') {
     if (!_isStreaming) return;
+    if (typeof source !== 'string' || !source) source = 'webui_stop_button';
     _stopRequestedByUser = true;
     _aborted = true;
-    _rpc.call('chat.abort', { sessionKey: _sessionKey }).catch(() => {});
+    _rpc.call('chat.abort', { sessionKey: _sessionKey, source }).catch(() => {});
     _endStreaming({ reason: 'aborted' });
     // Recover queued messages back into the composer so the user can edit
     // and resend rather than losing them. Idempotent on empty queue.

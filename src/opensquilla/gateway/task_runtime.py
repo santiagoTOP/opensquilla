@@ -179,6 +179,8 @@ class _RuntimeTask:
     cancel_requested: bool = False
     acquired_slot: bool = False
     overflow_dropped: bool = False
+    cancel_source: str | None = None
+    cancel_reason: str | None = None
 
 
 TaskHandler = Callable[[TaskRun], Awaitable[Any]]
@@ -228,6 +230,17 @@ class _TurnHardDeadlineExceeded(TimeoutError):  # noqa: N818
             f"turn exceeded hard deadline of {deadline_s:g}s"
         )
         self.deadline_s = deadline_s
+
+
+def _clean_cancel_detail(value: str | None, default: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    safe = "".join(
+        ch if ch.isalnum() or ch in {"_", "-", ".", ":"} else "_"
+        for ch in text
+    )
+    return (safe.strip("_") or default)[:80]
 
 
 class TaskRuntime:
@@ -374,7 +387,11 @@ class TaskRuntime:
             if collected is not None:
                 return collected
         if queue_mode == "interrupt":
-            await self.cancel(session_key=envelope.session_key)
+            await self.cancel(
+                session_key=envelope.session_key,
+                source="queue_interrupt",
+                reason="queue_mode_interrupt",
+            )
         elif self._max_pending_per_session is not None:
             effective_policy = self._pending_overflow_policy
             if overflow_policy is not None:
@@ -475,6 +492,9 @@ class TaskRuntime:
         self,
         task_id: str | None = None,
         session_key: str | None = None,
+        *,
+        source: str | None = None,
+        reason: str | None = None,
     ) -> int:
         if task_id is None and session_key is None:
             raise ValueError("task_id or session_key is required")
@@ -490,6 +510,8 @@ class TaskRuntime:
             ]
             for task in tasks:
                 task.cancel_requested = True
+                task.cancel_source = _clean_cancel_detail(source, "unknown")
+                task.cancel_reason = _clean_cancel_detail(reason, "cancelled")
                 if task.asyncio_task is not None and not task.asyncio_task.done():
                     task.asyncio_task.cancel()
         return len(tasks)
@@ -1305,14 +1327,26 @@ class TaskRuntime:
         existing = await self._storage.get_agent_task(task.task_id)
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        cancellation: dict[str, str] | None = None
+        if status == AgentTaskStatus.CANCELLED:
+            cancellation = {
+                "source": task.cancel_source
+                or ("overflow_drop" if task.overflow_dropped else "unknown"),
+                "reason": task.cancel_reason
+                or ("overflow_drop" if task.overflow_dropped else terminal_reason),
+            }
+            details["cancellation"] = cancellation
         if status == AgentTaskStatus.SUCCEEDED:
             details["turn_outcome"] = completed_outcome().to_dict()
         else:
-            details["turn_outcome"] = outcome_from_error(
+            turn_outcome = outcome_from_error(
                 code=terminal_reason if terminal_reason != "error" else error_class,
                 message=error_message,
                 error_class=error_class,
             ).to_dict()
+            if cancellation is not None:
+                turn_outcome["cancellation_source"] = cancellation["source"]
+            details["turn_outcome"] = turn_outcome
         if outcome is not None:
             details["subagent_group_outcome"] = outcome
             disclosure_required = task.envelope.input_provenance.get(

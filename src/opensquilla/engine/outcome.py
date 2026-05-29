@@ -37,7 +37,16 @@ _PARTIAL_CODES = frozenset(
         "tool_failure_loop_exhausted",
     }
 )
-_INTERRUPTED_CODES = frozenset({"cancelled", "interrupted", "timeout", "iteration_timeout"})
+_INTERRUPTED_CODES = frozenset(
+    {
+        "cancelled",
+        "cancelled_before_start",
+        "dropped_by_overflow",
+        "interrupted",
+        "timeout",
+        "iteration_timeout",
+    }
+)
 _BLOCKED_CODES = frozenset(
     {
         "human_decision_required",

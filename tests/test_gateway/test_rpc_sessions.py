@@ -1143,6 +1143,42 @@ class TestSessionsAbort:
         assert res.ok is True
 
     @pytest.mark.asyncio
+    async def test_abort_passes_cancel_source_to_runtime(self, dispatcher, session):
+        class Runtime:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def cancel(
+                self,
+                session_key: str | None = None,
+                source: str | None = None,
+                reason: str | None = None,
+            ) -> int:
+                self.calls.append(
+                    {"session_key": session_key, "source": source, "reason": reason}
+                )
+                return 1
+
+        runtime = Runtime()
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.abort",
+            {"key": session.session_key, "source": "webui_escape"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert runtime.calls == [
+            {
+                "session_key": session.session_key,
+                "source": "webui_escape",
+                "reason": "user_abort",
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_abort_no_manager(self, dispatcher, ctx_no_manager):
         res = await dispatcher.dispatch("r1", "sessions.abort", {"key": "any"}, ctx_no_manager)
         assert res.ok is True  # no-op

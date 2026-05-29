@@ -70,6 +70,37 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     )
 
 
+def _clean_cancel_source(value: Any, default: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    safe = "".join(
+        ch if ch.isalnum() or ch in {"_", "-", ".", ":"} else "_"
+        for ch in text
+    )
+    return (safe.strip("_") or default)[:80]
+
+
+def _cancel_source_from_params(params: dict | None, default: str) -> str:
+    return _clean_cancel_source((params or {}).get("source"), default)
+
+
+async def _cancel_task_runtime(
+    task_runtime: Any,
+    *,
+    session_key: str,
+    source: str,
+    reason: str,
+) -> int:
+    cancel = getattr(task_runtime, "cancel")
+    kwargs: dict[str, Any] = {"session_key": session_key}
+    if _accepts_keyword_arg(cancel, "source"):
+        kwargs["source"] = source
+    if _accepts_keyword_arg(cancel, "reason"):
+        kwargs["reason"] = reason
+    return int(await cancel(**kwargs))
+
+
 async def _durable_receipt_allows_covered_destructive_compaction(
     storage: Any,
     session_key: str,
@@ -170,7 +201,12 @@ async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> 
         except Exception:
             log.warning("sessions.reset.task_runtime_settle_failed", session_key=session_key)
 
-    await task_runtime.cancel(session_key=session_key)
+    await _cancel_task_runtime(
+        task_runtime,
+        session_key=session_key,
+        source="sessions_reset",
+        reason="session_reset",
+    )
 
     if not has_runtime_listing:
         return
@@ -1282,7 +1318,12 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
 
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
-        cancelled_count = await task_runtime.cancel(session_key=key)
+        cancelled_count = await _cancel_task_runtime(
+            task_runtime,
+            session_key=key,
+            source=_cancel_source_from_params(params, "sessions_abort"),
+            reason="user_abort",
+        )
         return {"aborted": cancelled_count > 0, "key": key}
 
     # Cancel running agent task via registry

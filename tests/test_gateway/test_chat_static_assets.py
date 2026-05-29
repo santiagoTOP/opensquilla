@@ -330,7 +330,7 @@ def test_chat_attachment_hard_cap_is_category_specific() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 8 — ESC has a document-level handler so abort works regardless of focus.
+# Test 8 — ESC has a document-level handler with overlay/editable guards.
 # ---------------------------------------------------------------------------
 
 def test_chat_js_has_document_level_escape_handler() -> None:
@@ -348,6 +348,29 @@ def test_chat_js_has_document_level_escape_handler() -> None:
     # also abort the streaming turn behind it.
     assert "if (e.defaultPrevented) return;" in source
     assert "if (_chatOverlayVisible()) return;" in source
+
+
+def test_chat_escape_does_not_abort_from_editable_target() -> None:
+    source = _read_chat_js()
+    handler_start = source.index("function _onDocKeydown(e) {")
+    handler_end = source.index("document.addEventListener('keydown', _onDocKeydown)", handler_start)
+    handler = source[handler_start:handler_end]
+
+    editable_idx = handler.index("const inEditable = target && (")
+    streaming_idx = handler.index("if (_isStreaming) {")
+    assert editable_idx < streaming_idx
+    assert "if (inEditable) return;" in handler
+    assert "_onStop('webui_escape')" in handler
+
+
+def test_chat_stop_sends_abort_source() -> None:
+    source = _read_chat_js()
+    stop_start = source.index("function _onStop(")
+    stop_end = source.index("// Delegated click handler", stop_start)
+    stop_body = source[stop_start:stop_end]
+
+    assert "function _onStop(source = 'webui_stop_button')" in stop_body
+    assert "_rpc.call('chat.abort', { sessionKey: _sessionKey, source })" in stop_body
     assert "function _chatOverlayVisible" in source
 
 
