@@ -54,6 +54,7 @@ from opensquilla.engine.hooks import (
 from opensquilla.engine.outcome import outcome_from_error, turn_outcome_details
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import PriceEntry, lookup_price
+from opensquilla.engine.router_decision import build_router_decision_event
 from opensquilla.engine.turn_policy import resolve_turn_policy
 from opensquilla.engine.turn_runner import (
     AgentBootstrapStage,
@@ -2005,6 +2006,9 @@ class TurnRunner:
                 tool_context.router_control_turn_hold_applied = bool(
                     turn.metadata.get("router_control_hold_applied")
                 )
+            router_event = build_router_decision_event(turn)
+            if router_event is not None:
+                yield router_event
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,

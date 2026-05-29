@@ -1516,6 +1516,45 @@ class Agent:
             terminates_turn=result.terminates_turn,
         )
 
+    async def _canonicalize_tool_result(
+        self,
+        result: ToolResult,
+        *,
+        tool_call: ToolCall | None = None,
+    ) -> ToolResult:
+        return await self._project_tool_result_for_llm(result, tool_call=tool_call)
+
+    def _record_provider_tool_result_projection(
+        self,
+        result: ToolResult,
+        projected_result: ToolResult,
+    ) -> None:
+        if projected_result.content != result.content:
+            self._provider_tool_result_overrides[result.tool_use_id] = ContentBlockToolResult(
+                tool_use_id=projected_result.tool_use_id,
+                content=projected_result.content,
+                is_error=projected_result.is_error,
+                execution_status=projected_result.execution_status,
+            )
+            return
+        self._provider_tool_result_overrides.pop(result.tool_use_id, None)
+
+    async def _project_tool_result_for_delivery(
+        self,
+        result: ToolResult,
+        *,
+        tool_call: ToolCall | None = None,
+    ) -> ToolResult:
+        if _pending_approval_payload(result.content) is not None:
+            self._provider_tool_result_overrides.pop(result.tool_use_id, None)
+            return result
+        projected_result = await self._project_tool_result_for_llm(
+            result,
+            tool_call=tool_call,
+        )
+        self._record_provider_tool_result_projection(result, projected_result)
+        return projected_result
+
     def _tool_result_compression_mode(self) -> str:
         mode = self.config.tool_result_compression_mode
         if mode in {"off", "truncate", "summarize"}:
@@ -3355,13 +3394,17 @@ class Agent:
                     result_tool_call = tc
                     for artifact in result.artifacts:
                         yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                    projected_result = await self._project_tool_result_for_delivery(
+                        result,
+                        tool_call=result_tool_call,
+                    )
                     yield ToolResultEvent(
-                        tool_use_id=result.tool_use_id,
-                        tool_name=result.tool_name,
-                        result=result.content,
-                        is_error=result.is_error,
+                        tool_use_id=projected_result.tool_use_id,
+                        tool_name=projected_result.tool_name,
+                        result=projected_result.content,
+                        is_error=projected_result.is_error,
                         arguments=tc.arguments,
-                        execution_status=result.execution_status,
+                        execution_status=projected_result.execution_status,
                     )
                     replay_event = router_control_replay_event_from_payload(result.content)
                     if replay_event is not None:
@@ -3385,41 +3428,32 @@ class Agent:
                         result_tool_call = retry_call
                         for artifact in result.artifacts:
                             yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                        projected_result = await self._project_tool_result_for_delivery(
+                            result,
+                            tool_call=result_tool_call,
+                        )
                         yield ToolResultEvent(
-                            tool_use_id=result.tool_use_id,
-                            tool_name=result.tool_name,
-                            result=result.content,
-                            is_error=result.is_error,
+                            tool_use_id=projected_result.tool_use_id,
+                            tool_name=projected_result.tool_name,
+                            result=projected_result.content,
+                            is_error=projected_result.is_error,
                             arguments=retry_arguments,
-                            execution_status=result.execution_status,
+                            execution_status=projected_result.execution_status,
                         )
                         replay_event = router_control_replay_event_from_payload(result.content)
                         if replay_event is not None:
                             yield replay_event
                     executed_results.append(result)
-                    projected_result = await self._project_tool_result_for_llm(
-                        result,
-                        tool_call=result_tool_call,
-                    )
-                    if projected_result.content != result.content:
-                        self._provider_tool_result_overrides[result.tool_use_id] = (
-                            ContentBlockToolResult(
-                                tool_use_id=projected_result.tool_use_id,
-                                content=projected_result.content,
-                                is_error=projected_result.is_error,
-                                execution_status=projected_result.execution_status,
-                            )
-                        )
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
                     if self._is_turn_yield_result(result) or result.terminates_turn:
                         turn_yielded = True
                     tool_result_blocks.append(
                         ContentBlockToolResult(
-                            tool_use_id=result.tool_use_id,
-                            content=result.content,
-                            is_error=result.is_error,
-                            execution_status=result.execution_status,
+                            tool_use_id=projected_result.tool_use_id,
+                            content=projected_result.content,
+                            is_error=projected_result.is_error,
+                            execution_status=projected_result.execution_status,
                         )
                     )
 

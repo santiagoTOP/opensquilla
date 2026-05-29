@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -375,6 +376,56 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
     assert projected_event.result == second_call_tool_result
     assert projected_event.result != output
     assert "rootdir:" not in projected_event.result
+
+
+@pytest.mark.asyncio
+async def test_approval_retry_clears_stale_tool_result_projection() -> None:
+    approval_payload = json.dumps(
+        {
+            "status": "approval_required",
+            "approval_id": "approval-1",
+            "message": "Approve this command.",
+            "lines": [str(index) for index in range(80)],
+        },
+        indent=2,
+    )
+    calls = 0
+
+    async def handler(tool_call: ToolCall) -> ToolResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ToolResult(
+                tool_use_id=tool_call.tool_use_id,
+                tool_name=tool_call.tool_name,
+                content=approval_payload,
+            )
+        assert tool_call.arguments["approval_id"] == "approval-1"
+        return ToolResult(
+            tool_use_id=tool_call.tool_use_id,
+            tool_name=tool_call.tool_name,
+            content="FINAL_OK",
+        )
+
+    provider = _ToolCallingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(context_window_tokens=1_000_000, max_iterations=2),
+        tool_definitions=[_tool_def("exec_command")],
+        tool_handler=handler,
+    )
+
+    events = [event async for event in agent.run_turn("run risky command")]
+
+    assert calls == 2
+    assert len(provider.calls) == 2
+    second_call_tool_result = provider.calls[1][-1].content[0].content
+    assert second_call_tool_result == "FINAL_OK"
+    tool_result_events = [event for event in events if isinstance(event, ToolResultEvent)]
+    approval_event_payload = json.loads(tool_result_events[0].result)
+    assert approval_event_payload["status"] == "approval_required"
+    assert approval_event_payload["approval_id"] == "approval-1"
+    assert tool_result_events[-1].result == "FINAL_OK"
 
 
 def test_python_backend_reduces_docker_build_output() -> None:

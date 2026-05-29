@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 from collections.abc import Mapping
 from dataclasses import replace
@@ -100,7 +101,13 @@ class ToolRegistry:
 
     @staticmethod
     def _parameters_for(rt: RegisteredTool, ctx: ToolContext) -> dict[str, Any]:
-        parameters = {key: dict(value) for key, value in rt.spec.parameters.items()}
+        raw_parameters = rt.spec.parameters
+        if (
+            raw_parameters.get("type") == "object"
+            and isinstance(raw_parameters.get("properties"), Mapping)
+        ):
+            raw_parameters = raw_parameters["properties"]
+        parameters = copy.deepcopy(raw_parameters)
         if rt.spec.name != "router_control":
             return parameters
         router_cfg = getattr(ctx, "router_control_config", None)

@@ -37,6 +37,7 @@ def test_agent_factory_adapter_passes_runner_tool_registry(monkeypatch) -> None:
         session_key="agent:main:test",
         turn_call_logger=None,
         memory_sync_manager=None,
+        tool_context=None,
     )
 
     assert captured["tool_registry"] is registry
