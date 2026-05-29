@@ -13,6 +13,7 @@ from starlette.responses import HTMLResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from opensquilla import __version__
 from opensquilla.gateway.config import GatewayConfig
 
 # Conservative max-age for static assets. 30 days is long enough that hot
@@ -72,7 +73,7 @@ def _request_ws_url(request: Request, config: GatewayConfig) -> str:
 def _build_bootstrap_context(config: GatewayConfig, request: Request) -> dict:
     """Build the template context for bootstrap config injection."""
     return {
-        "version": f"{config.version}+{_TEMPLATE_VERSION_SUFFIX}",
+        "version": f"{__version__}+{_TEMPLATE_VERSION_SUFFIX}",
         "ws_url": _request_ws_url(request, config),
         "auth_mode": config.auth.mode,
         "base_path": config.control_ui.base_path,

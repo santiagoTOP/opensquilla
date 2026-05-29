@@ -21,6 +21,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from opensquilla import __version__
 from opensquilla.gateway.config_migration import (
     backup_and_write_migrated_config,
     migrate_config_payload,
@@ -1418,7 +1419,10 @@ class GatewayConfig(BaseSettings):
     # > default) is testable without the pydantic-settings env cache.
     host: str = "127.0.0.1"
     port: int = 18791
-    version: str = "0.1.0"
+    # Resolved from installed distribution metadata (opensquilla.__version__),
+    # not operator config. UI/RPC surfaces read __version__ directly, so any
+    # stale value persisted in config.toml has no display effect.
+    version: str = __version__
     debug: bool = False
     log_file_enabled: bool = True
     log_level: str = "DEBUG"
