@@ -258,7 +258,8 @@ def test_setup_finish_summarizes_provider_proxy_only_when_present():
     body = txt[start:end]
 
     assert (
-        "const providerProxy = hasSavedProvider ? ((_config.llm || {}).proxy || '').trim() : ''"
+        "const providerProxy = configuredProvider "
+        "? ((_config.llm || {}).proxy || '').trim() : ''"
     ) in body
     assert "providerProxy ?" in body
     assert "<span>Proxy</span>" in body
@@ -340,7 +341,7 @@ def test_setup_provider_step_is_neutral_before_provider_choice():
     save_end = txt.index("  async function _saveRouter()", save_start)
     save_body = txt[save_start:save_end]
 
-    assert "const selected = hasSavedProvider ? current.provider : ''" in body
+    assert "const selected = _effectiveProvider();" in body
     assert "Choose from ${providers.length} supported providers" in body
     assert (
         '<option value="" disabled${selected ? \'\' : \' selected\'}>'
@@ -758,12 +759,7 @@ def test_setup_stepper_names_router_provider_prerequisite():
     start = txt.index("function _stepStatus")
     body = txt[start : txt.index("  function _aggregateStepStatus", start)]
 
-    assert "const currentProvider = (_config.llm || {}).provider || ''" in body
-    assert (
-        "const hasSavedProvider = Boolean(currentProvider) "
-        "&& _status.hasConfig !== false"
-    ) in body
-    assert "if (stepId === 'router' && !hasSavedProvider)" in body
+    assert "if (stepId === 'router' && !_effectiveProvider())" in body
     assert "Provider first" in body
 
 
@@ -786,14 +782,9 @@ def test_setup_provider_first_run_summary_does_not_headline_default_provider():
     end = txt.index("  function _providerConfigFor", start)
     body = txt[start:end]
 
+    assert "const selected = _effectiveProvider();" in body
     assert (
-        "const hasSavedProvider = (\n"
-        "      Boolean(current.provider)\n"
-        "      && _status.hasConfig !== false\n"
-        "    )"
-    ) in body
-    assert (
-        "const providerSummary = hasSavedProvider\n"
+        "const providerSummary = selected\n"
         "      ? (spec.label || selected)\n"
         "      : `Choose from ${providers.length} supported providers`"
     ) in body
@@ -846,29 +837,42 @@ def test_setup_provider_switch_summary_uses_provider_label():
     assert "summary.textContent = spec.label || providerId || 'not configured';" in body
 
 
-def test_setup_router_step_stays_neutral_before_provider_is_configured():
+def test_setup_router_step_uses_effective_provider_without_hardcoded_fallback():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     start = txt.index("function _renderRouterStep()")
     end = txt.index("  function _tierRow", start)
     body = txt[start:end]
 
-    assert "const currentProvider = (_config.llm || {}).provider || ''" in body
-    assert (
-        "const hasSavedProvider = Boolean(currentProvider) && _status.hasConfig !== false"
-    ) in body
-    assert "const provider = hasSavedProvider ? currentProvider : ''" in body
+    assert "const provider = _effectiveProvider();" in body
+    assert "const canSaveRouter = provider && provider === _configuredProvider();" in body
     assert "const routerSummary = provider" in body
     assert "'Choose a provider first'" in body
     assert "profiles.find(p => p.profileId === 'openrouter')" not in body
     assert "const tiers = provider ?" in body
     assert "data-router-provider-needed" in body
-    assert "data-save-router${provider ? '' : ' disabled'}" in body
+    assert "data-router-provider-unsaved" in body
+    assert "data-save-router${saveDisabled}" in body
 
     save_start = txt.index("async function _saveRouter()")
     save_end = txt.index("  async function _saveChannel()", save_start)
     save_body = txt[save_start:save_end]
-    assert "Boolean(currentProvider) && _status.hasConfig !== false" in save_body
+    assert "const provider = _effectiveProvider();" in save_body
+    assert "const configuredProvider = _configuredProvider();" in save_body
     assert "Choose a provider before saving router tiers." in save_body
+    assert "Save the provider before saving router tiers." in save_body
+
+
+def test_setup_effective_provider_accepts_runtime_config_but_not_bare_defaults():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    start = txt.index("function _configuredProvider()")
+    end = txt.index("  function _renderProviderFields", start)
+    body = txt[start:end]
+
+    assert "if (_status.hasConfig !== false) return provider;" in body
+    assert "if (_status.llmConfigured === true) return provider;" in body
+    assert "['explicit', 'env', 'not_required'].includes(_status.llmSource)" in body
+    assert "providerDraft['provider:selected']" in body
+    assert "return (includeDraft ? _draftProvider() : '') || _configuredProvider();" in body
 
 
 def test_setup_view_exposes_search_in_capability_center():
@@ -1121,18 +1125,15 @@ def test_setup_finish_summary_stays_neutral_before_provider_is_configured():
     end = txt.index("  function _renderCliCommand", start)
     body = txt[start:end]
 
-    assert "const currentProvider = (_config.llm || {}).provider || ''" in body
+    assert "const configuredProvider = _configuredProvider();" in body
+    assert "const providerSummary = configuredProvider || 'not configured'" in body
     assert (
-        "const hasSavedProvider = Boolean(currentProvider) && _status.hasConfig !== false"
-    ) in body
-    assert "const providerSummary = hasSavedProvider ? currentProvider : 'not configured'" in body
-    assert (
-        "const modelSummary = hasSavedProvider"
+        "const modelSummary = configuredProvider"
         "\n      ? ((_config.llm || {}).model || 'SquillaRouter defaults')"
         "\n      : 'not configured'"
     ) in body
     assert (
-        "const routerSummary = hasSavedProvider"
+        "const routerSummary = configuredProvider"
         "\n      ? (router.enabled === false ? 'disabled' : 'SquillaRouter')"
         "\n      : 'choose a provider first'"
     ) in body

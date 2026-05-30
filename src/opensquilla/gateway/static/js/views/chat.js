@@ -1175,7 +1175,7 @@ const ChatView = (() => {
         <div class="chat-composer" id="chat-composer">
           <div class="chat-attachments hidden" id="chat-attach-preview"></div>
           <div class="chat-input-bar">
-            <button class="btn btn--icon btn--ghost" id="chat-btn-attach" title="Attach files: PNG, JPEG, GIF, WEBP, PDF, TXT, MD, HTML, CSV, JSON">${icons.paperclip()}</button>
+            <button class="btn btn--icon btn--ghost" id="chat-btn-attach" title="Attach files: PNG, JPEG, GIF, WEBP, PDF, TXT, MD, HTML, CSV, JSON" aria-label="Attach files">${icons.paperclip()}</button>
             <div class="chat-toolbar-wrap">
               <button type="button" class="btn btn--icon btn--ghost chat-toolbar-trigger" id="chat-toolbar-trigger"
                       title="Run modes — execution, router"
@@ -1226,9 +1226,9 @@ const ChatView = (() => {
                         aria-label="Message to send"></textarea>
             </div>
             <button class="btn btn--icon btn--ghost" id="chat-btn-new" title="New chat session in the current agent" aria-label="New chat session in the current agent">${icons.plus()}</button>
-            <button class="btn btn--icon btn--ghost" id="chat-btn-export" title="Export as Markdown">${icons.download()}</button>
-            <button class="btn btn--icon btn--primary" id="chat-btn-send" title="Send (queues while streaming)">${icons.send()}</button>
-            <button class="btn btn--icon btn--danger hidden" id="chat-btn-stop" title="Stop current response (Esc)">${icons.stop()}</button>
+            <button class="btn btn--icon btn--ghost" id="chat-btn-export" title="Export as Markdown" aria-label="Export as Markdown">${icons.download()}</button>
+            <button class="btn btn--icon btn--primary" id="chat-btn-send" title="Send (queues while streaming)" aria-label="Send message">${icons.send()}</button>
+            <button class="btn btn--icon btn--danger hidden" id="chat-btn-stop" title="Stop current response (Esc)" aria-label="Stop current response">${icons.stop()}</button>
           </div>
         </div>
         <input type="file" id="chat-file-input" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/html,text/csv,application/json,.md,.markdown" multiple class="hidden" />
@@ -1296,7 +1296,7 @@ const ChatView = (() => {
 
   function _bindToolbarPills() {
     if (_elevatedPill) {
-      _elevatedPill.addEventListener('click', () => {
+      _elevatedPill.addEventListener('click', async () => {
         if (_elevatedUnavailable) {
           UI.toast(
             'Bypass requires a local owner session (loopback only).',
@@ -1309,9 +1309,12 @@ const ChatView = (() => {
           _setElevatedMode('', { toast: true, sync: true });
           return;
         }
-        const ok = window.confirm(
-          'Enable approval bypass for this browser session? This maps to /elevated bypass: host execution without approval prompts, while sensitive-path checks remain active.'
-        );
+        const ok = await UI.confirm({
+          title: 'Enable approval bypass?',
+          message: '<p>This allows host execution without approval prompts in this browser session. This maps to /elevated bypass.</p><p>Sensitive-path checks remain active.</p>',
+          confirmLabel: 'Enable bypass',
+          danger: true,
+        });
         if (ok) _setElevatedMode('bypass', { toast: true, sync: true });
       });
     }
@@ -1887,6 +1890,7 @@ const ChatView = (() => {
       search.type = 'search';
       search.className = 'chat-session-popover-search';
       search.placeholder = 'Search sessions…';
+      search.setAttribute('aria-label', 'Search sessions');
       search.autocomplete = 'off';
       search.spellcheck = false;
       pop.appendChild(search);
@@ -1899,8 +1903,13 @@ const ChatView = (() => {
       // Anchor below the chip via fixed positioning so the popover escapes
       // any `overflow:hidden` ancestor (the chip itself clips its key text).
       const rect = chip.getBoundingClientRect();
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 320;
+      const margin = 12;
+      const popWidth = Math.min(320, Math.max(240, viewportWidth - margin * 2));
+      const maxLeft = Math.max(margin, viewportWidth - popWidth - margin);
       pop.style.position = 'fixed';
-      pop.style.left = rect.left + 'px';
+      pop.style.width = popWidth + 'px';
+      pop.style.left = Math.min(Math.max(rect.left, margin), maxLeft) + 'px';
       pop.style.top = (rect.bottom + 4) + 'px';
       document.body.appendChild(pop);
       _popover = pop;
@@ -6467,7 +6476,7 @@ const ChatView = (() => {
     summary.appendChild(document.createTextNode(' ' + displayName));
     const statusSpan = document.createElement('span');
     statusSpan.className = 'chat-tools-status';
-    statusSpan.textContent = isRunning ? 'running' : 'ready';
+    _applyToolSummaryStatus(statusSpan, isRunning ? 'running' : '');
     summary.appendChild(statusSpan);
 
     const toolsBody = document.createElement('div');
@@ -6486,6 +6495,17 @@ const ChatView = (() => {
     return details;
   }
 
+  function _visibleToolSummaryStatus(status) {
+    return status === 'running' ? 'running' : '';
+  }
+
+  function _applyToolSummaryStatus(statusSpan, status) {
+    const visibleStatus = _visibleToolSummaryStatus(status || '');
+    statusSpan.dataset.status = status || '';
+    statusSpan.textContent = visibleStatus;
+    statusSpan.hidden = !visibleStatus;
+  }
+
   function _setToolSummaryStatus(details, status) {
     if (!details) return;
     const summary = details.querySelector('.chat-tools-summary');
@@ -6496,7 +6516,7 @@ const ChatView = (() => {
       statusSpan.className = 'chat-tools-status';
       summary.appendChild(statusSpan);
     }
-    statusSpan.textContent = status || '';
+    _applyToolSummaryStatus(statusSpan, status || '');
   }
 
   function _retitleToolCallDOM(details, name, input) {
@@ -6508,7 +6528,8 @@ const ChatView = (() => {
     if (!summary) return;
     const providerBadge = summary.querySelector('.chat-tool-provider');
     if (providerBadge) providerBadge.remove();
-    const statusText = summary.querySelector('.chat-tools-status')?.textContent || '';
+    const currentStatus = summary.querySelector('.chat-tools-status');
+    const statusText = currentStatus?.dataset?.status || currentStatus?.textContent || '';
     summary.textContent = '';
     const iconSpan = document.createElement('span');
     iconSpan.className = 'chat-tools-icon';
@@ -6517,7 +6538,7 @@ const ChatView = (() => {
     summary.appendChild(document.createTextNode(' ' + _toolDisplayName(name, input)));
     const statusSpan = document.createElement('span');
     statusSpan.className = 'chat-tools-status';
-    statusSpan.textContent = statusText;
+    _applyToolSummaryStatus(statusSpan, statusText);
     summary.appendChild(statusSpan);
     if (providerBadge) summary.appendChild(providerBadge);
   }
@@ -7569,7 +7590,7 @@ const ChatView = (() => {
       if (isImage && att.dataUrl) {
         html += `<div class="attachment-thumb">
           <img src="${att.dataUrl}" alt="${_esc(att.name)}">
-          <button class="attachment-remove" data-idx="${i}">&times;</button>
+          <button class="attachment-remove" data-idx="${i}" aria-label="Remove attachment ${_esc(att.name)}">&times;</button>
           <span class="attachment-name">${_esc(att.name)}</span>
         </div>`;
       } else {
@@ -7581,7 +7602,7 @@ const ChatView = (() => {
           <span class="attachment-chip__icon" aria-hidden="true">${isBusy ? '<span class="spinner attachment-chip__spinner"></span>' : 'file'}</span>
           <span class="attachment-chip__name">${_esc(att.name)}</span>
           <span class="attachment-chip__meta">${_esc(meta)}</span>
-          <button class="attachment-remove" data-idx="${i}" title="Remove">&times;</button>
+          <button class="attachment-remove" data-idx="${i}" title="Remove" aria-label="Remove attachment ${_esc(att.name)}">&times;</button>
         </div>`;
       }
     });

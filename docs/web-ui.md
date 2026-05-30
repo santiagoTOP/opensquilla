@@ -37,7 +37,7 @@ For gateway lifecycle, host/port, and exposure details, see
 | --- | --- |
 | Chat | Run and resume chat sessions, inspect tool activity, publish artifacts, and use manual compact controls. |
 | Overview / Health | See readiness, provider state, memory state, sandbox posture, and recovery hints. |
-| Channels | Add, edit, enable, disable, restart, and inspect channel adapters. |
+| Channels | Inspect configured channel adapter status and jump to guided setup for configuration changes. |
 | Skills | Browse available skills and meta-skill surfaces. |
 | Sessions | Inspect durable conversations and operational state. |
 | Agents | Manage durable agent entries. |

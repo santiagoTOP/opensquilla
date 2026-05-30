@@ -404,16 +404,6 @@ pre {
   outline-offset: 2px;
 }
 
-/* Topbar title — contextual page label */
-.topbar-title {
-  font-family: var(--font-sans);
-  font-size: var(--fs-md);
-  font-weight: 600;
-  color: var(--text);
-  margin: 0;
-  letter-spacing: 0;
-}
-
 @media (min-width: 769px) and (max-height: 640px) {
   .nav-brand {
     height: 44px;

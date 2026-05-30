@@ -174,7 +174,8 @@ const ChannelsView = (() => {
         <div class="ch-empty__actions">
           <button class="btn btn--primary" id="ch-guided-setup" type="button">${icons.config()}<span>Guided setup</span></button>
         </div>
-        <code class="ch-empty__code">opensquilla onboard configure channels · opensquilla channels list</code>
+        <code class="ch-empty__code">opensquilla onboard configure channels</code>
+        <code class="ch-empty__code">opensquilla channels list</code>
       </div>`;
       _el.querySelector('#ch-guided-setup')?.addEventListener('click', () => Router.navigate('/setup'));
       return;

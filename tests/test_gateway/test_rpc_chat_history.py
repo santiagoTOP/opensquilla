@@ -9,17 +9,31 @@ from opensquilla.session.models import TranscriptEntry
 
 
 class _FakeSessionManager:
-    def __init__(self, entries, *, canonical_entries=None, summaries=None):
+    def __init__(
+        self,
+        entries,
+        *,
+        canonical_entries=None,
+        summaries=None,
+        canonical_exception=None,
+        transcript_exception=None,
+    ):
         self._entries = entries
         self._canonical_entries = canonical_entries
         self._summaries = summaries or []
+        self._canonical_exception = canonical_exception
+        self._transcript_exception = transcript_exception
         self.used_canonical = False
 
     async def get_transcript(self, session_key):
+        if self._transcript_exception is not None:
+            raise self._transcript_exception
         return self._entries
 
     async def get_canonical_transcript(self, session_key):
         self.used_canonical = True
+        if self._canonical_exception is not None:
+            raise self._canonical_exception
         if self._canonical_entries is None:
             raise RuntimeError("canonical unavailable")
         return self._canonical_entries
@@ -123,6 +137,87 @@ async def test_chat_history_falls_back_when_canonical_unavailable() -> None:
     assert mgr.used_canonical is True
     assert [msg["text"] for msg in result["messages"]] == ["message 1"]
     assert result["canonical_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_history_falls_back_when_canonical_session_missing() -> None:
+    entries = [_entry(1)]
+    mgr = _FakeSessionManager(
+        entries,
+        canonical_exception=KeyError("Session not found: agent:main:webchat:test"),
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "limit": 10},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=mgr,
+        ),
+    )
+
+    assert mgr.used_canonical is True
+    assert [msg["text"] for msg in result["messages"]] == ["message 1"]
+    assert result["canonical_available"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_key",
+    [
+        "agent:main:webchat:new123",
+        "agent:ops:webchat:new123",
+    ],
+)
+async def test_chat_history_returns_empty_for_missing_webchat_session(
+    session_key: str,
+) -> None:
+    mgr = _FakeSessionManager(
+        [],
+        canonical_exception=KeyError(f"Session not found: {session_key}"),
+        transcript_exception=KeyError(f"Session not found: {session_key}"),
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": session_key, "limit": "2"},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=mgr,
+        ),
+    )
+
+    assert result == {
+        "messages": [],
+        "has_more": False,
+        "oldest_cursor": None,
+        "newest_cursor": None,
+        "history_scope": "complete",
+        "loaded_count": 0,
+        "page_size": 2,
+        "canonical_available": False,
+        "compaction_summaries": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_history_keeps_not_found_for_missing_non_webchat_session() -> None:
+    session_key = "agent:main:cli:new123"
+    mgr = _FakeSessionManager(
+        [],
+        canonical_exception=KeyError(f"Session not found: {session_key}"),
+        transcript_exception=KeyError(f"Session not found: {session_key}"),
+    )
+
+    with pytest.raises(KeyError):
+        await _handle_chat_history(
+            {"sessionKey": session_key},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=mgr,
+            ),
+        )
 
 
 @pytest.mark.asyncio

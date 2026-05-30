@@ -107,13 +107,11 @@ const SetupView = (() => {
   }
 
   function _stepStatus(stepId) {
-    const currentProvider = (_config.llm || {}).provider || '';
-    const hasSavedProvider = Boolean(currentProvider) && _status.hasConfig !== false;
     if (stepId === 'provider') {
       if (_providerEnvMissing()) return { label: 'Needs action', tone: 'is-warn' };
       return _detailStepStatus((_status.sectionDetails || {}).llm || (_status.sectionDetails || {}).provider);
     }
-    if (stepId === 'router' && !hasSavedProvider) {
+    if (stepId === 'router' && !_effectiveProvider()) {
       return { label: 'Provider first', tone: 'is-muted' };
     }
     if (stepId === 'router') return _detailStepStatus((_status.sectionDetails || {}).router);
@@ -287,14 +285,9 @@ const SetupView = (() => {
 
   function _renderProviderStep() {
     const providers = (_catalog.providers || []).filter(p => p.runtimeSupported);
-    const current = (_config.llm || {});
-    const hasSavedProvider = (
-      Boolean(current.provider)
-      && _status.hasConfig !== false
-    );
-    const selected = hasSavedProvider ? current.provider : '';
+    const selected = _effectiveProvider();
     const spec = selected ? providers.find(p => p.providerId === selected) || {} : {};
-    const providerSummary = hasSavedProvider
+    const providerSummary = selected
       ? (spec.label || selected)
       : `Choose from ${providers.length} supported providers`;
     const values = selected ? _providerConfigFor(selected) : {};
@@ -349,6 +342,26 @@ const SetupView = (() => {
   function _providerConfigFor(providerId) {
     const current = _config.llm || {};
     return current.provider === providerId ? current : {};
+  }
+
+  function _configuredProvider() {
+    const provider = String((_config.llm || {}).provider || '').trim();
+    if (!provider) return '';
+    if (_status.hasConfig !== false) return provider;
+    if (_status.llmConfigured === true) return provider;
+    if (['explicit', 'env', 'not_required'].includes(_status.llmSource)) return provider;
+    return '';
+  }
+
+  function _draftProvider() {
+    const live = _el?.querySelector('[data-provider-select]')?.value || '';
+    if (live) return live;
+    const providerDraft = _drafts.get('provider') || {};
+    return providerDraft['provider:selected'] || '';
+  }
+
+  function _effectiveProvider({ includeDraft = true } = {}) {
+    return (includeDraft ? _draftProvider() : '') || _configuredProvider();
   }
 
   function _isProviderAdvancedField(field, spec) {
@@ -461,9 +474,8 @@ const SetupView = (() => {
 
   function _renderRouterStep() {
     const router = (_config.squilla_router || {});
-    const currentProvider = (_config.llm || {}).provider || '';
-    const hasSavedProvider = Boolean(currentProvider) && _status.hasConfig !== false;
-    const provider = hasSavedProvider ? currentProvider : '';
+    const provider = _effectiveProvider();
+    const canSaveRouter = provider && provider === _configuredProvider();
     const catalog = _catalog.routerProfiles || {};
     const profiles = catalog.profiles || [];
     const profile = provider ? profiles.find(p => p.providerId === provider) || {} : {};
@@ -474,6 +486,7 @@ const SetupView = (() => {
       ? `${provider} / ${_tierLabel(defaultTier)}`
       : 'Choose a provider first';
     const routerDisabled = provider ? '' : ' disabled';
+    const saveDisabled = canSaveRouter ? '' : ' disabled';
     return `
       <section class="setup-panel">
         <header class="setup-panel__head">
@@ -499,9 +512,10 @@ const SetupView = (() => {
           </div>
           ${Object.entries(tiers).filter(([name]) => TEXT_TIERS.includes(name) || name === 'image_model').map(([name, tier]) => _tierRow(name, tier)).join('')}
         </div>` : `<div class="setup-warning" data-router-provider-needed>Choose a provider first to preview and save SquillaRouter tiers.</div>`}
+        ${provider && !canSaveRouter ? `<div class="setup-warning" data-router-provider-unsaved>Save the provider before saving router tiers.</div>` : ''}
         <div class="setup-actions">
           <button class="setup-btn" data-prev="provider">Back</button>
-          <button class="setup-btn setup-btn--primary" data-save-router${provider ? '' : ' disabled'}>Save Router</button>
+          <button class="setup-btn setup-btn--primary" data-save-router${saveDisabled}>Save Router</button>
           <button class="setup-btn" data-next="channels">Next</button>
         </div>
       </section>`;
@@ -847,16 +861,15 @@ const SetupView = (() => {
 
   function _renderFinishStep() {
     const router = (_config.squilla_router || {});
-    const currentProvider = (_config.llm || {}).provider || '';
-    const hasSavedProvider = Boolean(currentProvider) && _status.hasConfig !== false;
-    const providerSummary = hasSavedProvider ? currentProvider : 'not configured';
-    const modelSummary = hasSavedProvider
+    const configuredProvider = _configuredProvider();
+    const providerSummary = configuredProvider || 'not configured';
+    const modelSummary = configuredProvider
       ? ((_config.llm || {}).model || 'SquillaRouter defaults')
       : 'not configured';
-    const routerSummary = hasSavedProvider
+    const routerSummary = configuredProvider
       ? (router.enabled === false ? 'disabled' : 'SquillaRouter')
       : 'choose a provider first';
-    const providerProxy = hasSavedProvider ? ((_config.llm || {}).proxy || '').trim() : '';
+    const providerProxy = configuredProvider ? ((_config.llm || {}).proxy || '').trim() : '';
     const configArg = _configCliArg(_status.configPath);
     const envRecoveryCommands = Array.isArray(_status.envRecoveryCommands)
       ? _status.envRecoveryCommands
@@ -1432,9 +1445,14 @@ const SetupView = (() => {
   }
 
   async function _saveRouter() {
-    const currentProvider = (_config.llm || {}).provider || '';
-    if (!(Boolean(currentProvider) && _status.hasConfig !== false)) {
+    const provider = _effectiveProvider();
+    const configuredProvider = _configuredProvider();
+    if (!provider) {
       UI.toast('Choose a provider before saving router tiers.', 'err');
+      return;
+    }
+    if (provider !== configuredProvider) {
+      UI.toast('Save the provider before saving router tiers.', 'err');
       return;
     }
     const tiers = {};

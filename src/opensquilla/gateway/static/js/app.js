@@ -28,19 +28,19 @@ const App = (() => {
     _bindSidebarToggle();
     _bindConnectionState();
 
-    Router.register('/overview', (el) => OverviewView.render(el), () => OverviewView.destroy());
-    Router.register('/health', (el) => HealthView.render(el), () => HealthView.destroy());
-    Router.register('/chat', (el) => ChatView.render(el), () => ChatView.destroy());
-    Router.register('/sessions', (el) => SessionsView.render(el), () => SessionsView.destroy());
-    Router.register('/agents', (el) => AgentsView.render(el), () => AgentsView.destroy());
-    Router.register('/cron', (el) => CronView.render(el), () => CronView.destroy());
-    Router.register('/usage', (el) => UsageView.render(el), () => UsageView.destroy());
-    Router.register('/config', (el) => ConfigView.render(el), () => ConfigView.destroy());
-    Router.register('/setup', (el) => SetupView.render(el), () => SetupView.destroy());
-    Router.register('/channels', (el) => ChannelsView.render(el), () => ChannelsView.destroy());
-    Router.register('/approvals', (el) => ApprovalsView.render(el), () => ApprovalsView.destroy());
-    Router.register('/skills', (el) => SkillsView.render(el), () => SkillsView.destroy());
-    Router.register('/logs', (el) => LogsView.render(el), () => LogsView.destroy());
+    Router.register('/overview', (el) => OverviewView.render(el), () => OverviewView.destroy(), { title: 'Overview' });
+    Router.register('/health', (el) => HealthView.render(el), () => HealthView.destroy(), { title: 'Health' });
+    Router.register('/chat', (el) => ChatView.render(el), () => ChatView.destroy(), { title: 'Chat' });
+    Router.register('/sessions', (el) => SessionsView.render(el), () => SessionsView.destroy(), { title: 'Sessions' });
+    Router.register('/agents', (el) => AgentsView.render(el), () => AgentsView.destroy(), { title: 'Agents' });
+    Router.register('/cron', (el) => CronView.render(el), () => CronView.destroy(), { title: 'Cron' });
+    Router.register('/usage', (el) => UsageView.render(el), () => UsageView.destroy(), { title: 'Usage' });
+    Router.register('/config', (el) => ConfigView.render(el), () => ConfigView.destroy(), { title: 'Config' });
+    Router.register('/setup', (el) => SetupView.render(el), () => SetupView.destroy(), { title: 'Setup' });
+    Router.register('/channels', (el) => ChannelsView.render(el), () => ChannelsView.destroy(), { title: 'Channels' });
+    Router.register('/approvals', (el) => ApprovalsView.render(el), () => ApprovalsView.destroy(), { title: 'Approvals' });
+    Router.register('/skills', (el) => SkillsView.render(el), () => SkillsView.destroy(), { title: 'Skills' });
+    Router.register('/logs', (el) => LogsView.render(el), () => LogsView.destroy(), { title: 'Logs' });
 
     Router.init(_basePath(), document.getElementById('content'));
 
@@ -82,15 +82,14 @@ const App = (() => {
         ${navFootHTML}
       </nav>
       <div class="main">
-        <header class="topbar">
+        <header class="topbar" aria-label="Global status">
           <div class="topbar-left">
-            <button class="btn btn--icon btn--ghost sidebar-toggle" id="sidebar-toggle" title="Toggle menu" aria-controls="sidebar-nav" aria-expanded="false">${icons.menu()}</button>
-            <h1 class="topbar-title" id="topbar-title">Chat</h1>
-            <span class="conn-pill err" id="conn-pill">Disconnected</span>
+            <button class="btn btn--icon btn--ghost sidebar-toggle" id="sidebar-toggle" title="Toggle menu" aria-label="Toggle menu" aria-controls="sidebar-nav" aria-expanded="false">${icons.menu()}</button>
+            <span class="conn-pill err" id="conn-pill" title="Disconnected" role="status" aria-live="polite">Disconnected</span>
           </div>
           <div class="topbar-right">
             <button class="approval-inline hidden" id="approval-inline" title="Open approvals">Approval required</button>
-            <button class="btn btn--icon btn--ghost" id="theme-toggle" title="Toggle theme">${icons.sun()}</button>
+            <button class="btn btn--icon btn--ghost" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme" aria-pressed="false">${icons.sun()}</button>
           </div>
         </header>
         <main class="content" id="content"></main>
@@ -171,7 +170,9 @@ const App = (() => {
       if (!pill) return;
       const variant = VARIANT[state] || 'err';
       pill.className = `conn-pill ${variant}${variant === 'ok' ? ' compact' : ''}`;
-      pill.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+      const label = state.charAt(0).toUpperCase() + state.slice(1);
+      pill.textContent = label;
+      pill.title = label;
     });
   }
 

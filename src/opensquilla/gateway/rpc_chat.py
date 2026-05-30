@@ -52,6 +52,31 @@ def _normalize_chat_history_limit(value: object) -> int:
     return max(1, min(limit, _CHAT_HISTORY_MAX_LIMIT))
 
 
+def _is_webchat_session_key(key: str) -> bool:
+    parts = str(key or "").split(":")
+    return (
+        len(parts) == 4
+        and parts[0] == "agent"
+        and bool(parts[1])
+        and parts[2] == "webchat"
+        and bool(parts[3])
+    )
+
+
+def _empty_chat_history_payload(limit: int) -> dict[str, Any]:
+    return {
+        "messages": [],
+        "has_more": False,
+        "oldest_cursor": None,
+        "newest_cursor": None,
+        "history_scope": "complete",
+        "loaded_count": 0,
+        "page_size": limit,
+        "canonical_available": False,
+        "compaction_summaries": [],
+    }
+
+
 def _chat_history_bool(value: object, *, default: bool) -> bool:
     if value is None:
         return default
@@ -410,11 +435,16 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
 
     mgr = _require_chat_session_manager(ctx)
 
-    transcript, canonical_available = await _chat_history_transcript(
-        mgr,
-        session_key,
-        include_canonical=include_canonical,
-    )
+    try:
+        transcript, canonical_available = await _chat_history_transcript(
+            mgr,
+            session_key,
+            include_canonical=include_canonical,
+        )
+    except KeyError:
+        if _is_webchat_session_key(session_key):
+            return _empty_chat_history_payload(limit)
+        raise
     page_entries, has_more = _chat_history_page(
         transcript,
         limit=limit,

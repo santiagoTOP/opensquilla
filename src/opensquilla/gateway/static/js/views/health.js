@@ -11,7 +11,7 @@ const HealthView = (() => {
         <header class="health-stage__header">
           <div class="health-stage__title-block">
             <span class="health-eyebrow">Control · Health</span>
-            <h2>OpenSquilla Health</h2>
+            <h2>Health</h2>
             <p id="health-summary">Checking readiness</p>
           </div>
           <button class="btn btn--ghost" id="health-refresh" title="Refresh health report">

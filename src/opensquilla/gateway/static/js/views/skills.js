@@ -75,9 +75,9 @@ const SkillsView = (() => {
 
         <section class="sk-stats" id="sk-stats"></section>
 
-        <div class="sk-tabs" role="tablist" aria-label="Skill source">
-          <button class="sk-tab is-active" data-tab="installed" role="tab">${icons.skills()}<span>Installed</span></button>
-          <button class="sk-tab" data-tab="registry" role="tab">${icons.download()}<span>Community</span></button>
+        <div class="sk-tabs" role="group" aria-label="Skill source">
+          <button class="sk-tab is-active" data-tab="installed" aria-pressed="true">${icons.skills()}<span>Installed</span></button>
+          <button class="sk-tab" data-tab="registry" aria-pressed="false">${icons.download()}<span>Community</span></button>
         </div>
 
         <div id="skills-tab-installed" class="sk-panel">
@@ -127,7 +127,11 @@ const SkillsView = (() => {
     _el.querySelectorAll('.sk-tab').forEach(btn => {
       btn.addEventListener('click', () => {
         _activeTab = btn.dataset.tab;
-        _el.querySelectorAll('.sk-tab').forEach(b => b.classList.toggle('is-active', b === btn));
+        _el.querySelectorAll('.sk-tab').forEach(b => {
+          const active = b === btn;
+          b.classList.toggle('is-active', active);
+          b.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
         _el.querySelectorAll('.sk-panel').forEach(p => { p.hidden = true; });
         const panel = _el.querySelector('#skills-tab-' + btn.dataset.tab);
         if (panel) panel.hidden = false;
@@ -287,14 +291,14 @@ const SkillsView = (() => {
     try {
       const out = await _rpc.call('exec.proposals.settings.set', { [key]: value });
       if (out && out.status === 'error') {
-        alert('Settings update failed: ' + (out.reason || 'unknown'));
+        UI.toast('Settings update failed: ' + (out.reason || 'unknown'), 'err');
         return;
       }
       _proposalsSettings = (out && out.settings) || _proposalsSettings;
       _renderStats();
       _renderCards();
     } catch (err) {
-      alert('Settings update failed: ' + err.message);
+      UI.toast('Settings update failed: ' + err.message, 'err');
     } finally {
       if (button) button.disabled = false;
     }
@@ -305,13 +309,13 @@ const SkillsView = (() => {
     try {
       const out = await _rpc.call('exec.proposals.settings.set', { auto_enable_max_risk: value });
       if (out && out.status === 'error') {
-        alert('Settings update failed: ' + (out.reason || 'unknown'));
+        UI.toast('Settings update failed: ' + (out.reason || 'unknown'), 'err');
         return;
       }
       _proposalsSettings = (out && out.settings) || _proposalsSettings;
       _renderCards();
     } catch (err) {
-      alert('Settings update failed: ' + err.message);
+      UI.toast('Settings update failed: ' + err.message, 'err');
     } finally {
       if (select) select.disabled = false;
     }
@@ -626,7 +630,7 @@ const SkillsView = (() => {
     try {
       const data = await _rpc.call('exec.proposals.show', { proposal_id: proposalId });
       if (data.status !== 'ok') {
-        alert('Show failed: ' + (data.reason || 'unknown'));
+        UI.toast('Show failed: ' + (data.reason || 'unknown'), 'err');
         return;
       }
       const dlg = _el.querySelector('#skill-detail-dialog');
@@ -656,7 +660,7 @@ const SkillsView = (() => {
       if (closeBtn) closeBtn.addEventListener('click', () => dlg.close());
       dlg.showModal();
     } catch (err) {
-      alert('Show failed: ' + err.message);
+      UI.toast('Show failed: ' + err.message, 'err');
     }
   }
 
@@ -664,48 +668,64 @@ const SkillsView = (() => {
     try {
       let data = await _rpc.call('exec.proposals.accept', { proposal_id: proposalId });
       if (data.status === 'refused' && data.reason && data.reason.indexOf('gates') !== -1) {
-        if (!confirm(
-          `Proposal ${proposalId} did not pass all gates.\n\n${data.reason}\n\nAccept anyway (force)?`
-        )) return;
+        const ok = await UI.confirm({
+          title: 'Force accept proposal?',
+          message: `<p>Proposal <strong>${_esc(proposalId)}</strong> did not pass all gates.</p><p>${_esc(data.reason)}</p><p>Accept anyway?</p>`,
+          confirmLabel: 'Force accept',
+          danger: true,
+        });
+        if (!ok) return;
         data = await _rpc.call('exec.proposals.accept', { proposal_id: proposalId, force: true });
       }
       if (data.status !== 'ok') {
-        alert('Accept failed: ' + (data.reason || data.status));
+        UI.toast('Accept failed: ' + (data.reason || data.status), 'err');
         return;
       }
       // Reload list + cards so the proposal disappears and the new
       // skill appears under MANAGED layer.
       await _loadData();
     } catch (err) {
-      alert('Accept failed: ' + err.message);
+      UI.toast('Accept failed: ' + err.message, 'err');
     }
   }
 
   async function _rejectProposal(proposalId) {
-    if (!confirm(`Reject and delete proposal ${proposalId}? This cannot be undone.`)) return;
+    const ok = await UI.confirm({
+      title: 'Reject proposal?',
+      message: `<p>Reject and delete proposal <strong>${_esc(proposalId)}</strong>?</p><p>This cannot be undone.</p>`,
+      confirmLabel: 'Reject proposal',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const data = await _rpc.call('exec.proposals.reject', { proposal_id: proposalId });
       if (data.status !== 'ok') {
-        alert('Reject failed: ' + (data.reason || data.status));
+        UI.toast('Reject failed: ' + (data.reason || data.status), 'err');
         return;
       }
       await _loadData();
     } catch (err) {
-      alert('Reject failed: ' + err.message);
+      UI.toast('Reject failed: ' + err.message, 'err');
     }
   }
 
   async function _disableAutoEnabled(name) {
-    if (!confirm(`Disable auto-enabled skill ${name} and move it back to pending proposals?`)) return;
+    const ok = await UI.confirm({
+      title: 'Disable auto-enabled skill?',
+      message: `<p>Disable <strong>${_esc(name)}</strong> and move it back to pending proposals?</p>`,
+      confirmLabel: 'Disable skill',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const data = await _rpc.call('exec.proposals.auto_enabled.disable', { name });
       if (data.status !== 'ok') {
-        alert('Disable failed: ' + (data.reason || data.status));
+        UI.toast('Disable failed: ' + (data.reason || data.status), 'err');
         return;
       }
       await _loadData();
     } catch (err) {
-      alert('Disable failed: ' + err.message);
+      UI.toast('Disable failed: ' + err.message, 'err');
     }
   }
 

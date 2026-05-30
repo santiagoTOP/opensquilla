@@ -206,8 +206,22 @@
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
-.sess-th-sort { cursor: pointer; user-select: none; }
+.sess-th-sort { user-select: none; }
 .sess-th-sort:hover { color: var(--text); }
+.sess-th-sort__btn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.sess-th-sort__btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .sess-table__arrow { color: var(--accent); font-size: 9px; margin-left: 4px; }
 
 .sess-table tbody td {

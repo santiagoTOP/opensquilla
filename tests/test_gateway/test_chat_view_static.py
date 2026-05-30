@@ -3,9 +3,22 @@ from pathlib import Path
 
 CHAT_JS = Path("src/opensquilla/gateway/static/js/views/chat.js")
 CHAT_CSS = Path("src/opensquilla/gateway/static/css/views/chat.css")
+APP_JS = Path("src/opensquilla/gateway/static/js/app.js")
 RPC_JS = Path("src/opensquilla/gateway/static/js/rpc.js")
 SAVINGS_FX_JS = Path("src/opensquilla/gateway/static/js/components/savings-fx.js")
 TASK_RUNTIME_PY = Path("src/opensquilla/gateway/task_runtime.py")
+
+
+def test_global_topbar_does_not_render_duplicate_chat_title() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    topbar_start = source.index('<header class="topbar"')
+    topbar_end = source.index('<main class="content"', topbar_start)
+    topbar_markup = source[topbar_start:topbar_end]
+
+    assert 'id="topbar-title"' not in topbar_markup
+    assert ">Chat</h1>" not in topbar_markup
+    assert 'id="conn-pill"' in topbar_markup
+    assert 'id="theme-toggle"' in topbar_markup
 
 
 def test_chat_history_passes_subagent_completion_provenance_to_renderer() -> None:
@@ -311,11 +324,19 @@ def test_chat_stream_seq_drops_only_seen_duplicates_not_late_unique_events() -> 
 
 def test_chat_new_session_uses_current_agent_namespace() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
+    click_start = source.index("newBtn.addEventListener('click', () => {")
+    click_end = source.index("    // Export", click_start)
+    click_body = source[click_start:click_end]
+    slash_start = source.index("      case 'new_chat':")
+    slash_end = source.index("      case 'reset_session':", slash_start)
+    slash_body = source[slash_start:slash_end]
 
     assert "function _agentIdFromSessionKey(key)" in source
     assert "return _webchatSessionKey(_agentIdFromSessionKey(_sessionKey)," in source
     assert 'title="New chat session in the current agent"' in source
     assert "New chat session in the current agent: " in source
+    assert "_loadHistory(" not in click_body
+    assert "_loadHistory(" not in slash_body
 
 
 def test_chat_slash_menu_loads_web_chat_catalog_from_rpc() -> None:
@@ -1633,11 +1654,13 @@ def test_generic_duplicate_stream_seq_is_classified_as_exact_handler_replay() ->
 def test_tool_summary_exposes_visible_running_status() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     assert "function _setToolSummaryStatus(details, status)" in source
+    assert "function _visibleToolSummaryStatus(status)" in source
+    assert "return status === 'running' ? 'running' : '';" in source
     build_start = source.index("function _buildToolCallDOM(")
     build_end = source.index("function _retitleToolCallDOM", build_start)
     build_body = source[build_start:build_end]
     assert "statusSpan.className = 'chat-tools-status';" in build_body
-    assert "statusSpan.textContent = isRunning ? 'running' : 'ready';" in build_body
+    assert "_applyToolSummaryStatus(statusSpan, isRunning ? 'running' : '');" in build_body
     result_start = source.index("function _appendToolResult(payload)")
     result_end = source.index(
         "  // \u2500\u2500 PR5: meta-skill user_input form rendering",
@@ -1645,6 +1668,7 @@ def test_tool_summary_exposes_visible_running_status() -> None:
     )
     result_body = source[result_start:result_end]
     assert "_setToolSummaryStatus(details, isError ? 'error' : 'done');" in result_body
+    assert "statusSpan.hidden = !visibleStatus;" in source
 
 
 def test_router_fx_settles_but_preserves_winner_animation_when_output_begins() -> None:
