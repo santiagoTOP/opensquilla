@@ -398,7 +398,7 @@ pre {
 /* Weight-split wordmark: "Open" recedes, "Squilla" (the species) anchors. */
 .nav-brand__wm {
   font-size: 1.14rem;
-  letter-spacing: -0.012em;
+  letter-spacing: 0;
   line-height: 1;
 }
 .nav-brand__pre {

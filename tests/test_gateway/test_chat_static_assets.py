@@ -478,7 +478,10 @@ def test_chat_js_has_history_navigation_and_alt_pending_shortcuts() -> None:
     enqueue_start = source.index("function _enqueueCurrentInput")
     enqueue_end = source.index("  function _updateStopButton", enqueue_start)
     enqueue_body = source[enqueue_start:enqueue_end]
-    assert "return _enqueuePendingInput(text);" in enqueue_body
+    assert (
+        "return _enqueuePendingInput(text, null, 'the current response', "
+        "normalized.attachments);"
+    ) in enqueue_body
     assert "_pendingQueue.push" not in enqueue_body
     assert "_inputHistoryIdx" in source
     assert "_inputHistoryDraft" in source

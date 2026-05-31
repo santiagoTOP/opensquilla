@@ -14,7 +14,7 @@ def test_health_view_is_registered_and_loaded() -> None:
     app = APP_JS.read_text(encoding="utf-8")
     index = INDEX_HTML.read_text(encoding="utf-8")
 
-    assert "HealthView.render" in app
+    assert "_renderStandardView(HealthView, el)" in app
     assert 'data-path="/health"' in app
     assert "views/health.js" in index
     assert "views/health.css" in index

@@ -560,7 +560,7 @@ def test_setup_view_is_loaded_and_registered_but_not_sidebar_primary():
     template = TEMPLATE.read_text(encoding="utf-8")
     app = APP.read_text(encoding="utf-8")
     assert "static/js/views/setup.js" in template
-    assert "SetupView.render" in app
+    assert "_renderStandardView(SetupView, el)" in app
     assert "Router.register('/setup'" in app
     assert 'data-path="/setup"' not in app
 
