@@ -10,9 +10,9 @@ triggers:
   - "组合现有 skill 成 meta-skill"
   - "create a meta-skill"
   - "new meta-skill"
-  - "propose a meta-skill"
-  - "create a meta-skill that orchestrates existing skills"
-  - "compose existing skills into a meta-skill"
+  - "orchestrates existing skills"
+  - "orchestrates search"
+  - "compose existing skills"
   - "synthesize meta-skill"
   - "compose meta-skill"
 provenance:
@@ -21,9 +21,12 @@ provenance:
 composition:
   steps:
     - id: clarify_intent
-      kind: agent
-      skill: sub-agent
+      kind: llm_chat
       with:
+        system: |
+          You are the intent gate for meta-skill-creator. Do not inspect
+          workspace files, history, memory, or external sources. Decide only
+          from the explicit user request and activation context.
         task: |
           Clarify whether the user wants a meta-skill, not a normal standalone
           skill. If the request is generic skill creation, return
@@ -134,7 +137,7 @@ composition:
       kind: skill_exec
       skill: history-explorer
       depends_on: [clarify_intent, creator_clarify]
-      when: "'route: meta-skill' in (outputs.clarify_intent | lower)"
+      when: "'route: meta-skill' in (outputs.clarify_intent | lower) and 'Unattended meta-skill auto-propose run' in inputs.get('system_prompt', '')"
       on_failure: harvest_empty
       with:
         query: |
@@ -189,11 +192,14 @@ composition:
         slots_json: "{{ outputs.fill_slots }}"
 
     - id: collision_check
-      kind: agent
-      skill: sub-agent
+      kind: llm_chat
       depends_on: [assemble]
       when: "'route: meta-skill' in (outputs.clarify_intent | lower)"
       with:
+        system: |
+          You are a trigger-collision reviewer for meta-skill-creator. Use only
+          the candidate SKILL.md provided in the task and the bundled creator
+          boundaries named there. Do not call tools or inspect the workspace.
         task: |
           Review this generated meta-skill proposal for trigger collisions with
           existing bundled skills. Flag generic triggers, overlaps with
@@ -213,11 +219,14 @@ composition:
         gates: "G1,G2"
 
     - id: risk_classify
-      kind: agent
-      skill: sub-agent
+      kind: llm_chat
       depends_on: [lint]
       when: "'route: meta-skill' in (outputs.clarify_intent | lower)"
       with:
+        system: |
+          You are an operational-risk classifier for generated meta-skills. Use
+          only the candidate SKILL.md and lint result in the task. Do not call
+          tools or inspect the workspace.
         task: |
           Classify operational risk for the generated meta-skill. Consider file
           writes, network access, GitHub/gh actions, shell commands, memory
@@ -344,17 +353,21 @@ composition:
       tool: meta_skill_runtime_e2e_run
       tool_args:
         skill_md: "{{ outputs.assemble }}"
-        eval_prompts: |
-          [
-            {{ inputs.user_message | xml_escape | tojson }}
-          ]
+        # Leave eval_prompts empty so the runtime gate derives an operational
+        # positive prompt from the candidate skill's own trigger. The outer
+        # creator request asks for a meta-skill proposal; using it here would
+        # incorrectly compare a candidate workflow run against proposal prose.
+        eval_prompts: ""
 
     - id: preview
-      kind: agent
-      skill: sub-agent
+      kind: llm_chat
       depends_on: [smoke, acceptance_compare, runtime_e2e]
       when: "'route: meta-skill' in (outputs.clarify_intent | lower)"
       with:
+        system: |
+          You are the final preview writer for meta-skill-creator. Produce only
+          a concise operator-facing proposal preview from the supplied step
+          outputs. Do not call tools, inspect files, or invent persistence IDs.
         task: |
           Produce a concise proposal preview for the user/operator before
           persistence. Include proposed name, triggers, DAG summary, collision

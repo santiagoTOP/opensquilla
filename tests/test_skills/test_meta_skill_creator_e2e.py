@@ -166,6 +166,7 @@ def test_creator_preserves_required_triggers_and_prior_step_context(monkeypatch)
     skill_md = proposer.meta_skill_assemble("p1_sequential", slots_json)
     assert "kind: skill_exec\n      skill: \"history-explorer\"" in skill_md
     assert "kind: skill_exec\n      skill: \"git-diff\"" in skill_md
+    assert "kind: llm_chat\n      skill: \"summarize\"" in skill_md
     assert "outputs.history_scan" in skill_md
     assert "outputs.diff_capture" in skill_md
 
@@ -184,6 +185,21 @@ def test_creator_dag_passes_raw_user_request_to_slot_filling(tmp_path) -> None:
     user_intent = str(fill_slots.tool_args["user_intent"])
     assert "inputs.user_message" in user_intent
     assert "outputs.clarify_intent" in user_intent
+
+
+def test_creator_runtime_e2e_uses_candidate_trigger_prompt(tmp_path) -> None:
+    """Runtime E2E should exercise the candidate skill, not the outer creator
+    request that produced it."""
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snap.json")
+    loader.invalidate_cache()
+    creator_spec = loader.get_by_name("meta-skill-creator")
+    assert creator_spec is not None
+    plan = parse_meta_plan(creator_spec)
+    assert plan is not None
+
+    runtime_e2e = {step.id: step for step in plan.steps}["runtime_e2e"]
+    assert runtime_e2e.tool_args["skill_md"] == "{{ outputs.assemble }}"
+    assert runtime_e2e.tool_args["eval_prompts"] == ""
 
 
 def test_manual_creator_persist_auto_enables_when_setting_is_on(tmp_path) -> None:
@@ -320,6 +336,18 @@ async def test_orchestrator_drives_creator_dag_end_to_end(tmp_path, monkeypatch)
         yield TextDeltaEvent(text="<stub:agent>")
 
     async def stub_llm_chat(system_prompt: str, user_prompt: str) -> str:
+        if "Clarify whether the user wants a meta-skill" in user_prompt:
+            return (
+                "Route: Meta-Skill\n"
+                "WORKFLOW_GOAL: compose X then Y\n"
+                "OUTPUT_SHAPE: SKILL.md proposal\n"
+                "TRIGGERS: orch e2e trigger\n"
+                "HUMAN_PREFERENCE_BRANCH: no\n"
+                "NEEDS_CLARIFICATION: no\n"
+                "MISSING_FIELDS:\n"
+                "  - none\n"
+                "CLARIFY_REASON: none"
+            )
         return "p1_sequential"
 
     async def stub_tool_invoker(tool_name: str, args: dict) -> str:
@@ -347,7 +375,10 @@ async def test_orchestrator_drives_creator_dag_end_to_end(tmp_path, monkeypatch)
     )
     match = MetaMatch(
         plan=plan,
-        inputs={"user_message": "compose a meta-skill that does X then Y"},
+        inputs={
+            "user_message": "compose a meta-skill that does X then Y",
+            "system_prompt": "Unattended meta-skill auto-propose run.",
+        },
     )
 
     final_result = None
@@ -378,8 +409,11 @@ async def test_creator_dag_stops_when_clarify_routes_normal_skill(tmp_path) -> N
     assert plan is not None
 
     async def stub_agent_runner(system_prompt: str, user_prompt: str):
+        raise AssertionError("normal-skill route should not start creator agents")
+
+    async def stub_llm_chat(system_prompt: str, user_prompt: str) -> str:
         if "Clarify whether the user wants a meta-skill" in user_prompt:
-            yield TextDeltaEvent(text=(
+            return (
                 "Route: Normal-Skill\n"
                 "WORKFLOW_GOAL: create a standalone skill\n"
                 "OUTPUT_SHAPE: normal SKILL.md\n"
@@ -389,11 +423,7 @@ async def test_creator_dag_stops_when_clarify_routes_normal_skill(tmp_path) -> N
                 "MISSING_FIELDS:\n"
                 "  - none\n"
                 "CLARIFY_REASON: not a meta-skill request"
-            ))
-            return
-        raise AssertionError("normal-skill route should not start creator agents")
-
-    async def stub_llm_chat(system_prompt: str, user_prompt: str) -> str:
+            )
         raise AssertionError("normal-skill route should not call creator classifiers")
 
     async def stub_tool_invoker(tool_name: str, args: dict) -> str:
@@ -454,6 +484,18 @@ async def test_orchestrator_p2_fan_out_merge_proposal(tmp_path, monkeypatch) -> 
         yield TextDeltaEvent(text="<stub:agent>")
 
     async def stub_llm_chat(system_prompt: str, user_prompt: str) -> str:
+        if "Clarify whether the user wants a meta-skill" in user_prompt:
+            return (
+                "ROUTE: meta-skill\n"
+                "WORKFLOW_GOAL: compose trip planning workflow\n"
+                "OUTPUT_SHAPE: SKILL.md proposal\n"
+                "TRIGGERS: synth p2 trigger\n"
+                "HUMAN_PREFERENCE_BRANCH: no\n"
+                "NEEDS_CLARIFICATION: no\n"
+                "MISSING_FIELDS:\n"
+                "  - none\n"
+                "CLARIFY_REASON: none"
+            )
         return "p2_fan_out_merge"
 
     async def stub_tool_invoker(tool_name: str, args: dict) -> str:

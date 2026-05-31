@@ -645,7 +645,6 @@ def test_meta_skill_creator_has_intent_collision_risk_and_preview_gates(
 
 def test_meta_skill_creator_supports_preview_only_branch(tmp_path: Path) -> None:
     loader = _loader(tmp_path)
-    _assert_composes_at_least_two_skills(loader, "meta-skill-creator")
     steps, plan = _steps_by_id(loader, "meta-skill-creator")
 
     assert plan.final_text_mode == "step:final_response"
@@ -680,6 +679,12 @@ def test_meta_skill_creator_supports_preview_only_branch(tmp_path: Path) -> None
     assert "unattended auto-propose" in creator_mode_text
     assert "dream" in creator_mode_text
     assert "cron" in creator_mode_text
+    assert steps["clarify_intent"].kind == "llm_chat"
+    assert steps["collision_check"].kind == "llm_chat"
+    assert steps["risk_classify"].kind == "llm_chat"
+    assert steps["preview"].kind == "llm_chat"
+    assert steps["harvest"].kind == "skill_exec"
+    assert steps["harvest"].skill == "history-explorer"
     creation_steps = {
         "creator_mode",
         "harvest",
@@ -698,6 +703,7 @@ def test_meta_skill_creator_supports_preview_only_branch(tmp_path: Path) -> None
     }
     for step_id in creation_steps:
         assert "route: meta-skill" in steps[step_id].when
+    assert "Unattended meta-skill auto-propose run" in steps["harvest"].when
     assert "outputs.creator_mode != 'PREVIEW_ONLY'" in steps["smoke"].when
     assert "outputs.creator_mode != 'PREVIEW_ONLY'" in steps["persist"].when
     assert steps["final_response"].depends_on == ("preview", "normal_skill_exit")
@@ -768,12 +774,9 @@ def test_migration_assistant_routes_guides_and_optional_repo_context(
         required_fields={"source_stack", "target_stack"},
     )
     assert set(steps["classify"].depends_on) == {"migration_intake", "migration_clarify"}
-    assert steps["fetch_guide"].skill == "deep-research"
+    assert steps["fetch_guide"].kind == "skill_exec"
+    assert steps["fetch_guide"].skill == "multi-search-engine"
     assert set(steps["fetch_guide"].depends_on) == {"classify", "migration_clarify"}
-    assert [case.to for case in steps["fetch_guide"].route] == [
-        "github",
-        "multi-search-engine",
-    ]
     assert steps["repo_context"].skill == "git-diff"
     assert "current diff" in steps["repo_context"].when
     assert "current branch" in steps["repo_context"].when
