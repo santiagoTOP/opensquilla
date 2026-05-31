@@ -72,7 +72,7 @@ def test_chat_pending_attachment_preview_is_composer_width_capped() -> None:
     assert "overflow-x: auto;" in block
 
 
-def test_chat_sent_attachment_images_are_decoupled_from_text_bubble_width() -> None:
+def test_chat_sent_attachment_images_render_as_separate_thumbnail_attachments() -> None:
     css = CHAT_CSS.read_text(encoding="utf-8")
     body_start = css.index(".msg.user .msg-body.msg-body--has-attachments {")
     body_end = css.index(".msg.user .msg-body--has-attachments .msg-attachment-text", body_start)
@@ -87,12 +87,12 @@ def test_chat_sent_attachment_images_are_decoupled_from_text_bubble_width() -> N
     thumb_end = css.index("/* ─── Pending Queue", thumb_start)
     thumb_block = css[thumb_start:thumb_end]
 
-    assert "max-width: min(640px, 78%);" in body_block
+    assert "max-width: min(360px, 78%);" in body_block
     assert "max-width: min(360px, 100%);" in text_block
     assert "max-width: 100%;" in attachments_block
-    assert "width: min(520px, 70vw);" in thumb_block
+    assert "width: min(260px, 42vw);" in thumb_block
     assert "height: auto;" in thumb_block
-    assert "min-height: 96px;" in thumb_block
+    assert "min-height:" not in thumb_block
     assert "object-fit: contain;" in thumb_block
     assert "background: transparent;" in thumb_block
     assert "border-color: color-mix(in srgb, var(--border) 65%, transparent);" in thumb_block

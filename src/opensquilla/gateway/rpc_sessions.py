@@ -872,7 +872,39 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
     attachments_cfg = getattr(ctx.config, "attachments", None)
     persist_enabled = bool(getattr(attachments_cfg, "persist_transcripts", True))
     media_root = media_root_from_config(ctx.config)
-    session_id = key.split(":")[-1] or key
+    from opensquilla.session.models import SessionIntent
+
+    try:
+        session_intent = SessionIntent(params.get("intent", SessionIntent.CONTINUE.value))
+    except ValueError as exc:
+        raise ValueError(f"Invalid session intent: {params.get('intent')}") from exc
+
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise KeyError("No session storage available")
+
+    session = await storage.get_session(key)
+    if session is None and session_intent is SessionIntent.CONTINUE:
+        raise KeyError(f"Session not found: {key}")
+
+    if "apply_intent" in dir(ctx.session_manager):
+        session, _intent_applied = await ctx.session_manager.apply_intent(
+            key,
+            session_intent,
+            agent_id=normalize_agent_id(session.agent_id if session is not None else "main"),
+        )
+    elif session_intent is not SessionIntent.CONTINUE:
+        raise RuntimeError("Session intent handling requires SessionManager.apply_intent")
+
+    canonical_session_id = getattr(session, "session_id", None)
+    session_id = (
+        canonical_session_id
+        if isinstance(canonical_session_id, str) and canonical_session_id
+        else key.split(":")[-1] or key
+    )
     disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
     ingested_attachments = await _attachment_ingest.ingest_attachments(
         message_text,
@@ -914,38 +946,12 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
         )
     # Evict consumed uuids only after the turn is accepted.
     _consumed_file_uuids: list[str] = list(ingested_attachments.consumed_file_uuids)
-    from opensquilla.session.models import SessionIntent
-
-    try:
-        session_intent = SessionIntent(params.get("intent", SessionIntent.CONTINUE.value))
-    except ValueError as exc:
-        raise ValueError(f"Invalid session intent: {params.get('intent')}") from exc
     log.info(
         "sessions.send.params",
         session_key=key,
         message_len=len(message_text),
         attachments_count=len(raw_attachments),
     )
-
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
-
-    session = await storage.get_session(key)
-    if session is None and session_intent is SessionIntent.CONTINUE:
-        raise KeyError(f"Session not found: {key}")
-
-    if "apply_intent" in dir(ctx.session_manager):
-        session, _intent_applied = await ctx.session_manager.apply_intent(
-            key,
-            session_intent,
-            agent_id=normalize_agent_id(session.agent_id if session is not None else "main"),
-        )
-    elif session_intent is not SessionIntent.CONTINUE:
-        raise RuntimeError("Session intent handling requires SessionManager.apply_intent")
 
     display_text = params.get("displayText") if source_hint.get("caller_kind") == "web" else None
     if display_text is not None and not isinstance(display_text, str):

@@ -2666,8 +2666,9 @@ def test_chat_image_attachment_layout_stays_aligned_in_real_browser(
         assert pending["thumb"]["right"] <= pending["preview"]["right"], (name, pending)
         assert sent["sendAttachmentCount"] == 1, (name, sent)
         assert sent["sendMessage"] == "这是什么", (name, sent)
-        assert sent["text"]["width"] < sent["thumb"]["width"], (name, sent)
-        assert sent["thumb"]["height"] >= 96, (name, sent)
+        assert sent["text"]["right"] <= sent["body"]["right"] + 1, (name, sent)
+        assert sent["thumb"]["width"] <= 280, (name, sent)
+        assert sent["thumb"]["height"] <= 160, (name, sent)
         assert sent["thumb"]["right"] <= sent["width"], (name, sent)
         assert sent["attachments"]["right"] <= sent["body"]["right"] + 1, (name, sent)
         if name == "mobile":
@@ -2682,7 +2683,6 @@ def test_chat_image_attachment_layout_stays_aligned_in_real_browser(
                 name,
                 pending,
             )
-            assert sent["thumb"]["width"] >= 450, (name, sent)
 
 
 def test_completed_reconnect_without_replay_refreshes_history_in_real_browser(

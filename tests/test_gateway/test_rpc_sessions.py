@@ -1207,6 +1207,55 @@ class TestSessionsSend:
         )
 
     @pytest.mark.asyncio
+    async def test_web_large_paste_material_uses_canonical_session_id(
+        self,
+        dispatcher,
+        tmp_path,
+    ):
+        raw = "a" * LARGE_PASTE_CHARS
+        web_session = FakeSession(
+            session_key="agent:main:webchat:web-large-paste",
+            session_id="canonical-transcript-id",
+        )
+        web_manager = FakeSessionManager([web_session])
+        web_runner = _RecordingTurnRunner()
+        web_ctx = make_ctx(
+            session_manager=web_manager,
+            turn_runner=web_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
+
+        res = await dispatcher.dispatch(
+            "r-web-large-paste-canonical-id",
+            "sessions.send",
+            {
+                "key": web_session.session_key,
+                "message": raw,
+                "_source": {"caller_kind": "web", "channel_kind": "webchat"},
+            },
+            web_ctx,
+        )
+        web_task = get_agent_task_registry().get(web_session.session_key)
+        if web_task is not None:
+            await web_task
+
+        assert res.ok is True
+        runtime_attachment = web_runner.run_calls[0]["attachments"][0]
+        assert runtime_attachment["scope"] == web_session.session_id
+        canonical_path = transcript_material_path(
+            tmp_path,
+            web_session.session_id,
+            runtime_attachment["sha256"],
+        )
+        suffix_path = transcript_material_path(
+            tmp_path,
+            web_session.session_key.rsplit(":", 1)[-1],
+            runtime_attachment["sha256"],
+        )
+        assert canonical_path.read_text() == raw
+        assert not suffix_path.exists()
+
+    @pytest.mark.asyncio
     async def test_sessions_send_large_paste_defaults_to_web_guard(
         self,
         dispatcher,
