@@ -98,6 +98,8 @@ exclude = [
     "src/opensquilla/scheduler/templates/*.md",
     "src/opensquilla/skills/bundled/**/THIRD_PARTY_NOTICES.md",
     "src/opensquilla/skills/bundled/**/references/*.md",
+    "src/opensquilla/skills/exp/**",
+    "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]

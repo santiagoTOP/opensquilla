@@ -51,9 +51,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   duplicate compaction status, attachment and pasted-text rendering, artifact
   downloads, composer layout, model-router animation timing, and visible
   recovery during long turns.
-- MetaSkill runtime fixes cover paused runs, structured clarification, natural
-  language extraction, paper-writing flows, proposal gates, final text
-  selection, and cross-surface fallback output.
 - Provider and runtime hardening reduces malformed tool-call fallout, preserves
   configured model-switch intent, handles provider tool-choice requirements,
   and keeps oversized current-turn tool payloads from surfacing as bare

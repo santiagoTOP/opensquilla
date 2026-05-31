@@ -36,6 +36,7 @@ WHEEL_ROUTER_PREFIX = "opensquilla/squilla_router/models"
 ROUTER_PROVENANCE_WHEEL_PATH = (
     f"{WHEEL_ROUTER_PREFIX}/v4.2_phase3_inference/PROVENANCE.md"
 )
+TOKENJUICE_PROVENANCE_WHEEL_PATH = "opensquilla/plugins/tokenjuice/PROVENANCE.md"
 ALLOWED_SKILL_REFERENCE_WHEEL_PATHS = frozenset(
     {
         "opensquilla/skills/bundled/pptx/references/pptxgenjs.md",
@@ -214,6 +215,8 @@ def _contains_forbidden_release_segment(path: str) -> bool:
 def _is_allowed_runtime_markdown(path: str) -> bool:
     name = _release_name(path)
     if name == ROUTER_PROVENANCE_WHEEL_PATH:
+        return True
+    if name == TOKENJUICE_PROVENANCE_WHEEL_PATH:
         return True
     if name in ALLOWED_SKILL_REFERENCE_WHEEL_PATHS:
         return True
