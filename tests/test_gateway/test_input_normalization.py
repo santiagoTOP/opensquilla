@@ -7,8 +7,11 @@ import pytest
 from opensquilla.gateway.input_normalization import (
     INLINE_TEXT_ATTACHMENT_MAX_BYTES,
     LARGE_PASTE_CHARS,
+    LARGE_PASTE_PLACEHOLDER,
     PAGE_DUMP_CHARS,
+    PAGE_DUMP_PLACEHOLDER,
     estimate_text_tokens,
+    infer_normalized_input_from_attachments,
     normalize_incoming_text,
     page_dump_marker_score,
 )
@@ -125,3 +128,57 @@ def test_supported_web_source_hint_shapes_generate_attachment(
     assert normalized.kind == "large_paste"
     assert normalized.generated_attachments
     assert normalized.metadata["guard_action"] == "generated_text_attachment"
+
+
+def test_ascii_token_estimate_preserves_len_div_4_behavior() -> None:
+    assert estimate_text_tokens("a" * 20_000) == 5_000
+
+
+def test_cjk_token_estimate_is_not_len_div_4() -> None:
+    text = "家庭日程" * 100
+
+    assert estimate_text_tokens(text) == len(text)
+    assert estimate_text_tokens(text) > len(text) // 4
+
+
+def test_infers_page_dump_normalization_from_placeholder_attachment() -> None:
+    raw = (
+        "Chat session agent:main:webchat:gp85g1kj\n"
+        "Running\n"
+        "Still waiting for agent response...\n"
+        "AI MODEL ROUTER\n"
+        + ("界" * PAGE_DUMP_CHARS)
+    )
+    attachment = {
+        "type": "text/plain",
+        "mime": "text/plain",
+        "name": "webchat-page-dump-20260531-000000.txt",
+        "data": base64.b64encode(raw.encode("utf-8")).decode("ascii"),
+    }
+
+    normalized = infer_normalized_input_from_attachments(
+        PAGE_DUMP_PLACEHOLDER,
+        [attachment],
+    )
+
+    assert normalized is not None
+    assert normalized.kind == "page_dump"
+    assert normalized.semantic_message == PAGE_DUMP_PLACEHOLDER
+    assert normalized.metadata["guard_action"] == "generated_text_attachment"
+    assert normalized.metadata["original_chars"] == len(raw)
+    assert normalized.metadata["material_estimated_tokens"] == estimate_text_tokens(raw)
+    assert normalized.metadata["marker_score"] >= 3
+
+
+def test_regular_text_attachment_does_not_infer_normalization() -> None:
+    attachment = {
+        "type": "text/plain",
+        "mime": "text/plain",
+        "name": "notes.txt",
+        "data": base64.b64encode(b"hello").decode("ascii"),
+    }
+
+    assert (
+        infer_normalized_input_from_attachments(LARGE_PASTE_PLACEHOLDER, [attachment])
+        is None
+    )

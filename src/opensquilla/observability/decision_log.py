@@ -24,7 +24,7 @@ from typing import Literal
 from opensquilla.bootstrap_types import BootstrapFileReport
 from opensquilla.paths import default_opensquilla_home
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _INTENT_SUMMARY_MAX_CHARS = 500
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
@@ -134,6 +134,9 @@ class DecisionEntry:
     skill_count: int = 0
     skills_prompt_chars: int = 0
     memory_md_present: bool = False
+    daily_notes_omitted: bool = False
+    daily_notes_count_before_omit: int = 0
+    daily_notes_policy_reason: str | None = None
     injected_workspace_files_count: int = 0
     bootstrap_files: list[BootstrapFileReport] = field(default_factory=list)
     memory_mode_fingerprint: dict[str, str] = field(default_factory=dict)

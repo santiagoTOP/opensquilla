@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opensquilla.agents.registry import AgentRegistry
+from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.engine.types import DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
@@ -454,6 +455,12 @@ def _exact_pdf(size: int) -> bytes:
     return header + b"a" * (size - len(header))
 
 
+def _ctx_config_with_media_root(tmp_path) -> GatewayConfig:
+    cfg = GatewayConfig(memory={"flush_enabled": False})
+    cfg.attachments.media_root = str(tmp_path)
+    return cfg
+
+
 @pytest.fixture
 def dispatcher():
     return get_dispatcher()
@@ -869,6 +876,100 @@ class TestSessionsSend:
             "persisted_user_message_id"
         ) is None
 
+
+    @pytest.mark.asyncio
+    async def test_send_marks_empty_transcript_as_fresh_user_session(
+        self, dispatcher, session
+    ):
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append(
+                    {"envelope": envelope, "message": message, **kwargs}
+                )
+                return SimpleNamespace(
+                    task_id="task-1",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        runtime = RecordingTaskRuntime()
+        manager = FakeSessionManager([session])
+        manager.transcript = []
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert runtime.enqueue_calls[0]["fresh_user_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_marks_non_empty_transcript_as_not_fresh_user_session(
+        self, dispatcher, session
+    ):
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append(
+                    {"envelope": envelope, "message": message, **kwargs}
+                )
+                return SimpleNamespace(
+                    task_id="task-1",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        runtime = RecordingTaskRuntime()
+        manager = FakeSessionManager([session])
+        manager.transcript = [SimpleNamespace(role="user", content="previous")]
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert runtime.enqueue_calls[0]["fresh_user_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_send_marks_direct_runner_empty_transcript_as_fresh_user_session(
+        self, dispatcher
+    ):
+        session = FakeSession(session_key="agent:main:webchat:fresh-direct")
+        manager = FakeSessionManager([session])
+        manager.transcript = []
+        runner = _RecordingTurnRunner()
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=None,
+            turn_runner=runner,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+        task = get_agent_task_registry().get(session.session_key)
+        if task is not None:
+            await task
+
+        assert res.ok is True
+        assert runner.run_calls[0]["fresh_user_session"] is True
+
     def test_legacy_session_error_payload_is_terminal_message_normalized(self):
         payload = _normalize_terminal_event_payload(
             "session.event.error",
@@ -1038,6 +1139,7 @@ class TestSessionsSend:
     async def test_web_large_paste_is_normalized_before_turn_runner(
         self,
         dispatcher,
+        tmp_path,
     ):
         raw = "a" * LARGE_PASTE_CHARS
         placeholder = "Please process the attached pasted text."
@@ -1047,7 +1149,11 @@ class TestSessionsSend:
         )
         web_manager = FakeSessionManager([web_session])
         web_runner = _RecordingTurnRunner()
-        web_ctx = make_ctx(session_manager=web_manager, turn_runner=web_runner)
+        web_ctx = make_ctx(
+            session_manager=web_manager,
+            turn_runner=web_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
 
         res = await dispatcher.dispatch(
             "r-web-large-paste",
@@ -1069,12 +1175,23 @@ class TestSessionsSend:
         assert web_runner.run_calls[0]["semantic_message"] == placeholder
         runner_attachments = web_runner.run_calls[0]["attachments"]
         assert len(runner_attachments) == 1
+        assert runner_attachments[0]["kind"] == "attachment_ref"
+        assert runner_attachments[0]["source"] == "input_normalization"
         assert runner_attachments[0]["type"] == "text/plain"
         assert runner_attachments[0]["name"].startswith("webchat-paste-")
+        assert "data" not in runner_attachments[0]
+        assert runner_attachments[0]["_provider_inline_policy"] == "preview_only"
+        material_path = transcript_material_path(
+            tmp_path,
+            web_session.session_id,
+            runner_attachments[0]["sha256"],
+        )
+        assert material_path.read_text() == raw
 
         persisted = json.loads(web_manager.created_messages[0][2])
         assert persisted["text"] == placeholder
         assert len(persisted["attachments"]) == 1
+        assert persisted["attachments"][0]["sha256_ref"] == runner_attachments[0]["sha256"]
         assert persisted["attachments"][0]["name"].startswith("webchat-paste-")
 
         provenance = web_runner.run_calls[0]["input_provenance"]
@@ -1093,6 +1210,7 @@ class TestSessionsSend:
     async def test_sessions_send_large_paste_defaults_to_web_guard(
         self,
         dispatcher,
+        tmp_path,
     ):
         raw = "a" * LARGE_PASTE_CHARS
         placeholder = "Please process the attached pasted text."
@@ -1102,7 +1220,11 @@ class TestSessionsSend:
         )
         web_manager = FakeSessionManager([web_session])
         web_runner = _RecordingTurnRunner()
-        web_ctx = make_ctx(session_manager=web_manager, turn_runner=web_runner)
+        web_ctx = make_ctx(
+            session_manager=web_manager,
+            turn_runner=web_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
 
         res = await dispatcher.dispatch(
             "r-untagged-large-paste",
@@ -1122,12 +1244,16 @@ class TestSessionsSend:
         assert web_runner.run_calls[0]["semantic_message"] == placeholder
         runner_attachments = web_runner.run_calls[0]["attachments"]
         assert len(runner_attachments) == 1
+        assert runner_attachments[0]["kind"] == "attachment_ref"
+        assert runner_attachments[0]["source"] == "input_normalization"
         assert runner_attachments[0]["type"] == "text/plain"
         assert runner_attachments[0]["name"].startswith("webchat-paste-")
+        assert "data" not in runner_attachments[0]
 
         persisted = json.loads(web_manager.created_messages[0][2])
         assert persisted["text"] == placeholder
         assert len(persisted["attachments"]) == 1
+        assert persisted["attachments"][0]["sha256_ref"] == runner_attachments[0]["sha256"]
         assert persisted["attachments"][0]["name"].startswith("webchat-paste-")
 
         provenance = web_runner.run_calls[0]["input_provenance"]
@@ -1181,6 +1307,7 @@ class TestSessionsSend:
     async def test_chat_send_large_web_paste_uses_sessions_guard(
         self,
         dispatcher,
+        tmp_path,
     ):
         assert rpc_chat._handle_chat_send is not None
         raw = "a" * LARGE_PASTE_CHARS
@@ -1192,7 +1319,11 @@ class TestSessionsSend:
         )
         chat_manager = FakeSessionManager([chat_session])
         chat_runner = _RecordingTurnRunner()
-        chat_ctx = make_ctx(session_manager=chat_manager, turn_runner=chat_runner)
+        chat_ctx = make_ctx(
+            session_manager=chat_manager,
+            turn_runner=chat_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
 
         res = await dispatcher.dispatch(
             "r-chat-large-paste",
@@ -1213,6 +1344,8 @@ class TestSessionsSend:
         assert chat_runner.run_calls[0]["message"] == placeholder
         assert chat_runner.run_calls[0]["semantic_message"] == placeholder
         assert len(chat_runner.run_calls[0]["attachments"]) == 2
+        assert chat_runner.run_calls[0]["attachments"][0]["kind"] == "attachment_ref"
+        assert "data" not in chat_runner.run_calls[0]["attachments"][0]
         assert chat_runner.run_calls[0]["attachments"][0]["name"].startswith(
             "webchat-paste-"
         )
@@ -1225,6 +1358,7 @@ class TestSessionsSend:
     async def test_chat_send_client_normalized_paste_preserves_provenance(
         self,
         dispatcher,
+        tmp_path,
     ):
         assert rpc_chat._handle_chat_send is not None
         raw = "a" * LARGE_PASTE_CHARS
@@ -1253,7 +1387,11 @@ class TestSessionsSend:
         )
         chat_manager = FakeSessionManager([chat_session])
         chat_runner = _RecordingTurnRunner()
-        chat_ctx = make_ctx(session_manager=chat_manager, turn_runner=chat_runner)
+        chat_ctx = make_ctx(
+            session_manager=chat_manager,
+            turn_runner=chat_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
 
         res = await dispatcher.dispatch(
             "r-chat-client-normalized-paste",
@@ -1274,13 +1412,145 @@ class TestSessionsSend:
         assert res.ok is True
         assert chat_runner.run_calls[0]["message"] == placeholder
         assert chat_runner.run_calls[0]["semantic_message"] == placeholder
-        assert len(chat_runner.run_calls[0]["attachments"]) == 1
+        attachments = chat_runner.run_calls[0]["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0]["kind"] == "attachment_ref"
+        assert attachments[0]["source"] == "input_normalization"
+        assert "data" not in attachments[0]
+        assert attachments[0]["_provider_inline_policy"] == "preview_only"
         provenance = chat_runner.run_calls[0]["input_provenance"]
         assert provenance["kind"] == "web_message"
         assert provenance["source"] == "WebChat"
         assert provenance["input_normalization"]["guard_action"] == (
             "generated_text_attachment"
         )
+        assert provenance["input_normalization"]["original_chars"] == len(raw)
+        assert provenance["input_normalization"]["material_estimated_tokens"] == (
+            estimate_text_tokens(raw)
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_send_client_normalized_paste_without_provenance_is_inferred(
+        self,
+        dispatcher,
+        tmp_path,
+    ):
+        assert rpc_chat._handle_chat_send is not None
+        raw = "界" * LARGE_PASTE_CHARS
+        placeholder = "Please process the attached pasted text."
+        attachment = {
+            "type": "text/plain",
+            "mime": "text/plain",
+            "data": base64.b64encode(raw.encode("utf-8")).decode("ascii"),
+            "name": "webchat-paste-20260531-000000.txt",
+        }
+        chat_session = FakeSession(
+            session_key="agent:main:webchat:client-normalized-no-provenance",
+            session_id="client-normalized-no-provenance",
+        )
+        chat_manager = FakeSessionManager([chat_session])
+        chat_runner = _RecordingTurnRunner()
+        chat_ctx = make_ctx(
+            session_manager=chat_manager,
+            turn_runner=chat_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
+
+        res = await dispatcher.dispatch(
+            "r-chat-client-normalized-no-provenance",
+            "chat.send",
+            {
+                "sessionKey": chat_session.session_key,
+                "message": placeholder,
+                "displayText": placeholder,
+                "attachments": [attachment],
+            },
+            chat_ctx,
+        )
+        chat_task = get_agent_task_registry().get(chat_session.session_key)
+        if chat_task is not None:
+            await chat_task
+
+        assert res.ok is True
+        assert chat_runner.run_calls[0]["message"] == placeholder
+        assert chat_runner.run_calls[0]["semantic_message"] == placeholder
+        attachments = chat_runner.run_calls[0]["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0]["kind"] == "attachment_ref"
+        assert attachments[0]["source"] == "input_normalization"
+        assert "data" not in attachments[0]
+        material_path = transcript_material_path(
+            tmp_path,
+            chat_session.session_id,
+            attachments[0]["sha256"],
+        )
+        assert material_path.read_text() == raw
+        provenance = chat_runner.run_calls[0]["input_provenance"]
+        assert provenance["input_normalization"]["guard_action"] == (
+            "generated_text_attachment"
+        )
+        assert provenance["input_normalization"]["original_chars"] == len(raw)
+        assert provenance["input_normalization"]["material_estimated_tokens"] == (
+            estimate_text_tokens(raw)
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_send_client_normalized_paste_server_metadata_wins(
+        self,
+        dispatcher,
+        tmp_path,
+    ):
+        assert rpc_chat._handle_chat_send is not None
+        raw = "界" * LARGE_PASTE_CHARS
+        placeholder = "Please process the attached pasted text."
+        attachment = {
+            "type": "text/plain",
+            "mime": "text/plain",
+            "data": base64.b64encode(raw.encode("utf-8")).decode("ascii"),
+            "name": "webchat-paste-20260531-000000.txt",
+        }
+        client_provenance = {
+            "kind": "web_message",
+            "input_normalization": {
+                "source": "input_normalization",
+                "original_chars": 1,
+                "material_estimated_tokens": 1,
+                "marker_score": 0,
+                "generated_attachment_count": 1,
+                "guard_action": "generated_text_attachment",
+            },
+        }
+        chat_session = FakeSession(
+            session_key="agent:main:webchat:client-normalized-server-wins",
+            session_id="client-normalized-server-wins",
+        )
+        chat_manager = FakeSessionManager([chat_session])
+        chat_runner = _RecordingTurnRunner()
+        chat_ctx = make_ctx(
+            session_manager=chat_manager,
+            turn_runner=chat_runner,
+            config=_ctx_config_with_media_root(tmp_path),
+        )
+
+        res = await dispatcher.dispatch(
+            "r-chat-client-normalized-server-wins",
+            "chat.send",
+            {
+                "sessionKey": chat_session.session_key,
+                "message": placeholder,
+                "displayText": placeholder,
+                "attachments": [attachment],
+                "inputProvenance": client_provenance,
+            },
+            chat_ctx,
+        )
+        chat_task = get_agent_task_registry().get(chat_session.session_key)
+        if chat_task is not None:
+            await chat_task
+
+        assert res.ok is True
+        provenance = chat_runner.run_calls[0]["input_provenance"]
+        assert provenance["kind"] == "web_message"
         assert provenance["input_normalization"]["original_chars"] == len(raw)
         assert provenance["input_normalization"]["material_estimated_tokens"] == (
             estimate_text_tokens(raw)

@@ -29,7 +29,11 @@ from typing import TYPE_CHECKING, Any, Final, Literal, SupportsInt, TypeGuard, c
 import structlog
 
 from opensquilla.artifacts import artifact_marker
-from opensquilla.attachment_refs import is_attachment_ref, read_attachment_ref_bytes
+from opensquilla.attachment_refs import (
+    is_attachment_ref,
+    read_attachment_ref_bytes,
+    transcript_material_path,
+)
 from opensquilla.bootstrap_types import BootstrapFileReport
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
@@ -1118,6 +1122,8 @@ class BootstrapSnapshot:
 
 _PDF_ATTACHMENT_TEXT_LIMIT = 200_000
 _TEXT_ATTACHMENT_TEXT_LIMIT = 200_000
+_PREVIEW_ONLY_TEXT_ATTACHMENT_CHARS = 4_000
+_PREVIEW_ONLY_TEXT_ATTACHMENT_LINES = 80
 
 _XML_ATTR_ESCAPES = {
     "<": "&lt;",
@@ -1177,6 +1183,90 @@ def _truncate_attachment_text(text: str, *, limit: int = _PDF_ATTACHMENT_TEXT_LI
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n\n[attachment text truncated: {len(text)} chars total]"
+
+
+def _preview_attachment_text(
+    text: str,
+    *,
+    char_limit: int = _PREVIEW_ONLY_TEXT_ATTACHMENT_CHARS,
+    line_limit: int = _PREVIEW_ONLY_TEXT_ATTACHMENT_LINES,
+) -> tuple[str, bool]:
+    lines = text.splitlines(keepends=True)
+    preview = "".join(lines[:line_limit])
+    truncated = len(lines) > line_limit
+    if len(preview) > char_limit:
+        preview = preview[:char_limit]
+        truncated = True
+    elif len(text) > len(preview):
+        truncated = True
+    return preview, truncated
+
+
+def _attachment_ref_material_path(
+    attachment: dict[str, Any],
+    *,
+    media_root: Path | None,
+) -> str | None:
+    path = attachment.get("_material_path")
+    if isinstance(path, str) and path:
+        return path
+    if media_root is None or not is_attachment_ref(attachment):
+        return None
+    scope = attachment.get("scope")
+    sha = attachment.get("sha256") or attachment.get("material_id")
+    if not isinstance(scope, str) or not isinstance(sha, str):
+        return None
+    try:
+        return str(transcript_material_path(media_root, scope, sha))
+    except ValueError:
+        return None
+
+
+def _render_preview_only_attachment_text(
+    attachment: dict[str, Any],
+    *,
+    filename: str,
+    mime: str,
+    raw_bytes: bytes,
+    media_root: Path | None,
+) -> str:
+    try:
+        decoded = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return "[attachment unavailable: declared text content is not valid UTF-8]"
+
+    preview, truncated = _preview_attachment_text(decoded)
+    material_path = _attachment_ref_material_path(attachment, media_root=media_root)
+    estimated_tokens = attachment.get("_material_estimated_tokens")
+    estimated_line = (
+        f"estimated_tokens: {estimated_tokens}"
+        if isinstance(estimated_tokens, int)
+        else "estimated_tokens: unknown"
+    )
+    path_line = f"path: {material_path}" if material_path else "path: unavailable"
+    read_hint = (
+        f'read_full: use read_file(path="{material_path}", offset=1, limit=200) '
+        "and adjust offset/limit as needed."
+        if material_path
+        else "read_full: material path unavailable."
+    )
+    truncation = (
+        f"\n\n[attachment preview truncated: {len(decoded)} chars total]"
+        if truncated
+        else ""
+    )
+    return (
+        "[large text attachment materialized]\n"
+        f"name: {filename}\n"
+        f"mime: {mime}\n"
+        f"size_bytes: {len(raw_bytes)}\n"
+        f"{estimated_line}\n"
+        f"{path_line}\n"
+        f"{read_hint}\n\n"
+        "preview:\n"
+        f"{preview}"
+        f"{truncation}"
+    )
 
 
 def _extract_pdf_attachment_text(raw_bytes: bytes, filename: str) -> str:
@@ -1725,6 +1815,7 @@ class TurnRunner:
         persist_input: bool = False,
         input_provenance: dict[str, Any] | None = None,
         history_has_persisted_user: bool = True,
+        fresh_user_session: bool | None = None,
         session_intent: str | None = None,
         semantic_message: str | None = None,
         run_kind: str = "default",
@@ -1786,6 +1877,7 @@ class TurnRunner:
                     persist_input=persist_input,
                     input_provenance=input_provenance,
                     history_has_persisted_user=history_has_persisted_user,
+                    fresh_user_session=fresh_user_session,
                     session_intent=session_intent,
                     semantic_message=semantic_message,
                     run_kind=run_kind,
@@ -1825,6 +1917,7 @@ class TurnRunner:
                         persist_input=persist_input,
                         input_provenance=input_provenance,
                         history_has_persisted_user=history_has_persisted_user,
+                        fresh_user_session=fresh_user_session,
                         session_intent=session_intent,
                         semantic_message=semantic_message,
                         run_kind=run_kind,
@@ -1858,6 +1951,7 @@ class TurnRunner:
         persist_input: bool = False,
         input_provenance: dict[str, Any] | None = None,
         history_has_persisted_user: bool = True,
+        fresh_user_session: bool | None = None,
         session_intent: str | None = None,
         semantic_message: str | None = None,
         run_kind: str = "default",
@@ -1982,6 +2076,13 @@ class TurnRunner:
                     model=model,
                     history_has_persisted_user=history_has_persisted_user,
                     persist_input=persist_input,
+                    fresh_user_session=(
+                        fresh_user_session
+                        if fresh_user_session is not None
+                        else input_mode == "user"
+                        and run_kind == "default"
+                        and not history_has_persisted_user
+                    ),
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     normalization_metadata=normalization_metadata,
                 )
@@ -2199,6 +2300,7 @@ class TurnRunner:
                     persist_input=False,
                     input_provenance=input_provenance,
                     history_has_persisted_user=True,
+                    fresh_user_session=False,
                     session_intent=session_intent,
                     semantic_message=semantic_message,
                     run_kind=run_kind,
@@ -3290,6 +3392,7 @@ class TurnRunner:
         extra_context: dict[str, str] | None = None,
         prompt_metadata: dict[str, Any] | None = None,
         bootstrap_context_mode: str | None = None,
+        fresh_user_session: bool = False,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -3396,7 +3499,17 @@ class TurnRunner:
         else:
             daily = self._load_daily_notes(memory_source_dir)
             memory_text = self._load_memory_md(memory_source_dir)
+        daily_notes_count_before_omit = len(daily)
+        daily_notes_omitted = daily_notes_count_before_omit > 0
+        if daily_notes_omitted:
+            daily = {}
         if prompt_metadata is not None:
+            prompt_metadata["daily_notes_omitted"] = daily_notes_omitted
+            prompt_metadata["daily_notes_count_before_omit"] = daily_notes_count_before_omit
+            if daily_notes_omitted:
+                prompt_metadata["daily_notes_policy_reason"] = "auto_injection_disabled"
+            if fresh_user_session:
+                prompt_metadata["daily_notes_fresh_session_omitted"] = True
             prompt_metadata["memory_md_present"] = memory_text is not None
             prompt_metadata["injected_workspace_files_count"] = len(workspace_files)
             prompt_metadata["bootstrap_files"] = visible_bootstrap_report
@@ -4120,6 +4233,15 @@ class TurnRunner:
                 skill_count=prompt_report.skill_count if prompt_report else 0,
                 skills_prompt_chars=prompt_report.skills_prompt_chars if prompt_report else 0,
                 memory_md_present=prompt_report.memory_md_present if prompt_report else False,
+                daily_notes_omitted=(
+                    prompt_report.daily_notes_omitted if prompt_report else False
+                ),
+                daily_notes_count_before_omit=(
+                    prompt_report.daily_notes_count_before_omit if prompt_report else 0
+                ),
+                daily_notes_policy_reason=(
+                    prompt_report.daily_notes_policy_reason if prompt_report else None
+                ),
                 injected_workspace_files_count=(
                     prompt_report.injected_workspace_files_count if prompt_report else 0
                 ),
@@ -5585,15 +5707,27 @@ class TurnRunner:
                 wrapped = _render_file_context_block(filename, media_type, extracted_pdf_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
-                try:
-                    decoded_text = _truncate_attachment_text(
-                        raw_bytes.decode("utf-8"),
-                        limit=_TEXT_ATTACHMENT_TEXT_LIMIT,
+                if (
+                    is_attachment_ref(att)
+                    and att.get("_provider_inline_policy") == "preview_only"
+                ):
+                    decoded_text = _render_preview_only_attachment_text(
+                        att,
+                        filename=filename,
+                        mime=media_type,
+                        raw_bytes=raw_bytes,
+                        media_root=media_root,
                     )
-                except UnicodeDecodeError:
-                    decoded_text = (
-                        "[attachment unavailable: declared text content is not valid UTF-8]"
-                    )
+                else:
+                    try:
+                        decoded_text = _truncate_attachment_text(
+                            raw_bytes.decode("utf-8"),
+                            limit=_TEXT_ATTACHMENT_TEXT_LIMIT,
+                        )
+                    except UnicodeDecodeError:
+                        decoded_text = (
+                            "[attachment unavailable: declared text content is not valid UTF-8]"
+                        )
                 wrapped = _render_file_context_block(filename, media_type, decoded_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             else:  # pragma: no cover - guarded by allow-list above

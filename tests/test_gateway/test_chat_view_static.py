@@ -36,6 +36,30 @@ def test_chat_toolbar_has_no_tool_compress_selector() -> None:
     assert "tool-compress" not in source
 
 
+def test_chat_slash_menu_is_part_of_composer_and_width_capped() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+    composer_start = source.index('<div class="chat-composer" id="chat-composer">')
+    composer_end = source.index('<input type="file" id="chat-file-input"', composer_start)
+    composer_markup = source[composer_start:composer_end]
+
+    assert 'id="chat-slash"' in composer_markup
+    assert composer_markup.index('id="chat-slash"') < composer_markup.index(
+        'class="chat-input-bar"'
+    )
+    slash_css = css[css.index(".chat-slash {") : css.index(".chat-slash-item {")]
+    assert "var(--chat-measure)" in slash_css
+
+    slash_desc_start = css.index(".chat-slash-desc {")
+    slash_desc = css[
+        slash_desc_start : css.index("/* ─── Per-bubble", slash_desc_start)
+    ]
+    assert "min-width: 0;" in slash_desc
+    assert "overflow: hidden;" in slash_desc
+    assert "text-overflow: ellipsis;" in slash_desc
+    assert "white-space: nowrap;" in slash_desc
+
+
 def test_chat_tool_display_map_does_not_reference_removed_wrapper_tools() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     start = source.index("const _TOOL_EMOJI = {")
@@ -265,6 +289,34 @@ def test_chat_tool_result_can_retitle_coerced_tool_cards() -> None:
     assert "_retitleToolCallDOM(details, resultToolName, seg.input || '')" in history_body
 
 
+def test_chat_tool_result_full_view_uses_stable_modal_class() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+    build_start = source.index("function _buildToolResultDOM")
+    build_end = source.index("  function _appendToolCall", build_start)
+    build_body = source[build_start:build_end]
+
+    assert "class=\"chat-tool-result-full\"" in build_body
+    assert "style=\"white-space:pre-wrap" not in build_body
+    assert "viewBtn.type = 'button';" in build_body
+    assert "event.stopPropagation();" in build_body
+    assert ".chat-tool-result-full" in css
+    assert "overflow-wrap: anywhere;" in css
+    assert "max-width: min(" in css
+
+
+def test_chat_historical_tool_results_stringify_non_string_payloads() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    history_start = source.index("function _reconstructToolCalls(bubbleDiv, segments)")
+    history_end = source.index("  function _renderMessageTags", history_start)
+    history_body = source[history_start:history_end]
+
+    assert "function _toolResultContent" in source
+    assert "const content = _toolResultContent(seg);" in history_body
+    assert "const content = _toolResultContent(payload);" in source
+    assert "JSON.stringify(raw, null, 2)" in source
+
+
 def test_router_control_is_hidden_from_regular_tool_cards() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     append_tool_start = source.index("function _appendToolCall(payload)")
@@ -441,6 +493,38 @@ def test_chat_slash_executor_handles_unknown_without_chat_send() -> None:
     assert "Unsupported command" in executor
     assert "return true;" in executor
     assert "chat.send" not in executor
+
+
+def test_chat_image_paste_prevents_default_only_after_attachment_acceptance() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    paste_start = source.index("const pasteHandler = (e) => {")
+    paste_end = source.index("    document.addEventListener('paste', pasteHandler);", paste_start)
+    paste_body = source[paste_start:paste_end]
+
+    assert "let consumedAttachment = false;" in paste_body
+    assert "if (file && _addAttachment(file)) consumedAttachment = true;" in paste_body
+    assert "if (consumedAttachment) e.preventDefault();" in paste_body
+    assert paste_body.index("_addAttachment(file)") < paste_body.index("e.preventDefault()")
+
+
+def test_chat_add_attachment_reports_acceptance_for_paste_handler() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    add_start = source.index("function _addAttachment(file)")
+    add_end = source.index("  async function _uploadAttachmentStaged(file, mime, localId)", add_start)
+    add_body = source[add_start:add_end]
+
+    assert "return false;" in add_body[
+        add_body.index("if (!_isAllowedAttachmentMime(mime))") :
+        add_body.index("const hardCap = _attachmentHardCapBytes(mime);")
+    ]
+    assert "return false;" in add_body[
+        add_body.index("if (file.size > hardCap)") :
+        add_body.index("const localId = _nextAttachmentId++;")
+    ]
+    assert "reader.readAsDataURL(file);" in add_body
+    assert "reader.readAsDataURL(file);\n      return true;" in add_body
+    assert "_uploadAttachmentStaged(file, mime, localId).catch" in add_body
+    assert add_body.rstrip().endswith("return true;\n  }")
 
 
 def test_chat_usage_slash_commands_call_usage_rpcs() -> None:

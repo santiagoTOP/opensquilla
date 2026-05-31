@@ -15,7 +15,11 @@ from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.start_turn import start_turn_via_runtime
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
-from opensquilla.gateway.input_normalization import normalize_incoming_text
+from opensquilla.gateway.input_normalization import (
+    infer_normalized_input_from_attachments,
+    materialize_generated_text_attachments,
+    normalize_incoming_text,
+)
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_services import (
@@ -880,6 +884,34 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
     )
     message_text = ingested_attachments.text
     raw_attachments = ingested_attachments.attachments
+    inferred_normalized_input = None
+    if normalized_input.metadata.get("guard_action") == "none":
+        inferred_normalized_input = infer_normalized_input_from_attachments(
+            message_text,
+            raw_attachments,
+        )
+        if inferred_normalized_input is not None:
+            message_text = inferred_normalized_input.message_text
+            semantic_message_text = inferred_normalized_input.semantic_message
+
+    normalization_metadata = (
+        normalized_input.metadata
+        if normalized_input.metadata.get("guard_action") != "none"
+        else (
+            inferred_normalized_input.metadata
+            if inferred_normalized_input is not None
+            and inferred_normalized_input.metadata.get("guard_action") != "none"
+            else None
+        )
+    )
+    if normalization_metadata is not None:
+        raw_attachments = materialize_generated_text_attachments(
+            raw_attachments,
+            media_root=media_root,
+            session_id=session_id,
+            normalization_metadata=normalization_metadata,
+            disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
+        )
     # Evict consumed uuids only after the turn is accepted.
     _consumed_file_uuids: list[str] = list(ingested_attachments.consumed_file_uuids)
     from opensquilla.session.models import SessionIntent
@@ -957,8 +989,8 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
         input_provenance = dict(input_provenance)
     else:
         input_provenance = dict(route_envelope.input_provenance)
-    if normalized_input.metadata.get("guard_action") != "none":
-        input_provenance["input_normalization"] = normalized_input.metadata
+    if normalization_metadata is not None:
+        input_provenance["input_normalization"] = normalization_metadata
     if input_provenance != route_envelope.input_provenance:
         route_envelope = replace(
             route_envelope,
@@ -971,9 +1003,13 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
     # tear the append and leak an orphan user turn into the cleared transcript.
     _persist_lock = get_session_lock(ctx.turn_runner, key)
     persisted_entry: Any = None
+    fresh_user_session = False
 
     async def _persist_user_message() -> None:
-        nonlocal message_text, persisted_entry
+        nonlocal message_text, persisted_entry, fresh_user_session
+        get_transcript = getattr(ctx.session_manager, "get_transcript", None)
+        if callable(get_transcript):
+            fresh_user_session = not bool(await get_transcript(key))
         if raw_attachments:
             from opensquilla.gateway.transcripts import (
                 build_transcript_attachment_envelope,
@@ -1054,6 +1090,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 no_memory_capture=bool(capture_controls["no_memory_capture"]),
                 semantic_message=semantic_message_text,
                 persisted_user_message_id=getattr(persisted_entry, "message_id", None),
+                fresh_user_session=fresh_user_session,
             )
         except Exception as exc:
             # Ensure the uuid eviction does NOT fire on this
@@ -1191,6 +1228,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 run_kind=run_kind,
                 no_memory_capture=capture_controls["no_memory_capture"],
                 semantic_message=semantic_message_text,
+                fresh_user_session=fresh_user_session,
             )
             stream_idle_timeout = _optional_positive_timeout(
                 ctx.config, "agent_stream_idle_timeout_seconds", 600.0

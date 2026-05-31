@@ -18,6 +18,7 @@ from opensquilla.gateway.boot import (
     _warn_workspace_state_mismatch,
     build_flush_service,
     build_services,
+    build_task_runtime_run_kwargs,
     dispatch_task_runtime_turn,
     emit_skill_filter_banner,
     validate_squilla_router_runtime,
@@ -57,6 +58,23 @@ def test_task_runtime_hard_deadline_honors_explicit_config() -> None:
     config.task_runtime.turn_hard_deadline_s = 12.5
 
     assert _task_runtime_turn_hard_deadline_s(config) == 12.5
+
+
+def test_build_task_runtime_run_kwargs_forwards_fresh_user_session() -> None:
+    run = SimpleNamespace(
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=True,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["fresh_user_session"] is True
 
 
 def test_gateway_stream_timeouts_allow_long_silent_agent_work() -> None:

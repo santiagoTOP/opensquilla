@@ -645,6 +645,493 @@ def test_chat_topbar_one_row_layout_in_real_browser(tmp_path: Path) -> None:
     assert all(item["themeAfterClick"] in {"dark", "light"} for item in payload["layouts"])
 
 
+def test_chat_slash_menu_aligns_with_composer_in_real_browser(tmp_path: Path) -> None:
+    if os.environ.get("OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E") != "1":
+        pytest.skip("set OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E=1 to run chat browser e2e")
+
+    port = _free_port()
+    server_script = tmp_path / "webui_chat_slash_server.py"
+    browser_script = tmp_path / "webui_chat_slash_browser.js"
+    server_script.write_text(
+        textwrap.dedent(
+            f"""
+            import uvicorn
+
+            from opensquilla.gateway.app import create_gateway_app
+            from opensquilla.gateway.config import AuthConfig, GatewayConfig
+
+            config = GatewayConfig(
+                host="127.0.0.1",
+                port={port},
+                auth=AuthConfig(mode="none"),
+            )
+            app = create_gateway_app(config)
+
+            if __name__ == "__main__":
+                uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
+            """
+        ),
+        encoding="utf-8",
+    )
+    browser_script.write_text(
+        textwrap.dedent(
+            r"""
+            const { chromium } = require("playwright");
+
+            async function waitRpc(page) {
+              await page.waitForFunction(
+                () =>
+                  typeof App !== "undefined" &&
+                  App.getRpc &&
+                  App.getRpc()?.state === "connected",
+                { timeout: 15000 }
+              );
+            }
+
+            async function installMocks(page) {
+              await page.evaluate(() => {
+                const rpc = App.getRpc();
+                const originalCall = rpc.call.bind(rpc);
+                rpc.call = (method, params = {}) => {
+                  if (method === "tools.search_provider") {
+                    return Promise.resolve({ provider: "none" });
+                  }
+                  if (method === "config.get") {
+                    return Promise.resolve({
+                      permissions: { default_mode: "ask" },
+                      squilla_router: { enabled: true, rollout_phase: "full", tiers: {} },
+                    });
+                  }
+                  if (method === "chat.history") {
+                    return Promise.resolve({
+                      messages: [],
+                      history_scope: "complete",
+                      has_more: false,
+                    });
+                  }
+                  if (method === "sessions.messages.subscribe") {
+                    return Promise.resolve({
+                      subscribed: true,
+                      key: params.key,
+                      current_stream_seq: 0,
+                      replay_complete: true,
+                      replayed_count: 0,
+                      run_status: "idle",
+                    });
+                  }
+                  if (method === "commands.list_for_surface") {
+                    return Promise.resolve({
+                      commands: [
+                        {
+                          name: "/compact",
+                          description: [
+                            "Compact older context in the current session with an intentionally",
+                            "long command description that must truncate instead of stretching",
+                            "the composer tray.",
+                          ].join(" "),
+                          execution: { action: "sessions.contextCompact" },
+                        },
+                      ],
+                    });
+                  }
+                  if (method === "sessions.contextCompact") {
+                    return Promise.resolve({ compacted: false, reason: "no_entries" });
+                  }
+                  return originalCall(method, params);
+                };
+              });
+            }
+
+            async function openChat(page, viewport) {
+              await page.setViewportSize({ width: viewport.width, height: viewport.height });
+              await page.goto(process.env.TARGET_URL, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+              await waitRpc(page);
+              await installMocks(page);
+              await page.evaluate(() =>
+                Router.navigate("/chat?session=agent:main:webchat:slash-layout")
+              );
+              await page.waitForSelector("#chat-textarea", { timeout: 15000 });
+              await page.locator("#chat-textarea").fill("/compact");
+              await page.waitForSelector(".chat-slash:not(.hidden)", { timeout: 5000 });
+              await page.waitForTimeout(80);
+            }
+
+            async function measure(page, viewport) {
+              await openChat(page, viewport);
+              const layout = await page.evaluate(() => {
+                const box = (selector) => {
+                  const el = document.querySelector(selector);
+                  const r = el.getBoundingClientRect();
+                  return {
+                    left: r.left,
+                    right: r.right,
+                    width: r.width,
+                    height: r.height,
+                    visible:
+                      r.width > 0 &&
+                      r.height > 0 &&
+                      getComputedStyle(el).display !== "none" &&
+                      getComputedStyle(el).visibility !== "hidden",
+                  };
+                };
+                const desc = document.querySelector(".chat-slash-desc");
+                const slash = document.querySelector(".chat-slash");
+                const input = document.querySelector(".chat-input-bar");
+                return {
+                  width: window.innerWidth,
+                  scrollWidth: document.documentElement.scrollWidth,
+                  slash: box(".chat-slash"),
+                  input: box(".chat-input-bar"),
+                  composer: box("#chat-composer"),
+                  attach: box("#chat-btn-attach"),
+                  newChat: box("#chat-btn-new"),
+                  exportButton: box("#chat-btn-export"),
+                  send: box("#chat-btn-send"),
+                  slashParentId: slash?.parentElement?.id || "",
+                  slashBeforeInput: !!(
+                    slash &&
+                    input &&
+                    slash.compareDocumentPosition(input) &
+                      Node.DOCUMENT_POSITION_FOLLOWING
+                  ),
+                  descClientWidth: desc ? desc.clientWidth : 0,
+                  descScrollWidth: desc ? desc.scrollWidth : 0,
+                };
+              });
+
+              await page.locator("#chat-textarea").press("ArrowDown");
+              const afterArrow = await page.locator(".chat-slash:not(.hidden)").count();
+              await page.locator("#chat-textarea").press("Escape");
+              const afterEscape = await page.locator(".chat-slash:not(.hidden)").count();
+              await page.locator("#chat-textarea").fill("/compact");
+              await page.waitForSelector(".chat-slash:not(.hidden)", { timeout: 5000 });
+              await page.locator("#chat-textarea").press("Enter");
+              await page.waitForFunction(
+                () => document.querySelector("#chat-textarea").value === ""
+              );
+              const afterEnterValue = await page.locator("#chat-textarea").inputValue();
+
+              return {
+                name: viewport.name,
+                layout,
+                afterArrow,
+                afterEscape,
+                afterEnterValue,
+              };
+            }
+
+            (async () => {
+              const browser = await chromium.launch({ headless: true });
+              const page = await browser.newPage();
+              const errors = [];
+              page.on("pageerror", err => errors.push(String(err)));
+              const viewports = [
+                { name: "desktop", width: 1365, height: 768 },
+                { name: "wide", width: 2048, height: 900 },
+                { name: "mobile", width: 390, height: 844 },
+              ];
+              const layouts = [];
+              for (const viewport of viewports) layouts.push(await measure(page, viewport));
+              await browser.close();
+              console.log(JSON.stringify({ layouts, pageErrors: errors }));
+            })().catch(err => {
+              console.error(err && err.stack ? err.stack : String(err));
+              process.exit(1);
+            });
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["OPENSQUILLA_STATE_DIR"] = str(tmp_path / "state")
+    env["OPENSQUILLA_LOG_DIR"] = str(tmp_path / "logs")
+    server = subprocess.Popen(
+        [sys.executable, str(server_script)],
+        cwd=Path.cwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        _wait_for_health(port, server)
+        _install_playwright(tmp_path)
+        result = subprocess.run(
+            [_node(), str(browser_script)],
+            cwd=tmp_path,
+            env=dict(env, TARGET_URL=f"http://127.0.0.1:{port}/control/"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    finally:
+        _stop_process(server)
+
+    assert payload["pageErrors"] == []
+    layouts = {item["name"]: item for item in payload["layouts"]}
+    for name, item in layouts.items():
+        layout = item["layout"]
+        assert layout["scrollWidth"] <= layout["width"], (name, layout)
+        assert layout["slash"]["visible"], (name, layout)
+        assert layout["slashParentId"] == "chat-composer", (name, layout)
+        assert layout["slashBeforeInput"] is True, (name, layout)
+        if name == "mobile":
+            assert layout["slash"]["left"] >= layout["composer"]["left"], (name, layout)
+            assert layout["slash"]["right"] <= layout["composer"]["right"], (name, layout)
+        else:
+            assert abs(layout["slash"]["left"] - layout["input"]["left"]) <= 1, (name, layout)
+            assert abs(layout["slash"]["right"] - layout["input"]["right"]) <= 1, (name, layout)
+        assert layout["descScrollWidth"] > layout["descClientWidth"], (name, layout)
+        assert item["afterArrow"] == 1, item
+        assert item["afterEscape"] == 0, item
+        assert item["afterEnterValue"] == "", item
+        assert layout["attach"]["visible"], (name, layout)
+        assert layout["newChat"]["visible"], (name, layout)
+        assert layout["send"]["visible"], (name, layout)
+
+    assert layouts["desktop"]["layout"]["slash"]["width"] < 1000
+    assert layouts["wide"]["layout"]["slash"]["width"] < 1000
+    assert layouts["mobile"]["layout"]["exportButton"]["visible"] is False
+
+
+def test_chat_tool_result_full_view_handles_large_payloads_in_real_browser(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E") != "1":
+        pytest.skip("set OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E=1 to run chat browser e2e")
+
+    port = _free_port()
+    server_script = tmp_path / "webui_chat_tool_result_server.py"
+    browser_script = tmp_path / "webui_chat_tool_result_browser.js"
+    server_script.write_text(
+        textwrap.dedent(
+            f"""
+            import uvicorn
+
+            from opensquilla.gateway.app import create_gateway_app
+            from opensquilla.gateway.config import AuthConfig, GatewayConfig
+
+            config = GatewayConfig(
+                host="127.0.0.1",
+                port={port},
+                auth=AuthConfig(mode="none"),
+            )
+            app = create_gateway_app(config)
+
+            if __name__ == "__main__":
+                uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
+            """
+        ),
+        encoding="utf-8",
+    )
+    browser_script.write_text(
+        textwrap.dedent(
+            r"""
+            const { chromium } = require("playwright");
+
+            async function waitRpc(page) {
+              await page.waitForFunction(
+                () =>
+                  typeof App !== "undefined" &&
+                  App.getRpc &&
+                  App.getRpc()?.state === "connected",
+                { timeout: 15000 }
+              );
+            }
+
+            async function installMocks(page) {
+              await page.evaluate(() => {
+                const rpc = App.getRpc();
+                const originalCall = rpc.call.bind(rpc);
+                rpc.call = (method, params = {}) => {
+                  if (method === "tools.search_provider") {
+                    return Promise.resolve({ provider: "none" });
+                  }
+                  if (method === "config.get") {
+                    return Promise.resolve({
+                      permissions: { default_mode: "ask" },
+                      squilla_router: { enabled: true, rollout_phase: "full", tiers: {} },
+                    });
+                  }
+                  if (method === "chat.history") {
+                    const longOutput = [
+                      "labubu-1.jpg -> 1788872 chars base64",
+                      "labubu-2.jpg -> 836304 chars base64",
+                      "labubu-3.jpg -> 2109592 chars base64",
+                      "single-unbroken-token-" + "x".repeat(1800),
+                    ].join("\\n");
+                    return Promise.resolve({
+                      messages: [
+                        {
+                          role: "assistant",
+                          text: "",
+                          timestamp: "2026-05-31T00:00:00Z",
+                          tool_calls: [
+                            {
+                              type: "tool_use",
+                              name: "execute_code",
+                              tool_use_id: "tool-large-result",
+                              input: { code: "print_large_payload()" },
+                            },
+                            {
+                              type: "tool_result",
+                              tool_use_id: "tool-large-result",
+                              result: {
+                                exit_code: 0,
+                                stdout: longOutput,
+                                stderr: "",
+                                timed_out: false,
+                                elapsed_ms: 213,
+                              },
+                            },
+                          ],
+                        },
+                      ],
+                      history_scope: "complete",
+                      has_more: false,
+                    });
+                  }
+                  if (method === "sessions.messages.subscribe") {
+                    return Promise.resolve({
+                      subscribed: true,
+                      key: params.key,
+                      current_stream_seq: 0,
+                      replay_complete: true,
+                      replayed_count: 0,
+                      run_status: "idle",
+                    });
+                  }
+                  return originalCall(method, params);
+                };
+              });
+            }
+
+            async function measure(page, viewport) {
+              await page.setViewportSize({ width: viewport.width, height: viewport.height });
+              await page.goto(process.env.TARGET_URL, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+              await waitRpc(page);
+              await installMocks(page);
+              await page.evaluate(() =>
+                Router.navigate("/chat?session=agent:main:webchat:tool-result-full")
+              );
+              await page.waitForSelector(".chat-tools-summary", { timeout: 15000 });
+              await page.locator(".chat-tools-summary").first().click();
+              await page.waitForSelector(".chat-tool-view-btn", {
+                state: "visible",
+                timeout: 5000,
+              });
+              await page.locator(".chat-tool-view-btn").first().click();
+              await page.waitForSelector(".modal .chat-tool-result-full", { timeout: 5000 });
+              const layout = await page.evaluate(() => {
+                const rect = (selector) => {
+                  const el = document.querySelector(selector);
+                  const r = el.getBoundingClientRect();
+                  return {
+                    left: r.left,
+                    right: r.right,
+                    top: r.top,
+                    bottom: r.bottom,
+                    width: r.width,
+                    height: r.height,
+                  };
+                };
+                const pre = document.querySelector(".chat-tool-result-full");
+                const button = document.querySelector(".chat-tool-view-btn");
+                return {
+                  width: window.innerWidth,
+                  scrollWidth: document.documentElement.scrollWidth,
+                  modal: rect(".modal"),
+                  pre: rect(".chat-tool-result-full"),
+                  preScrollWidth: pre.scrollWidth,
+                  preClientWidth: pre.clientWidth,
+                  buttonType: button ? button.getAttribute("type") : "",
+                  text: pre ? pre.textContent.slice(0, 80) : "",
+                };
+              });
+              await page.locator(".modal-foot button", { hasText: "Close" }).click();
+              await page.waitForSelector(".modal-backdrop", { state: "detached", timeout: 5000 });
+              const afterClose = await page.locator(".modal-backdrop").count();
+              return { name: viewport.name, layout, afterClose };
+            }
+
+            (async () => {
+              const browser = await chromium.launch({ headless: true });
+              const page = await browser.newPage();
+              const errors = [];
+              page.on("pageerror", err => errors.push(String(err)));
+              const viewports = [
+                { name: "desktop", width: 1365, height: 768 },
+                { name: "mobile", width: 390, height: 844 },
+              ];
+              const layouts = [];
+              for (const viewport of viewports) layouts.push(await measure(page, viewport));
+              await browser.close();
+              console.log(JSON.stringify({ layouts, pageErrors: errors }));
+            })().catch(err => {
+              console.error(err && err.stack ? err.stack : String(err));
+              process.exit(1);
+            });
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["OPENSQUILLA_STATE_DIR"] = str(tmp_path / "state")
+    env["OPENSQUILLA_LOG_DIR"] = str(tmp_path / "logs")
+    server = subprocess.Popen(
+        [sys.executable, str(server_script)],
+        cwd=Path.cwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        _wait_for_health(port, server)
+        _install_playwright(tmp_path)
+        result = subprocess.run(
+            [_node(), str(browser_script)],
+            cwd=tmp_path,
+            env=dict(env, TARGET_URL=f"http://127.0.0.1:{port}/control/"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    finally:
+        _stop_process(server)
+
+    assert payload["pageErrors"] == []
+    layouts = {item["name"]: item for item in payload["layouts"]}
+    for name, item in layouts.items():
+        layout = item["layout"]
+        assert item["afterClose"] == 0, item
+        assert layout["scrollWidth"] <= layout["width"], (name, layout)
+        assert layout["buttonType"] == "button", (name, layout)
+        assert "labubu-1.jpg" in layout["text"], (name, layout)
+        assert layout["modal"]["left"] >= 0, (name, layout)
+        assert layout["modal"]["right"] <= layout["width"], (name, layout)
+        assert layout["pre"]["right"] <= layout["modal"]["right"], (name, layout)
+        assert layout["preScrollWidth"] <= layout["preClientWidth"] + 2, (name, layout)
+
+
 def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
     tmp_path: Path,
 ) -> None:
@@ -1735,6 +2222,173 @@ def test_webchat_large_paste_auto_attaches_text_in_real_browser(tmp_path: Path) 
     assert payload["bubbleHasPlaceholder"] is True, payload
     assert payload["bubbleHasLongRawPaste"] is False, payload
     assert payload["attachmentChipHasGeneratedName"] is True, payload
+    assert payload["pageErrors"] == [], payload
+
+
+def test_image_paste_consumes_attachment_without_inserting_wsl_path_text_in_real_browser(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E") != "1":
+        pytest.skip("set OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E=1 to run chat browser e2e")
+
+    port = _free_port()
+    server_script = tmp_path / "webui_image_paste_server.py"
+    browser_script = tmp_path / "webui_image_paste_browser.js"
+    server_script.write_text(
+        textwrap.dedent(
+            f"""
+            import uvicorn
+
+            from opensquilla.gateway.app import create_gateway_app
+            from opensquilla.gateway.config import AuthConfig, GatewayConfig
+
+            config = GatewayConfig(
+                host="127.0.0.1",
+                port={port},
+                auth=AuthConfig(mode="none"),
+            )
+            app = create_gateway_app(config)
+
+            if __name__ == "__main__":
+                uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
+            """
+        ),
+        encoding="utf-8",
+    )
+    browser_script.write_text(
+        textwrap.dedent(
+            r"""
+            const { chromium } = require("playwright");
+
+            async function waitRpc(page) {
+              await page.waitForFunction(
+                () =>
+                  typeof App !== "undefined" &&
+                  App.getRpc &&
+                  App.getRpc()?.state === "connected",
+                { timeout: 15000 }
+              );
+            }
+
+            async function dispatchSyntheticPaste(page, { includeImage, text }) {
+              return await page.evaluate(async ({ includeImage, text }) => {
+                const textarea = document.querySelector("#chat-textarea");
+                const items = [];
+                if (includeImage) {
+                  const b64 =
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lHE7+QAAAABJRU5ErkJggg==";
+                  const bytes = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
+                  const file = new File([bytes], "361d381f.png", { type: "image/png" });
+                  items.push({
+                    type: "image/png",
+                    getAsFile: () => file,
+                  });
+                }
+                items.push({
+                  type: "text/plain",
+                  getAsFile: () => null,
+                });
+                const event = new Event("paste", { bubbles: true, cancelable: true });
+                Object.defineProperty(event, "clipboardData", {
+                  value: {
+                    items,
+                    getData: type => (type === "text/plain" ? text : ""),
+                  },
+                });
+                document.dispatchEvent(event);
+                if (!event.defaultPrevented) {
+                  textarea.value += text;
+                  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+                return {
+                  defaultPrevented: event.defaultPrevented,
+                  textareaValue: textarea.value,
+                  previewHidden: document.querySelector("#chat-attach-preview")?.classList.contains("hidden"),
+                  attachmentThumbs: document.querySelectorAll("#chat-attach-preview .attachment-thumb").length,
+                  attachmentChips: document.querySelectorAll("#chat-attach-preview .attachment-chip").length,
+                };
+              }, { includeImage, text });
+            }
+
+            (async () => {
+              const browser = await chromium.launch({ headless: true });
+              const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+              const errors = [];
+              page.on("pageerror", err => errors.push(String(err)));
+
+              await page.goto(process.env.TARGET_URL, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+              await page.waitForSelector("#chat-textarea", { timeout: 15000 });
+              await waitRpc(page);
+
+              const wslPath = "/tmp/.wsl-screenshot-cli/361d381f306061eb91d29b48ca876da8ab0ee3374a57bcfaa9212c3b7105858.png";
+              const imagePaste = await dispatchSyntheticPaste(page, {
+                includeImage: true,
+                text: wslPath,
+              });
+
+              await page.locator(".attachment-remove").click();
+              await page.fill("#chat-textarea", "");
+
+              const textOnlyPaste = await dispatchSyntheticPaste(page, {
+                includeImage: false,
+                text: wslPath,
+              });
+
+              await browser.close();
+              console.log(JSON.stringify({
+                imagePaste,
+                textOnlyPaste,
+                pageErrors: errors,
+              }));
+            })().catch(err => {
+              console.error(err && err.stack ? err.stack : String(err));
+              process.exit(1);
+            });
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["OPENSQUILLA_STATE_DIR"] = str(tmp_path / "state")
+    env["OPENSQUILLA_LOG_DIR"] = str(tmp_path / "logs")
+    server = subprocess.Popen(
+        [sys.executable, str(server_script)],
+        cwd=Path.cwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        _wait_for_health(port, server)
+        _install_playwright(tmp_path)
+        result = subprocess.run(
+            [_node(), str(browser_script)],
+            cwd=tmp_path,
+            env=dict(env, TARGET_URL=f"http://127.0.0.1:{port}/control/chat"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    finally:
+        _stop_process(server)
+
+    assert payload["imagePaste"]["defaultPrevented"] is True, payload
+    assert payload["imagePaste"]["textareaValue"] == "", payload
+    assert payload["imagePaste"]["previewHidden"] is False, payload
+    assert payload["imagePaste"]["attachmentThumbs"] == 1, payload
+    assert payload["textOnlyPaste"]["defaultPrevented"] is False, payload
+    assert payload["textOnlyPaste"]["textareaValue"].startswith("/tmp/.wsl-screenshot-cli/"), payload
     assert payload["pageErrors"] == [], payload
 
 

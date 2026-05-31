@@ -94,6 +94,7 @@ class PromptAssemblerPort(Protocol):
         extra_context: dict[str, str] | None,
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
+        fresh_user_session: bool = False,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -226,7 +227,8 @@ class PromptAssemblerStageInput:
     model: str | None
     history_has_persisted_user: bool
     persist_input: bool
-    ingress_pipeline_steps: list[PipelineStepRecord] | None
+    fresh_user_session: bool = False
+    ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     normalization_metadata: dict[str, Any] | None = None
 
 @dataclass(frozen=True)
@@ -350,6 +352,7 @@ class PromptAssemblerStage:
             extra_context=inp.extra_prompt_context,
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=inp.bootstrap_context_mode,
+            fresh_user_session=inp.fresh_user_session,
         )
 
         # 2. Fetch router context (transcript-driven)

@@ -236,6 +236,45 @@ def _strict_read_workspace_root() -> Path | None:
     return Path(ctx.workspace_dir).expanduser().resolve(strict=False)
 
 
+def _strict_read_material_root() -> Path | None:
+    ctx = current_tool_context.get()
+    if (
+        ctx is None
+        or not ctx.workspace_strict
+        or not ctx.artifact_media_root
+        or not ctx.artifact_session_id
+    ):
+        return None
+
+    from opensquilla.attachment_refs import transcript_material_dir
+
+    return transcript_material_dir(
+        Path(ctx.artifact_media_root).expanduser(),
+        ctx.artifact_session_id,
+    ).resolve(strict=False)
+
+
+def _strict_read_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    workspace_root = _strict_read_workspace_root()
+    if workspace_root is not None:
+        roots.append(workspace_root)
+    material_root = _strict_read_material_root()
+    if material_root is not None:
+        roots.append(material_root)
+    return tuple(roots)
+
+
+def _is_within_any_root(candidate: Path, roots: tuple[Path, ...]) -> bool:
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _workspace_strict_read_block(
     tool_name: str,
     resolved: Path,
@@ -243,23 +282,23 @@ def _workspace_strict_read_block(
 ) -> dict[str, object] | None:
     """Return a block envelope when *resolved* escapes the strict workspace."""
 
-    root = _strict_read_workspace_root()
-    if root is None:
+    roots = _strict_read_roots()
+    if not roots:
         return None
     candidate = resolved.expanduser().resolve(strict=False)
-    try:
-        candidate.relative_to(root)
-    except ValueError:
+    if not _is_within_any_root(candidate, roots):
+        root_labels = ", ".join(str(root) for root in roots)
         return {
             "status": "blocked",
             "reason": "workspace_strict",
             "tool": tool_name,
             "path": original_path,
             "resolved_path": str(candidate),
-            "workspace": str(root),
+            "workspace": str(roots[0]),
+            "allowed_roots": [str(root) for root in roots],
             "message": (
-                f"{tool_name} blocked: {candidate} is outside active workspace "
-                f"{root}."
+                f"{tool_name} blocked: {candidate} is outside active read roots "
+                f"({root_labels})."
             ),
             "retryable": False,
         }
@@ -284,17 +323,17 @@ def _workspace_strict_candidate_marker(
     candidate: Path,
     original_path: str | None = None,
     strict_root: Path | None = None,
+    strict_roots: tuple[Path, ...] | None = None,
 ) -> str | None:
     """Return a per-candidate blocked marker for directory/search tools."""
 
-    root = strict_root if strict_root is not None else _strict_read_workspace_root()
-    if root is None:
+    roots = (strict_root,) if strict_root is not None else (strict_roots or _strict_read_roots())
+    if not roots:
         return None
     resolved = candidate.expanduser().resolve(strict=False)
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        return f"[blocked] {candidate}: outside active workspace {root}"
+    if not _is_within_any_root(resolved, roots):
+        root_labels = ", ".join(str(root) for root in roots)
+        return f"[blocked] {candidate}: outside active read roots ({root_labels})"
     return None
 
 
@@ -798,7 +837,7 @@ async def list_dir(path: str) -> str:
         raise NotADirectoryError(f"Not a directory: {path}")
 
     loop = asyncio.get_event_loop()
-    strict_root = _strict_read_workspace_root()
+    strict_roots = _strict_read_roots()
     workspace_root = _workspace_root()
 
     def _list() -> list[str]:
@@ -806,7 +845,11 @@ async def list_dir(path: str) -> str:
         files: list[str] = []
         blocked_entries: list[str] = []
         for entry in sorted(p.iterdir(), key=lambda e: e.name):
-            marker = _workspace_strict_candidate_marker("list_dir", entry, strict_root=strict_root)
+            marker = _workspace_strict_candidate_marker(
+                "list_dir",
+                entry,
+                strict_roots=strict_roots,
+            )
             if marker is not None:
                 blocked_entries.append(marker)
                 continue
@@ -842,7 +885,7 @@ async def glob_search(pattern: str, path: str | None = None) -> str:
     _gate_workspace_strict_read("glob_search", base, path or str(base))
 
     loop = asyncio.get_event_loop()
-    strict_root = _strict_read_workspace_root()
+    strict_roots = _strict_read_roots()
     workspace_root = _workspace_root()
 
     def _glob() -> list[str]:
@@ -851,7 +894,7 @@ async def glob_search(pattern: str, path: str | None = None) -> str:
             marker = _workspace_strict_candidate_marker(
                 "glob_search",
                 candidate,
-                strict_root=strict_root,
+                strict_roots=strict_roots,
             )
             if marker is not None:
                 matches.append(marker)
@@ -894,7 +937,7 @@ async def grep_search(
     _gate_workspace_strict_read("grep_search", base, path or str(base))
 
     loop = asyncio.get_event_loop()
-    strict_root = _strict_read_workspace_root()
+    strict_roots = _strict_read_roots()
     workspace_root = _workspace_root()
 
     def _search() -> list[str]:
@@ -927,7 +970,7 @@ async def grep_search(
                 marker = _workspace_strict_candidate_marker(
                     "grep_search",
                     fp,
-                    strict_root=strict_root,
+                    strict_roots=strict_roots,
                 )
                 if marker is not None:
                     results.append(marker)

@@ -168,6 +168,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
         extra_context: dict[str, str] | None,
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
+        fresh_user_session: bool = False,
     ) -> str | tuple[str, str]:
         return self._runner._assemble_prompt(
             agent_id,
@@ -177,6 +178,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
             extra_context=extra_context,
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=bootstrap_context_mode,
+            fresh_user_session=fresh_user_session,
         )
 
 class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):

@@ -103,6 +103,9 @@ class TaskRun:
     # the ingress surface. Kept off RouteEnvelope.metadata so cached envelopes
     # cannot leak stale one-turn ids into later runtime sends.
     persisted_user_message_id: str | None = None
+    # True when the ingress surface observed an empty user transcript before
+    # persisting this turn's user message.
+    fresh_user_session: bool = False
     # Optional in-process sink for the structured events produced by this
     # specific task's turn stream. Used by channel delivery to mirror the
     # same live text stream that WebUI already receives without changing
@@ -172,6 +175,7 @@ class _RuntimeTask:
     ingress_pipeline_steps: tuple[Any, ...] = ()
     semantic_message: str | None = None
     persisted_user_message_id: str | None = None
+    fresh_user_session: bool = False
     stream_event_sink: TaskStreamEventSink | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_emitted: bool = False
@@ -368,6 +372,7 @@ class TaskRuntime:
         ingress_pipeline_steps: tuple[Any, ...] | list[Any] | None = None,
         semantic_message: str | None = None,
         persisted_user_message_id: str | None = None,
+        fresh_user_session: bool = False,
         stream_event_sink: TaskStreamEventSink | None = None,
         *,
         update_envelope_cache: bool = True,
@@ -422,6 +427,7 @@ class TaskRuntime:
                 "no_memory_capture": no_memory_capture,
                 "metadata": envelope.metadata,
                 "persisted_user_message_id": persisted_user_message_id,
+                "fresh_user_session": fresh_user_session,
             },
         )
         await self._storage.create_agent_task(record)
@@ -436,6 +442,7 @@ class TaskRuntime:
             ingress_pipeline_steps=tuple(ingress_pipeline_steps or ()),
             semantic_message=semantic_message,
             persisted_user_message_id=persisted_user_message_id,
+            fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
         )
         async with self._state_lock:
@@ -834,6 +841,7 @@ class TaskRuntime:
                         ingress_pipeline_steps=task.ingress_pipeline_steps,
                         semantic_message=task.semantic_message,
                         persisted_user_message_id=task.persisted_user_message_id,
+                        fresh_user_session=task.fresh_user_session,
                         stream_event_sink=task.stream_event_sink,
                     )
                     await self._run_turn_handler_with_write_lock_bypass(

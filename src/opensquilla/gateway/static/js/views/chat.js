@@ -1201,9 +1201,9 @@ const ChatView = (() => {
         </div>
         <div class="chat-pending hidden" id="chat-pending"></div>
         <div class="chat-compact-status hidden" id="chat-compact-status" role="status" aria-live="polite"></div>
-        <div class="chat-slash hidden" id="chat-slash"></div>
         <div class="chat-composer" id="chat-composer">
           <div class="chat-attachments hidden" id="chat-attach-preview"></div>
+          <div class="chat-slash hidden" id="chat-slash"></div>
           <div class="chat-input-bar">
             <button class="btn btn--icon btn--ghost" id="chat-btn-attach" title="Attach files: PNG, JPEG, GIF, WEBP, PDF, TXT, MD, HTML, CSV, JSON" aria-label="Attach files">${icons.paperclip()}</button>
             <div class="chat-toolbar-wrap">
@@ -2524,12 +2524,14 @@ const ChatView = (() => {
       if (Router.currentPath() !== '/chat') return;
       const items = e.clipboardData && e.clipboardData.items;
       if (!items) return;
+      let consumedAttachment = false;
       for (let i = 0; i < items.length; i++) {
         if (items[i].type.startsWith('image/')) {
           const file = items[i].getAsFile();
-          if (file) _addAttachment(file);
+          if (file && _addAttachment(file)) consumedAttachment = true;
         }
       }
+      if (consumedAttachment) e.preventDefault();
     };
     document.addEventListener('paste', pasteHandler);
     _unsubs.push(() => document.removeEventListener('paste', pasteHandler));
@@ -7186,6 +7188,21 @@ const ChatView = (() => {
     return !!(status && status.truncated);
   }
 
+  function _toolResultContent(payload) {
+    if (!payload) return '';
+    let raw = '';
+    if (Object.prototype.hasOwnProperty.call(payload, 'result')) {
+      raw = payload.result;
+    } else if (Object.prototype.hasOwnProperty.call(payload, 'content')) {
+      raw = payload.content;
+    } else if (Object.prototype.hasOwnProperty.call(payload, 'output')) {
+      raw = payload.output;
+    }
+    if (typeof raw === 'string') return raw;
+    const rendered = JSON.stringify(raw, null, 2);
+    return rendered == null ? '' : rendered;
+  }
+
   function _memorySearchSourceRows(content) {
     if (!content || typeof content !== 'string') return [];
     const rows = [];
@@ -7251,9 +7268,12 @@ const ChatView = (() => {
     if (content.length > 200) {
       const viewBtn = document.createElement('button');
       viewBtn.className = 'btn btn--sm btn--ghost chat-tool-view-btn';
+      viewBtn.type = 'button';
       viewBtn.textContent = 'View full';
-      viewBtn.addEventListener('click', () => {
-        UI.modal('Tool Result', '<pre style="white-space:pre-wrap;max-height:60vh;overflow:auto;font-size:var(--fs-sm)">' + _esc(content) + '</pre>', [
+      viewBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        UI.modal('Tool Result', '<pre class="chat-tool-result-full">' + _esc(content) + '</pre>', [
           { label: 'Close', cls: 'btn-secondary' },
         ]);
       });
@@ -7344,8 +7364,7 @@ const ChatView = (() => {
       return;
     }
 
-    const raw = payload.result || payload.content || payload.output || '';
-    const content = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+    const content = _toolResultContent(payload);
     const isError = _toolResultIsError(payload);
     const toolId = payload.tool_use_id || '';
     let toolName = payload.name || payload.tool_name || '';
@@ -7837,7 +7856,7 @@ const ChatView = (() => {
         } else if (seg.type === 'tool_result') {
           const toolId = seg.tool_use_id || '';
           const isError = _toolResultIsError(seg);
-          const content = seg.result || '';
+          const content = _toolResultContent(seg);
           const resultToolName = seg.name || _toolNameById[toolId] || '';
           if (_isControlPlaneToolName(resultToolName)) continue;
 
@@ -8174,12 +8193,12 @@ const ChatView = (() => {
     const mime = _resolveAttachmentMime(file);
     if (!_isAllowedAttachmentMime(mime)) {
       UI.toast(`Unsupported file: ${file.name || 'attachment'} (${mime}). Allowed: ${ATTACHMENT_ALLOWED_LABEL}`, 'warn', 4500);
-      return;
+      return false;
     }
     const hardCap = _attachmentHardCapBytes(mime);
     if (file.size > hardCap) {
       UI.toast(`File too large: ${file.name || 'attachment'} (max ${Math.round(hardCap / 1024 / 1024)} MB)`, 'warn');
-      return;
+      return false;
     }
 
     const localId = _nextAttachmentId++;
@@ -8218,7 +8237,7 @@ const ChatView = (() => {
         UI.toast(`Could not read file: ${file.name || 'attachment'}`, 'warn');
       };
       reader.readAsDataURL(file);
-      return;
+      return true;
     }
 
     if (!_canStageAttachmentMime(mime)) {
@@ -8227,7 +8246,7 @@ const ChatView = (() => {
         'warn',
         4500,
       );
-      return;
+      return false;
     }
 
     _pendingAttachments.push({
@@ -8242,6 +8261,7 @@ const ChatView = (() => {
       _removeAttachmentByLocalId(localId);
       UI.toast(`Upload failed for ${file.name || 'attachment'}: ${err && err.message || err}`, 'warn', 4500);
     });
+    return true;
   }
 
   async function _uploadAttachmentStaged(file, mime, localId) {
