@@ -86,7 +86,6 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `meta-job-search-pipeline`
 - `meta-kid-project-planner`
 - `meta-paper-write`
-- `meta-safe-skill-installer`
 - `meta-skill-creator`
 - `meta-web-research-to-report`
 - `multi-search-engine`

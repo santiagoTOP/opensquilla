@@ -25,7 +25,6 @@ ORIGINALS = {
     "meta-job-search-pipeline",
     "meta-kid-project-planner",
     "meta-paper-write",
-    "meta-safe-skill-installer",
     "meta-skill-creator",
     "meta-web-research-to-report",
     "multi-search-engine",

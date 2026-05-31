@@ -44,7 +44,6 @@ def test_list_meta_specs_includes_known_meta_bundles(loader: SkillLoader) -> Non
         "meta-job-search-pipeline",
         "meta-kid-project-planner",
         "meta-paper-write",
-        "meta-safe-skill-installer",
         "meta-skill-creator",
         "meta-web-research-to-report",
     }
