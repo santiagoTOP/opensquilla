@@ -217,7 +217,7 @@ class LlmProviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_LLM_")
 
     provider: str = "openrouter"
-    model: str = "deepseek/deepseek-v4-flash"
+    model: str = "deepseek/deepseek-v4-pro"
     api_key: str = ""
     api_key_env: str = ""
     base_url: str = "https://openrouter.ai/api/v1"
@@ -546,7 +546,7 @@ def _default_tiers() -> dict:
         },
         "t1": {
             "provider": "openrouter",
-            "model": "deepseek/deepseek-v4-flash",
+            "model": "deepseek/deepseek-v4-pro",
             "description": (
                 "M tier: default balanced text model for normal agent work, coding assistance, "
                 "debugging, and moderate analysis"

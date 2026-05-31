@@ -55,7 +55,7 @@ def test_onboard_noninteractive_provider(tmp_path, monkeypatch):
     assert "openrouter ·" not in result.stdout
     assert "OpenSquilla Setup Handoff" in result.stdout
     assert "Provider Configured" not in result.stdout
-    assert "LLM: openrouter / deepseek/deepseek-v4-flash" in result.stdout
+    assert "LLM: openrouter / deepseek/deepseek-v4-pro" in result.stdout
 
 
 def test_onboard_finish_commands_remain_copyable_with_long_config_path(
@@ -829,7 +829,7 @@ def test_onboard_catalog_accepts_short_capability_section_aliases(
 @pytest.mark.parametrize(
     ("section", "expected"),
     [
-        ("providers", ["openrouter", "OPENROUTER_API_KEY", "deepseek/deepseek-v4-flash"]),
+        ("providers", ["openrouter", "OPENROUTER_API_KEY", "deepseek/deepseek-v4-pro"]),
         ("router", ["recommended", "openrouter-mix", "t0", "t3"]),
         ("search", ["duckduckgo", "brave", "BRAVE_SEARCH_API_KEY"]),
         ("channels", ["discord", "Bot token", "opensquilla channels describe discord --json"]),
@@ -948,7 +948,7 @@ def test_onboard_catalog_focused_provider_examples_match_key_requirements(
     assert result.exit_code == 0, result.stdout
     assert (
         "Try: opensquilla onboard configure provider --provider openrouter "
-        "--model deepseek/deepseek-v4-flash --api-key-env OPENROUTER_API_KEY "
+        "--model deepseek/deepseek-v4-pro --api-key-env OPENROUTER_API_KEY "
         f"--config {_config_arg(target)}"
     ) in result.stdout
     assert (
