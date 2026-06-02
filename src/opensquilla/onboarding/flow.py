@@ -58,7 +58,7 @@ from opensquilla.onboarding.search_specs import (
 )
 from opensquilla.onboarding.setup_paths import web_setup_url
 from opensquilla.onboarding.status import get_onboarding_status
-from opensquilla.squilla_router.tiers import (
+from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     IMAGE_TIER,
     TEXT_TIERS,

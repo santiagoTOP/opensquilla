@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any
 
-from opensquilla.squilla_router.tiers import (
+from opensquilla.router_tiers import (
     normalize_target_id,
     normalize_tier_mapping,
 )

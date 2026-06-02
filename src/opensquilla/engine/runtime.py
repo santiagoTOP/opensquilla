@@ -150,6 +150,7 @@ from opensquilla.router_control import (
     RouterControlHoldStore,
     render_router_control_prompt_block,
 )
+from opensquilla.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -183,7 +184,6 @@ from opensquilla.session.keys import (
     normalize_agent_id,
 )
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
-from opensquilla.squilla_router.tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
 from opensquilla.tools.types import CallerKind, ToolContext
 
 if TYPE_CHECKING:

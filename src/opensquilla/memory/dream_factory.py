@@ -9,7 +9,7 @@ from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.memory.dream import Dream
-from opensquilla.squilla_router.tiers import DEFAULT_TEXT_TIER, normalize_text_tier
+from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
 
 
 def _router_model_routing_enabled(router_cfg: Any | None) -> bool:

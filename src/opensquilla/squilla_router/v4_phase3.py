@@ -13,11 +13,11 @@ from typing import Any
 import structlog
 import yaml
 
-from opensquilla.squilla_router.controller import TIER_ORDER, select_localized_prompt_hint
-from opensquilla.squilla_router.tiers import (
+from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     ROUTE_CLASS_TO_TIER,
 )
+from opensquilla.squilla_router.controller import TIER_ORDER, select_localized_prompt_hint
 
 log = structlog.get_logger(__name__)
 

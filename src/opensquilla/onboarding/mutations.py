@@ -32,12 +32,12 @@ from opensquilla.onboarding.redaction import (
     redact_search_payload,
 )
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
-from opensquilla.secrets import clean_header_secret
-from opensquilla.squilla_router.tiers import (
+from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     TEXT_TIERS,
     normalize_text_tier,
 )
+from opensquilla.secrets import clean_header_secret
 
 SearchFallbackPolicy = Literal["off", "network"]
 RouterMode = Literal["recommended", "openrouter-mix", "disabled"]

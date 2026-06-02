@@ -6,7 +6,7 @@ from typing import Any, cast
 
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.types import RouterDecisionEvent
-from opensquilla.squilla_router.tiers import normalize_text_tier, tier_index
+from opensquilla.router_tiers import normalize_text_tier, tier_index
 
 
 def _coerce_probs(value: object) -> list[float]:

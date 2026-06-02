@@ -20,6 +20,13 @@ from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import lookup_price
 from opensquilla.provider.context_capabilities import provider_state_continuity_diagnostic
 from opensquilla.router_control import RouterControlHoldStore
+from opensquilla.router_tiers import (
+    DEFAULT_TEXT_TIER,
+    HIGHEST_TEXT_TIER,
+    ROUTE_CLASS_TO_TIER,
+    TIER_TO_ROUTE_CLASS,
+    normalize_text_tier,
+)
 from opensquilla.squilla_router.controller import (
     derive_prompt_policy,
     derive_thinking_mode,
@@ -27,13 +34,6 @@ from opensquilla.squilla_router.controller import (
     normalize_decisions,
     synthetic_one_hot,
     thinking_mode_to_level,
-)
-from opensquilla.squilla_router.tiers import (
-    DEFAULT_TEXT_TIER,
-    HIGHEST_TEXT_TIER,
-    ROUTE_CLASS_TO_TIER,
-    TIER_TO_ROUTE_CLASS,
-    normalize_text_tier,
 )
 
 log = structlog.get_logger(__name__)

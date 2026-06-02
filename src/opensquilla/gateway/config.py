@@ -27,12 +27,12 @@ from opensquilla.gateway.config_migration import (
     migrate_config_payload,
 )
 from opensquilla.paths import default_opensquilla_home
-from opensquilla.sandbox.config import SandboxSettings
-from opensquilla.squilla_router.tiers import (
+from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     normalize_text_tier,
     normalize_tier_mapping,
 )
+from opensquilla.sandbox.config import SandboxSettings
 
 
 class ContextOverflowPolicy(StrEnum):

@@ -1,4 +1,4 @@
-"""Canonical Squilla router tier identifiers and legacy aliases."""
+"""Canonical router tier identifiers and legacy aliases."""
 
 from __future__ import annotations
 
@@ -89,4 +89,3 @@ def tier_index(value: object) -> int:
         return TEXT_TIERS.index(tier)
     except ValueError:
         return -1
-

@@ -9,7 +9,7 @@ from opensquilla.gateway.config import (
     ROUTER_TIER_PROFILE_IDS,
     _router_tier_profile_defaults,
 )
-from opensquilla.squilla_router.tiers import DEFAULT_TEXT_TIER, TEXT_TIERS
+from opensquilla.router_tiers import DEFAULT_TEXT_TIER, TEXT_TIERS
 
 
 @dataclass(frozen=True)

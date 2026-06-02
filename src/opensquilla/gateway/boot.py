@@ -2485,7 +2485,7 @@ async def start_gateway_server(
             provider_selector = svc.provider_selector
             router_cfg = getattr(config, "squilla_router", None)
             tiers = getattr(router_cfg, "tiers", {}) if router_cfg is not None else {}
-            from opensquilla.squilla_router.tiers import HIGHEST_TEXT_TIER
+            from opensquilla.router_tiers import HIGHEST_TEXT_TIER
 
             t3_tier = tiers.get(HIGHEST_TEXT_TIER) if isinstance(tiers, dict) else None
             t3_model = ""
