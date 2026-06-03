@@ -82,7 +82,7 @@ def test_chat_day_separator_stays_on_centered_chat_axis() -> None:
     assert "margin: var(--sp-2) auto;" in block
 
 
-def test_chat_user_bubble_short_text_is_vertically_centered() -> None:
+def test_chat_user_bubble_text_uses_reading_direction_alignment() -> None:
     css = CHAT_CSS.read_text(encoding="utf-8")
     start = css.index(".chat-msg--user .chat-msg-text,")
     end = css.index("/* Assistant", start)
@@ -90,7 +90,8 @@ def test_chat_user_bubble_short_text_is_vertically_centered() -> None:
 
     assert "display: flex;" in block
     assert "align-items: center;" in block
-    assert "justify-content: center;" in block
+    assert "justify-content: flex-start;" in block
+    assert "text-align: start;" in block
 
 
 def test_chat_sent_attachment_images_render_as_separate_thumbnail_attachments() -> None:
@@ -138,8 +139,10 @@ def test_chat_user_message_bubbles_preserve_multiline_text() -> None:
 
     assert "white-space: pre-wrap;" in user_block
     assert "overflow-wrap: anywhere;" in user_block
+    assert "text-align: start;" in user_block
     assert "white-space: pre-wrap;" in attachment_text_block
     assert "overflow-wrap: anywhere;" in attachment_text_block
+    assert "text-align: start;" in attachment_text_block
 
 
 def test_chat_non_image_message_attachments_render_download_links_when_data_exists() -> None:
