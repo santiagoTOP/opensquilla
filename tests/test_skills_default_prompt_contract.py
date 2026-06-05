@@ -178,6 +178,14 @@ async def test_default_prompt_only_injects_retained_bundled_skills(
                 "python3": True,
                 "tmux": True,
             },
+            env_cache={
+                "ARK_API_KEY": "set",
+                "BYTEPLUS_API_KEY": "set",
+                "GEMINI_API_KEY": "set",
+                "OPENAI_API_KEY": "set",
+                "OPENROUTER_API_KEY": "set",
+                "VOLC_ARK_API_KEY": "set",
+            },
         ),
     )
     loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
