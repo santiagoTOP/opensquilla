@@ -2,12 +2,12 @@ name: Issue Link Sync
 
 "on":
   pull_request_target:
-    types: [closed]
-    branches: [dev]
+    types: [opened, reopened, edited, closed]
 
 permissions:
   contents: read
   issues: write
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
