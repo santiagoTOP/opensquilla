@@ -8,7 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- OpenTUI preview backend documentation now covers explicit opt-in usage,
+  dependency setup, replay benchmarks, and real-terminal harness evidence.
+
 ### Changed
+
+- Terminal chat documentation now distinguishes the stable Python-native default
+  backend from the opt-in OpenTUI preview backend.
 
 ### Fixed
 

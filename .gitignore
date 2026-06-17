@@ -24,12 +24,6 @@ data/
 .opensquilla/
 benchmarks/
 specs/
-# Public proposals tree: docs/proposals/ overrides global specs/ + plans/
-# ignores so design notes and implementation plans intended for review
-# travel with the repository.
-!docs/proposals/
-!docs/proposals/specs/
-!docs/proposals/plans/
 # Local agent/editor instructions and runtime state.
 AGENTS.md
 !docs/agents.md
@@ -48,7 +42,20 @@ GEMINI.md
 /prd.json
 /progress.txt
 /plans/
+/docs/plans/
+/docs/proposals/
 /docs/superpowers/
+!/docs/superpowers/
+!/docs/superpowers/plans/
+!/docs/superpowers/plans/**
+!/docs/superpowers/specs/
+!/docs/superpowers/specs/2026-05-28-tui-frontend-architecture-design.md
+!/docs/superpowers/specs/2026-05-28-tui-real-terminal-harness-design.md
+!/docs/superpowers/specs/2026-05-29-live-textual-tui-design.md
+!/docs/superpowers/specs/2026-05-30-opentui-tui-protocol-refactor-and-visual-hierarchy-design.md
+!/docs/superpowers/specs/2026-05-31-opentui-fullscreen-conversation-design.md
+!/docs/superpowers/specs/2026-05-30-opentui-footer-tui-design.md
+!/docs/superpowers/specs/2026-06-02-opentui-block-protocol-architecture-design.md
 *.png
 # Brand assets are intentionally tracked: top-level assets/ for branding,
 # and the WebUI static asset path so the gateway page renders the mark.
@@ -75,8 +82,7 @@ opensquilla-webui/dist/
 /tests/_private/
 
 # Maintainer-local design / planning artifacts kept beside the repo but
-# not part of the published source. Move into /docs/proposals/ if/when
-# they are ready for public consumption.
+# not part of the published source.
 /meta-skills.pptx
 /kb-index.xlsx
 
