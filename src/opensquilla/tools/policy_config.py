@@ -143,6 +143,31 @@ class ToolPolicy:
     by_sender: Mapping[str, ToolPolicy] = field(default_factory=dict)
 
 
+# Coding mode (operator toggle): the in-session write tools that let the
+# agent hand-edit a repository. When coding mode is ON these are denied so
+# every code change is forced through the code-task plugin instead. Shell
+# (exec_command/background_process) is intentionally kept so the agent can
+# still LAUNCH code-task.
+CODING_MODE_DENIED_TOOLS: frozenset[str] = frozenset(
+    {
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "execute_code",
+        "git_commit",
+        "create_csv",
+        "create_pdf_report",
+        "create_pptx",
+        "create_xlsx",
+    }
+)
+
+
+def coding_mode_denied_tools(coding_mode: bool) -> frozenset[str]:
+    """Tools to deny while the coding-mode toggle is on (empty when off)."""
+    return CODING_MODE_DENIED_TOOLS if coding_mode else frozenset()
+
+
 def expand_selectors(selectors: frozenset[str], available_tools: frozenset[str]) -> set[str]:
     expanded: set[str] = set()
     for selector in selectors:

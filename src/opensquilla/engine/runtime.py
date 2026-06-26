@@ -3389,6 +3389,24 @@ class TurnRunner:
         session_key: str,
         explicit: float | None = None,
     ) -> float:
+        """Per-iteration timeout, with a coding-mode floor.
+
+        A coding-mode turn delegates to code-task and then blocks in a single
+        long ``process(action="wait")`` (code-task can run ~90 min). The
+        per-iteration watchdog must not clamp that wait, so floor the timeout
+        at 5400s while coding mode is on.
+        """
+        value = self._resolve_agent_iteration_timeout_base(session_key, explicit)
+        skills_cfg = getattr(self._config, "skills", None)
+        if bool(getattr(skills_cfg, "coding_mode", False)) and value < 5400.0:
+            return 5400.0
+        return value
+
+    def _resolve_agent_iteration_timeout_base(
+        self,
+        session_key: str,
+        explicit: float | None = None,
+    ) -> float:
         """Resolve per-iteration timeout for this turn.
 
         Precedence: explicit arg > session config > env > gateway config > default.
@@ -3720,6 +3738,17 @@ class TurnRunner:
                     hard_denied=None,
                 )
             ctx = self._apply_runtime_capability_denies(ctx)
+            # Coding mode (operator toggle ON): deny in-session write tools
+            # so all code changes are forced through the code-task plugin
+            # rather than the agent hand-editing files. Enforced at tool
+            # build + dispatch (ctx.denied_tools is honored by dispatch).
+            from opensquilla.tools.policy_config import coding_mode_denied_tools
+
+            _skills_cfg = getattr(self._config, "skills", None)
+            ctx.denied_tools.update(
+                coding_mode_denied_tools(bool(getattr(_skills_cfg, "coding_mode", False)))
+            )
+            ctx.coding_mode = bool(getattr(_skills_cfg, "coding_mode", False))
             log.debug(
                 "tool_policy.policy_pre",
                 allowed_tool_count=len(self._tool_registry.to_tool_definitions(ctx)),
@@ -4310,6 +4339,7 @@ class TurnRunner:
             apply_prompt_cache,
             apply_squilla_router,
             apply_vision_followup_gate,
+            enforce_coding_mode,
             filter_skills,
             inject_platform_hint,
             inject_subagent_grounding,
@@ -4471,6 +4501,7 @@ class TurnRunner:
                 _bounded_apply_squilla_router,
                 observe_reasoning_hint,
                 meta_resolution,
+                enforce_coding_mode,
                 meta_command_launch,
                 filter_skills,
                 inject_subagent_grounding,

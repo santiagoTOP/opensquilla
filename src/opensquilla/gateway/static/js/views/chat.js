@@ -1262,6 +1262,15 @@ const ChatView = (() => {
                       </label>
                     </div>
                   </div>
+                  <div class="chat-toolbar-row">
+                    <span class="chat-toolbar-row-label">Coding mode</span>
+                    <div class="toggle-switch-wrap" id="pill-codetask-group" title="Lock this session into coding mode: code changes go through code-task. Off makes code-task unavailable.">
+                      <label class="toggle-switch" aria-label="Coding mode">
+                        <input type="checkbox" id="toggle-codetask" />
+                        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                      </label>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1400,6 +1409,23 @@ const ChatView = (() => {
       });
     }
 
+    // Coding-mode toggle — operator-level (persists to config). ON locks the
+    // session into coding mode (code changes go through code-task); OFF makes
+    // code-task unavailable across every skill API.
+    const codetaskToggle = _el.querySelector('#toggle-codetask');
+    if (codetaskToggle) {
+      codetaskToggle.addEventListener('change', async () => {
+        const enabled = codetaskToggle.checked;
+        try {
+          await _rpc.call('config.patch.safe', { patches: { 'skills.coding_mode': enabled } });
+          UI.toast('Coding mode: ' + (enabled ? 'ON' : 'OFF'), 'info');
+        } catch (e) {
+          codetaskToggle.checked = !enabled;  // revert on failure
+          UI.toast('Failed: ' + e.message, 'err');
+        }
+      });
+    }
+
     // Router-fx visualisation toggle — purely client-side (no config write):
     // it only controls whether THIS browser draws the animated grid.
     const routerFxToggle = _el.querySelector('#toggle-router-fx');
@@ -1468,6 +1494,11 @@ const ChatView = (() => {
       const routerFxToggle = _el?.querySelector('#toggle-router-fx');
       if (routerFxToggle) routerFxToggle.checked = _routerFx.enabled;
       if (window.SavingsFX) window.SavingsFX.setEnabled(_routerFx.enabled);
+      // Coding mode: ON reflects skills.coding_mode.
+      const codetaskToggle = _el?.querySelector('#toggle-codetask');
+      if (codetaskToggle) {
+        codetaskToggle.checked = !!(cfg?.skills?.coding_mode);
+      }
       _globalElevatedMode = _normalizeElevatedMode(cfg?.permissions?.default_mode);
       _toolbarState.bypass = _isApprovalBypassMode(_effectiveElevatedMode());
       _updateElevatedPill();

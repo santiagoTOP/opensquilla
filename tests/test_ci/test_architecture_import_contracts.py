@@ -19,6 +19,8 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("channels", "tools"),
     ("cli", "agents"),
     ("cli", "contracts"),
+    # opensquilla swebench CLI drives the contrib SWE-bench harness (lazy import).
+    ("cli", "contrib"),
     ("cli", "dist"),
     ("cli", "engine"),
     ("cli", "gateway"),
