@@ -1,7 +1,8 @@
-﻿# OpenSquilla MetaSkill User Guide
+# OpenSquilla MetaSkill User Guide
 
 MetaSkill lets OpenSquilla move from figuring out complex work from scratch on
-every turn to reusable, triggerable, auditable, and improvable task protocols.
+every turn to reusable, explicitly launchable, auditable, and improvable task
+protocols.
 
 A normal conversation solves one request. A MetaSkill preserves a way of doing
 high-value work.
@@ -55,9 +56,36 @@ MetaSkill provides four main advantages:
 
 - protocolized capability captured in a `SKILL.md` file with `kind: meta` and
   `composition.steps`;
-- triggerable by user intent in natural language;
+- explicit launch through `/meta`, with optional automatic triggering only when
+  `meta_skill.auto_trigger = true`;
 - auditable and replayable step inputs, outputs, status, and results;
 - improvable over time as repeated collaboration patterns become proposals.
+
+## Default Launch Model
+
+MetaSkills are manual-only by default. Use `/meta` to list available workflows
+and `/meta <name>` to run one. This keeps workflow launches deliberate,
+reviewable, and easier to explain.
+
+Web chat and the CLI gateway TUI support both list and run:
+
+```text
+/meta
+/meta meta-kid-project-planner
+```
+
+Channel and standalone CLI surfaces support `/meta` listing only.
+
+To restore the older automatic behavior, set:
+
+```toml
+[meta_skill]
+auto_trigger = true
+```
+
+With `auto_trigger = true`, OpenSquilla may consider MetaSkills during ordinary
+natural-language turns. Leave it off when you want workflows to run only after
+an explicit `/meta <name>` command.
 
 ## User Mental Model
 
@@ -75,12 +103,12 @@ A strong MetaSkill request contains four things:
 Example:
 
 ```text
-Use meta-skill `meta-paper-write`.
+/meta meta-kid-project-planner
 
-I need a compact workshop-paper skeleton, not a generic essay.
-Mark citation and experiment placeholders clearly.
-Separate claims, assumptions, and missing evidence.
-Do not invent completed experiments or verified sources.
+I need a safe weekend project plan, not a generic list of ideas.
+Use only materials that are easy to buy locally.
+Separate adult-only steps from child-safe steps.
+Do not include flames, blades, solvents, or risky chemicals.
 ```
 
 The user defines the target and standard; OpenSquilla organizes the execution.
@@ -121,39 +149,41 @@ Common setup surfaces:
 
 ## Two Ways to Use MetaSkill
 
-### Natural Delegation
+### Default: Explicit Command
 
-Describe the outcome directly:
-
-```text
-Draft a compact research paper skeleton on retrieval-augmented generation for
-customer-support knowledge bases, with citation and experiment placeholders.
-```
-
-OpenSquilla selects the appropriate MetaSkill based on current intent. This is
-best for ordinary usage when the user does not want to remember names. If the
-request is broad or close to another task category, explicit delegation is more
-stable.
-
-### Explicit Delegation
-
-Name the capability:
+Start the workflow with `/meta <name>` and then describe the outcome:
 
 ```text
-Use meta-skill `meta-paper-write`.
+/meta meta-kid-project-planner
 
-Draft a compact research paper skeleton on retrieval-augmented generation for
-customer-support knowledge bases, with citation and experiment placeholders.
+Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
+materials, steps, safety notes, and a simple presentation outline.
 ```
 
-This is best for important, expensive, or easily confused tasks.
+This is the normal 0.4.0 path. It is best for important, expensive, or easily
+confused tasks because the workflow launch is explicit.
+
+### Compatibility: Automatic Triggering
+
+If `meta_skill.auto_trigger = true` is set, OpenSquilla can consider MetaSkills
+from natural-language intent:
+
+```text
+Use meta-skill `meta-kid-project-planner`.
+
+Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
+materials, steps, safety notes, and a simple presentation outline.
+```
+
+This mode is for users who intentionally want the older auto-trigger behavior.
+It is not the default.
 
 ## Low-Cost, High-Quality Request Template
 
 Recommended template:
 
 ```text
-Use meta-skill `<name>`.
+/meta <name>
 
 Outcome:
 Context:
@@ -166,15 +196,17 @@ Do not:
 Example:
 
 ```text
-Use meta-skill `meta-paper-write`.
+/meta meta-kid-project-planner
 
-Outcome: draft a compact workshop-paper skeleton.
-Context: the topic is local-first agent orchestration.
-Decision standard: include section structure, citation plan, and experiment
-placeholders.
-Expected output: a LaTeX-ready outline I can review.
-Constraints: mark unverified citations as placeholders.
-Do not: invent completed experiments or verified sources.
+Outcome: plan a child-safe weekend science project.
+Context: 7-year-old, balcony plants, 20 minutes of activity, ordinary household
+materials only.
+Decision standard: safe, age-appropriate, low mess, and easy to present at
+school.
+Expected output: materials list, adult setup, child steps, safety notes, and a
+presentation outline.
+Constraints: avoid flames, blades, solvents, and risky chemicals.
+Do not: ask the child to do adult-only setup alone.
 ```
 
 Useful constraints:
@@ -186,7 +218,6 @@ Useful constraints:
 - Ask me if a decision depends on missing information.
 
 ## Built-In MetaSkill Usage Patterns
-
 
 ### `meta-kid-project-planner`
 
@@ -204,7 +235,7 @@ Good fit:
 High-quality request:
 
 ```text
-Use meta-skill `meta-kid-project-planner`.
+/meta meta-kid-project-planner
 
 Help my child prepare a second-grade science fair project about plant growth. We
 have beans, paper cups, cotton, water, and a sunny windowsill.
@@ -241,7 +272,7 @@ before asking for a compiled PDF.
 High-quality request:
 
 ```text
-Use meta-skill `meta-paper-write`.
+/meta meta-paper-write
 
 Draft a compact research paper skeleton on retrieval-augmented generation for
 customer-support knowledge bases.
@@ -260,37 +291,6 @@ Keep it compact first. Do not write a full manuscript unless I ask.
 
 Expected result: a paper-shaped deliverable, not a generic essay. Citations
 should not be presented as verified sources unless actually verified.
-
-### `meta-short-drama`
-
-Use for short-drama generation workflows that need script, visual prompts,
-clip assembly, subtitles, and a local video artifact.
-
-Good fit:
-
-- short-drama production request;
-- shot list and image prompt planning;
-- consistent character setup;
-- subtitle burn-in;
-- final local MP4 assembly.
-
-High-quality request:
-
-```text
-Use meta-skill `meta-short-drama`.
-
-Create a five-shot short drama about a delivery rider discovering a hidden note
-inside a returned package. Keep the tone warm and suspenseful.
-
-Give me:
-- shot-by-shot script
-- character identity notes
-- visual prompt plan
-- subtitle-ready dialogue
-- final video artifact if generation is available
-```
-
-Expected result: a production workflow, not just a script idea.
 
 ### `meta-skill-creator`
 
@@ -314,7 +314,7 @@ Poor fit:
 High-quality request:
 
 ```text
-Use meta-skill `meta-skill-creator`.
+/meta meta-skill-creator
 
 Create a new meta-skill for product launch briefs. It should search current
 sources, collect product context, draft a launch memo, generate a DOCX handoff,
@@ -352,6 +352,20 @@ If you only want to analyze a MetaSkill and do not want proposal creation:
 Only analyze. Do not create, assemble, preview, or persist any meta-skill
 proposal.
 ```
+
+## Run Progress Ribbon
+
+While a MetaSkill runs, the WebUI shows a horizontal ribbon at the top
+of the agent reply listing every step in the workflow. The currently
+running chip is highlighted; succeeded steps show ✓, skipped ↷, failed
+✗, and `on_failure` substitutes show ⇄. Click any chip to scroll to
+that step's tool card. If a step fails, the ribbon also surfaces
+"Retry run", "Switch meta-skill", and "Show error detail" actions
+inline.
+
+The ribbon survives disconnects: when the browser reconnects, the gateway
+replays the announce → state → completed events so the ribbon rebuilds
+to the latest state.
 
 ## Reading the Result
 
@@ -421,4 +435,4 @@ For the authoring protocol, read [`../authoring/meta-skills.md`](../authoring/me
 
 ---
 
-[Docs index](../README.md) 路 [Product guide](../../README.product.md) 路 [Improve this page](../contributing-docs.md) 路 [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](../README.md) · [Product guide](../../README.product.md) · [Improve this page](../contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)

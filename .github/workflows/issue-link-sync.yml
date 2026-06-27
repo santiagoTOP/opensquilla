@@ -3,11 +3,11 @@ name: Issue Link Sync
 "on":
   pull_request_target:
     types: [opened, reopened, edited, closed]
+    branches: [main, dev]
 
 permissions:
   contents: read
   issues: write
-  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}

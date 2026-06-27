@@ -22,6 +22,13 @@ and reserve expensive models for work that needs them.
 
 Read: [`features/squilla-router.md`](features/squilla-router.md)
 
+### TUI Frontend
+
+Terminal chat uses a streaming plane for token deltas and a structured UI plane
+for plugin snapshots such as the Router HUD.
+
+Read: [`features/tui-frontend.md`](features/tui-frontend.md)
+
 ### Tool Compression
 
 Large tool outputs are projected into compact provider-visible previews while
@@ -32,7 +39,8 @@ Read: [`features/tool-compression.md`](features/tool-compression.md)
 ### Meta-Skills
 
 Repeatable multi-step workflows can be represented as skills, inspected,
-proposed, replayed, and reused.
+proposed, replayed, and reused. By default, users launch them manually with
+`/meta` and `/meta <name>`.
 
 Read: [`features/meta-skills.md`](features/meta-skills.md) and
 [`features/meta-skill-user-guide.md`](features/meta-skill-user-guide.md)
@@ -129,9 +137,9 @@ Bundled user-facing skills include:
 - `skill-creator`
 
 Retained bundled MetaSkills include `meta-kid-project-planner`,
-`meta-paper-write`, `meta-short-drama`, and `meta-skill-creator`.
-Experimental MetaSkills may exist in development trees, but they are not
-presented as stable built-in product capabilities.
+`meta-paper-write`, `meta-short-drama`, and `meta-skill-creator`. Experimental
+MetaSkills may exist in development trees, but they are not presented as stable
+built-in product capabilities.
 
 Read: [`features/skills.md`](features/skills.md)
 

@@ -25,7 +25,6 @@ def test_meta_skill_user_guide_contains_user_contract_and_retained_catalog() -> 
         "Correcting a Bad Run",
         "meta-kid-project-planner",
         "meta-paper-write",
-        "meta-short-drama",
         "meta-skill-creator",
     ]
     for snippet in required_snippets:

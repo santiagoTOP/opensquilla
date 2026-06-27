@@ -2,6 +2,7 @@ from pathlib import Path
 
 CHAT_JS = Path("src/opensquilla/gateway/static/js/views/chat.js")
 CHAT_CSS = Path("src/opensquilla/gateway/static/css/views/chat.css")
+CHAT_ROUTER_FX_VUE = Path("opensquilla-webui/src/components/chat/RouterFxStrip.vue")
 APP_JS = Path("src/opensquilla/gateway/static/js/app.js")
 RPC_JS = Path("src/opensquilla/gateway/static/js/rpc.js")
 SAVINGS_FX_JS = Path("src/opensquilla/gateway/static/js/components/savings-fx.js")
@@ -25,6 +26,21 @@ def test_chat_history_passes_subagent_completion_provenance_to_renderer() -> Non
 
     assert "provenanceSourceTool: msg.provenance_source_tool || ''" in source
     assert "provenanceSourceSessionKey: msg.provenance_source_session_key || ''" in source
+
+
+def test_chat_suppresses_internal_provider_retry_warning_toasts() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+
+    warning_start = source.index("_rpc.on('session.event.warning'")
+    warning_end = source.index("    // Track session epoch", warning_start)
+    warning_handler = source[warning_start:warning_end]
+
+    assert "const silentWarningCodes = new Set([" in warning_handler
+    assert "'provider_reasoning_only_retry'" in warning_handler
+    assert "if (silentWarningCodes.has(code)) return;" in warning_handler
+    silent_warning_index = warning_handler.index("if (silentWarningCodes.has(code)) return;")
+    toast_index = warning_handler.index("UI.toast(msg, 'warn', 5000);")
+    assert silent_warning_index < toast_index
 
 
 def test_chat_toolbar_has_no_tool_compress_selector() -> None:
@@ -517,6 +533,21 @@ def test_chat_publish_artifact_tool_cards_show_target_filename() -> None:
     )
 
 
+def test_chat_meta_step_cards_explain_long_running_work() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+    build_start = source.index("function _buildToolCallDOM")
+    build_end = source.index("  function _findToolDetailsById", build_start)
+    build_body = source[build_start:build_end]
+
+    assert "function _metaStepRunningHint(name)" in source
+    assert "stepId.endsWith('_video')" in source
+    assert "may take several minutes" in source
+    assert "chat-meta-step-running-hint" in build_body
+    assert "_metaStepRunningHint(name)" in build_body
+    assert ".chat-meta-step-running-hint" in css
+
+
 def test_chat_memory_search_results_surface_sources() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     css = CHAT_CSS.read_text(encoding="utf-8")
@@ -730,6 +761,7 @@ def test_chat_slash_input_supports_literal_slash_escape() -> None:
     slash_exec_guard_idx = send_prefix.index("if (!isLiteralSlash && text.startsWith('/')) {")
     assert literal_idx < normalize_idx < slash_exec_guard_idx
     assert "{ allowSlashCommand: isSlashCommand }" in send_prefix
+    assert "!!(await _lookupSlashCommand(text))" in send_prefix
     assert "await _executeSlashCommand(text)" in send_prefix
     assert "if (val.startsWith('//')) { _closeSlashMenu(); return; }" in source
 
@@ -748,6 +780,7 @@ def test_chat_slash_commands_are_blocked_while_streaming_after_literal_escape() 
         "if (_isStreaming || _isCompactInFlightForCurrentSession()) {"
     )
     execute_idx = send_prefix.index("await _executeSlashCommand(text)")
+    streaming_guard = "if (isSlashCommand) {"
     real_slash_guard = "if (!isLiteralSlash && text.startsWith('/')) {"
     streaming_block_end = send_prefix.index(f"\n\n    {real_slash_guard}", streaming_idx)
     streaming_block = send_prefix[streaming_idx:streaming_block_end]
@@ -757,10 +790,10 @@ def test_chat_slash_commands_are_blocked_while_streaming_after_literal_escape() 
     assert "text = text.slice(1);" in send_prefix[literal_idx:normalize_idx]
     assert "text = normalized.text;" in send_prefix[normalize_idx:streaming_idx]
     assert (
-        "_pendingAttachments = normalized.attachments;"
+        "attachmentsForSend = normalized.attachments;"
         in send_prefix[normalize_idx:streaming_idx]
     )
-    assert real_slash_guard in streaming_block
+    assert streaming_guard in streaming_block
     assert "const waitReason = _isCompactInFlightForCurrentSession()" in streaming_block
     assert "Wait for ${waitReason} before running" in streaming_block
     assert "_executeSlashCommand" not in streaming_block
@@ -768,15 +801,20 @@ def test_chat_slash_commands_are_blocked_while_streaming_after_literal_escape() 
     assert real_slash_guard in send_prefix[streaming_idx:execute_idx]
 
 
-def test_chat_slash_executor_handles_unknown_without_chat_send() -> None:
+def test_chat_slash_executor_lets_unknown_slash_input_fall_through() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
+    lookup_start = source.index("async function _lookupSlashCommand(text)")
+    lookup_end = source.index("async function _executeSlashCommand(text)", lookup_start)
     exec_start = source.index("async function _executeSlashCommand(text)")
     exec_end = source.index("  /* ── Send Message", exec_start)
+    lookup = source[lookup_start:lookup_end]
     executor = source[exec_start:exec_end]
 
-    assert "_slashCommandMap.get(_slashCommandKey(cmdText))" in executor
-    assert "Unsupported command" in executor
-    assert "return true;" in executor
+    assert "await _loadSlashCommands()" in lookup
+    assert "_slashCommandMap.get(_slashCommandKey(cmdText)) || null" in lookup
+    assert "const cmd = await _lookupSlashCommand(text);" in executor
+    assert "Unsupported command" not in executor
+    assert "return false;" in executor
     assert "chat.send" not in executor
 
 
@@ -858,7 +896,11 @@ def test_chat_switching_existing_session_does_not_mark_new_chat_intent() -> None
 
     assert "_pendingSessionIntent = 'new_chat'" not in switch_body
     assert source.count("_pendingSessionIntent = 'new_chat'") == 2
-    assert "params.intent = _pendingSessionIntent;" in source
+    assert (
+        "const sessionIntentForSend = textOverride !== null ? null : _pendingSessionIntent;"
+        in source
+    )
+    assert "params.intent = sessionIntentForSend;" in source
 
 
 def test_chat_regenerate_targets_clicked_assistant_bubble() -> None:
@@ -1553,7 +1595,7 @@ def test_chat_large_paste_guard_runs_before_queue_and_rpc_send() -> None:
     assert send_body.index(normalize_call) < send_body.index("const params = { message:")
     provenance_call = (
         "const normalizationProvenance = "
-        "_inputNormalizationProvenanceFromAttachments(_pendingAttachments);"
+        "_inputNormalizationProvenanceFromAttachments(attachmentsForSend);"
     )
     assert provenance_call in send_body
     assert (
@@ -1594,7 +1636,8 @@ def test_chat_manual_pending_enqueue_normalizes_large_pastes() -> None:
     assert "if (text.startsWith('//')) {" in current_body
     assert "isLiteralSlash = true;" in current_body
     assert "text = text.slice(1);" in current_body
-    assert "const isSlashCommand = !isLiteralSlash && text.startsWith('/');" in current_body
+    assert "const isSlashCommand = !isLiteralSlash && text.startsWith('/')" in current_body
+    assert "!!(await _lookupSlashCommand(text))" in current_body
     assert "{ allowSlashCommand: isSlashCommand }" in current_body
     assert normalize_idx < enqueue_idx
     assert "_pendingAttachments = normalized.attachments;" in current_body
@@ -1976,6 +2019,31 @@ def test_router_fx_legacy_grid_is_config_driven_visual_only() -> None:
     assert "Router panel" not in source
     assert "data-router-panel" not in source
     assert "const _ROUTER_FX_DECOY_POOL = [" in source
+    for model in (
+        "gpt-5.5",
+        "claude-opus-4.8",
+        "gemini-3.5-flash",
+        "qwen3-coder-plus",
+        "grok-4.3",
+        "deepseek-v3.2",
+        "kimi-k2.6",
+        "mistral-medium-3.5",
+        "command-a-plus",
+        "glm-4.6",
+    ):
+        assert model in source
+    for stale_model in (
+        "gpt-4.1-mini",
+        "gpt-4o-mini",
+        "o4-mini",
+        "deepseek-chat",
+        "mistral-medium',",
+        "grok-code-fast",
+        "deepseek-v4-pro",
+        "glm-5.2",
+        "qwen3-coder',",
+    ):
+        assert stale_model not in source
     assert "const _ROUTER_FX_GRID_COLS = 5;" in source
     assert "const _ROUTER_FX_GRID_ROWS = 3;" in source
     assert "const _ROUTER_FX_REAL_ANCHOR_CELLS" in source
@@ -1985,10 +2053,9 @@ def test_router_fx_legacy_grid_is_config_driven_visual_only() -> None:
     assert "_routerFxApplyConfigVisualMode(cfg?.squilla_router?.visual_mode);" in source
     assert "saved.visualMode" not in source
     assert "saved.panel" not in source
-    assert "visualMode:" not in source[
-        source.index("function _routerFxSavePref() {"):
-        source.index("function _routerFxSortTiers(", source.index("function _routerFxSavePref() {"))
-    ]
+    save_start = source.index("function _routerFxSavePref() {")
+    save_end = source.index("function _routerFxSortTiers(", save_start)
+    assert "visualMode:" not in source[save_start:save_end]
 
     legacy_start = source.index("function _routerFxBuildLegacyGridCells(realEntries, seedKey) {")
     legacy_end = source.index("  function _routerFxBuildGridCells", legacy_start)
@@ -2020,15 +2087,19 @@ def test_router_fx_legacy_grid_is_config_driven_visual_only() -> None:
 
 
 def test_router_fx_cells_render_plain_model_names_only() -> None:
-    # The panel intentionally shows the real candidates for this request. Cells
-    # show only the user-facing model name: no S/M/L/XL, no provider labels, no
-    # thinking badges, and no DOM roster metadata beyond the cell index needed
-    # for the selector.
+    # Cells show only the user-facing model name: no S/M/L/XL, no provider
+    # labels, no thinking badges, and no DOM roster metadata beyond the cell
+    # index needed for the selector.
     source = CHAT_JS.read_text(encoding="utf-8")
     css = CHAT_CSS.read_text(encoding="utf-8")
+    vue = CHAT_ROUTER_FX_VUE.read_text(encoding="utf-8")
 
     assert "cell.dataset.kind" not in source
     assert "cell.dataset.tiers" not in source
+    assert ":data-kind" not in vue
+    assert ":data-tiers" not in vue
+    assert '[data-kind="real"]' not in vue
+    assert '[data-kind="decoy"]' not in vue
     assert '[data-kind="real"]' not in css
     assert '[data-kind="decoy"]' not in css
     assert "router-fx-dot-idle" not in css
@@ -2154,20 +2225,19 @@ def test_router_fx_grid_labels_shrink_to_fit() -> None:
     assert "_routerFxFitLabels(wrap);" in source[insert_start:insert_end]
 
 
-def test_router_fx_watching_indicator_deferred_until_panel_settles() -> None:
-    # The "squilla · Watching · N.Ns" indicator is RETAINED, but DEFERRED until
-    # the router panel has settled — so routing animates first and "Watching…"
-    # only shows afterwards (while the model is still generating). The timer
-    # starts at send so it reads total elapsed.
+def test_router_fx_scan_does_not_hide_waiting_indicator() -> None:
+    # The "squilla · Watching · N.Ns" indicator must remain visible even while
+    # the router panel is scanning. Provider first-byte waits can be minutes
+    # long, so router animation must not suppress the only user-facing progress
+    # signal.
     source = CHAT_JS.read_text(encoding="utf-8")
     # No longer suppressed.
     assert "if (_routerFx.enabled && _routerFeatureEnabled) return;" not in source
-    # _showThinkingIndicatorNow defers while the panel is still scanning.
     now_start = source.index("function _showThinkingIndicatorNow() {")
     now_end = source.index("function _hideThinkingIndicator", now_start)
     body = source[now_start:now_end]
-    assert "_thread.querySelector('.router-fx[data-scanning=\"true\"]')" in body
-    assert "_thinkingDelayTimer = setTimeout(_showThinkingIndicatorNow, 150);" in body
+    assert "_thread.querySelector('.router-fx[data-scanning=\"true\"]')" not in body
+    assert "thinking.defer.router_scan" not in body
     # The verb list (incl. "Watching") is unchanged.
     assert "const SQUILLA_VERBS = ['Watching'," in source
 
@@ -2550,6 +2620,106 @@ def test_historical_clarify_tool_results_reconstruct_form_not_raw_card() -> None
     )
     raw_result_index = history_body.index("const resultDiv = _buildToolResultDOM(")
     assert clarify_form_index < raw_result_index
+
+
+def test_clarify_form_renders_progress_summary_and_next_steps() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+
+    form_start = source.index("function _appendClarifyFormToBody(body, payload, args)")
+    form_end = source.index("  function _appendClarifySkipSummary", form_start)
+    form_body = source[form_start:form_end]
+
+    assert "const requiredFields = fields.filter((field) => field && field.required);" in form_body
+    assert "clarify-form-progress" in form_body
+    assert "clarify-form-progress-metric" in form_body
+    assert "clarify-form-progress-next" in form_body
+    assert "已收集" in form_body
+    assert "补充" in form_body
+    assert "Suggested next steps" in form_body
+
+    assert ".clarify-form-progress" in css
+    assert ".clarify-form-progress-metric" in css
+    assert ".clarify-form-progress-next" in css
+
+
+def test_clarify_form_keeps_internal_prompt_out_of_primary_labels() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+
+    form_start = source.index("function _appendClarifyFormToBody(body, payload, args)")
+    form_end = source.index("  function _appendClarifySkipSummary", form_start)
+    form_body = source[form_start:form_end]
+
+    assert "const clarifyFieldDisplayLabel = (field) => {" in form_body
+    assert "script draft" in form_body
+    assert "verbatim reply" in form_body
+    assert "回复内容" in form_body
+    assert "Reply" in form_body
+    assert "missingRequiredFields.map(clarifyFieldDisplayLabel)" in form_body
+    assert "label.textContent = clarifyFieldDisplayLabel(field) + requiredFlag;" in form_body
+    assert "field.prompt && clarifyFieldDisplayLabel(field) !== fieldPromptText" in form_body
+    assert "clarify-form-field-help" in form_body
+    assert "填写要求" in form_body
+    assert "Requirements" in form_body
+
+    assert ".clarify-form-field-help" in css
+    assert ".clarify-form-field-help-summary" in css
+    assert ".clarify-form-field-help-body" in css
+
+
+def test_clarify_form_submit_waits_for_connection_and_shows_pending_feedback() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+
+    form_start = source.index("function _appendClarifyFormToBody(body, payload, args)")
+    form_end = source.index("  function _appendClarifySkipSummary", form_start)
+    form_body = source[form_start:form_end]
+    call_index = form_body.index("_rpc.call('chat.clarify_submit'")
+
+    assert "_rpc.waitForConnection()" in form_body
+    assert form_body.index("_rpc.waitForConnection()") < call_index
+    assert "clarify-form--submitting" in form_body
+    assert "clarify-form--submitted" in form_body
+    assert "clarify-form-submit-status" in form_body
+    assert "已提交，正在继续流程" in form_body
+    assert "Submitted, continuing" in form_body
+
+    assert ".clarify-form--submitting" in css
+    assert ".clarify-form-submit-status" in css
+
+
+def test_clarify_submit_button_has_direct_click_fallback() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+
+    form_start = source.index("function _appendClarifyFormToBody(body, payload, args)")
+    form_end = source.index("  function _appendClarifySkipSummary", form_start)
+    form_body = source[form_start:form_end]
+
+    assert "let clarifySubmitInFlight = false;" in form_body
+    assert "const submitClarifyForm = () => {" in form_body
+    assert "const form = document.createElement('div');" in form_body
+    assert "form.setAttribute('role', 'form');" in form_body
+    assert "submitBtn.type = 'button';" in form_body
+    assert "submitBtn.addEventListener('click', (evt) => {" in form_body
+    assert "form.addEventListener('keydown', (evt) => {" in form_body
+    assert "evt.key !== 'Enter'" in form_body
+    assert "evt.preventDefault();" in form_body
+    assert "submitClarifyForm();" in form_body
+
+
+def test_clarify_submit_connection_wait_has_visible_timeout() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+
+    form_start = source.index("function _appendClarifyFormToBody(body, payload, args)")
+    form_end = source.index("  function _appendClarifySkipSummary", form_start)
+    form_body = source[form_start:form_end]
+
+    assert "const waitForClarifySubmitConnection = () => Promise.race([" in form_body
+    assert "_rpc.waitForConnection()," in form_body
+    assert "setTimeout(() => reject(new Error(clarifyText(" in form_body
+    assert "连接超时，请刷新页面后重试。" in form_body
+    assert "waitForClarifySubmitConnection()" in form_body
 
 
 def test_router_fx_settles_but_preserves_winner_animation_when_output_begins() -> None:

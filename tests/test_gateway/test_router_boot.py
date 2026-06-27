@@ -60,6 +60,179 @@ def test_task_runtime_hard_deadline_honors_explicit_config() -> None:
     assert _task_runtime_turn_hard_deadline_s(config) == 12.5
 
 
+def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> None:
+    from opensquilla.gateway import boot
+
+    released: list[str] = []
+
+    class FakePidLock:
+        def release(self) -> None:
+            released.append("released")
+
+    class FailingChannelManager:
+        async def stop_all(self) -> None:
+            raise RuntimeError("channel stop failed")
+
+    server = boot.GatewayServer(
+        app=SimpleNamespace(),
+        config=GatewayConfig(),
+        _channel_manager=FailingChannelManager(),
+        _pid_lock=FakePidLock(),
+    )
+
+    async def run_case() -> None:
+        with pytest.raises(RuntimeError, match="channel stop failed"):
+            await server.close()
+
+        assert released == ["released"]
+        assert server._pid_lock is None
+
+    asyncio.run(run_case())
+
+
+def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    events: list[str] = []
+
+    async def fail_build_services(**_kwargs: Any) -> Any:
+        events.append("build_services")
+        raise RuntimeError("service construction failed")
+
+    monkeypatch.setattr(boot, "build_services", fail_build_services)
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: events.append("acquire"),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: events.append("release"),
+    )
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+
+    async def run_case() -> None:
+        with pytest.raises(RuntimeError, match="service construction failed"):
+            await boot.start_gateway_server(config=config, run=False)
+
+        assert events == ["acquire", "build_services", "release"]
+
+    asyncio.run(run_case())
+
+
+def test_start_gateway_server_logs_install_telemetry_without_structlog_event_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    debug_logs: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeLog:
+        def debug(self, event: str, **kwargs: Any) -> None:
+            debug_logs.append((event, kwargs))
+
+        def info(self, _event: str, **_kwargs: Any) -> None:
+            return None
+
+        def warning(self, _event: str, **_kwargs: Any) -> None:
+            return None
+
+    class FakeTurnRunner:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        def set_session_lock_provider(self, _provider: Any) -> None:
+            return None
+
+    async def fake_build_services(**kwargs: Any) -> Any:
+        config = kwargs["config"]
+
+        async def close() -> None:
+            return None
+
+        return SimpleNamespace(
+            provider_selector=object(),
+            tool_registry=object(),
+            session_manager=object(),
+            skill_loader=object(),
+            usage_tracker=object(),
+            config=config,
+            memory_sync_managers={},
+            model_catalog=None,
+            memory_retrievers={},
+            turn_capture_services={},
+            flush_service=None,
+            cron_scheduler=None,
+            task_runtime=None,
+            agent_registry=None,
+            memory_managers={},
+            memory_stores={},
+            _turn_runner_ref=[],
+            close=close,
+        )
+
+    def fake_collect_install_telemetry(*, config: GatewayConfig) -> Any:
+        return SimpleNamespace(
+            skipped_reason=None,
+            event="install",
+            sent=True,
+            uploaded=False,
+            endpoint_configured=True,
+        )
+
+    monkeypatch.setattr(boot, "log", FakeLog())
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr(boot, "build_services", fake_build_services)
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.observability.install_telemetry.collect_install_telemetry",
+        fake_collect_install_telemetry,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: None,
+    )
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+
+    async def run_case() -> None:
+        server = await boot.start_gateway_server(config=config, run=False)
+
+        try:
+            telemetry_logs = [
+                kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
+            ]
+            assert len(telemetry_logs) == 1
+            assert telemetry_logs[0]["telemetry_event"] == "install"
+            assert "event" not in telemetry_logs[0]
+            assert "gateway.install_telemetry_skipped" not in {
+                event for event, _kwargs in debug_logs
+            }
+        finally:
+            await server.close()
+
+    asyncio.run(run_case())
+
+
 def test_build_task_runtime_run_kwargs_forwards_fresh_user_session() -> None:
     run = SimpleNamespace(
         agent_id="main",

@@ -39,6 +39,18 @@ def _plan_with_collect_then_summary() -> MetaPlan:
         fields=(
             ClarifyField(name="destination", type="string", required=True),
             ClarifyField(name="days", type="int", required=True, min=1, max=14),
+            ClarifyField(
+                name="language",
+                type="enum",
+                required=False,
+                choices=("en", "zh", "mixed"),
+            ),
+            ClarifyField(
+                name="additional_notes",
+                type="string",
+                required=False,
+                max_chars=2000,
+            ),
         ),
         intro="Trip info needed.",
     )
@@ -88,6 +100,192 @@ def _seed_running_run(writer, plan, run_id="r1", session_key="S1"):
 async def _sv(*_a):
     return
     yield  # type: ignore[unreachable]
+
+
+@pytest.mark.asyncio
+async def test_resume_updates_language_instruction_from_clarify_language(writer):
+    plan = _plan_with_collect_then_summary()
+    inputs = _seed_running_run(writer, plan)
+    inputs["language_instruction"] = (
+        "Output language rule: write final user-facing prose, headings, "
+        "labels, and summaries in English only unless the user explicitly "
+        "asks for another language."
+    )
+
+    dispatched_context: dict[str, dict] = {}
+    orch = MetaOrchestrator(
+        agent_runner=None,  # type: ignore[arg-type]
+        skill_loader=None,
+        dao=writer,
+    )
+
+    async def _dispatch(step, effective_skill, match_inputs, outputs):
+        if step.kind == "user_input":
+            async for ev in orch._dispatch_one_step(
+                step, effective_skill, match_inputs, outputs,
+                run_id="r1", session_id="S1",
+            ):
+                yield ev
+            return
+        if step.id == "summary":
+            dispatched_context["summary"] = {
+                "user_language": match_inputs.get("user_language"),
+                "language_instruction": match_inputs.get("language_instruction"),
+                "inputs_collected": match_inputs.get("collected"),
+            }
+            yield _StepDone(text="summary-done", status="ok")
+
+    paused = await orch.run_once(
+        MetaMatch(plan=plan, inputs=inputs),
+        run_id="r1",
+        session_id="S1",
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+    assert paused.paused is True
+
+    await orch.resume(
+        run_id="r1",
+        session_id="S1",
+        filled_fields={"destination": "纸盘动物", "days": 14, "language": "mixed"},
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+
+    summary = dispatched_context["summary"]
+    assert summary["inputs_collected"]["collect"]["language"] == "mixed"
+    assert summary["user_language"] == "zh"
+    assert "English only" not in summary["language_instruction"]
+    assert "Simplified Chinese" in summary["language_instruction"]
+
+
+@pytest.mark.asyncio
+async def test_resume_prefers_chinese_when_any_clarify_field_contains_chinese(writer):
+    plan = _plan_with_collect_then_summary()
+    inputs = _seed_running_run(writer, plan)
+    inputs["language_instruction"] = (
+        "Output language rule: write final user-facing prose, headings, "
+        "labels, and summaries in English only unless the user explicitly "
+        "asks for another language."
+    )
+
+    dispatched_context: dict[str, dict] = {}
+    orch = MetaOrchestrator(
+        agent_runner=None,  # type: ignore[arg-type]
+        skill_loader=None,
+        dao=writer,
+    )
+
+    async def _dispatch(step, effective_skill, match_inputs, outputs):
+        if step.kind == "user_input":
+            async for ev in orch._dispatch_one_step(
+                step, effective_skill, match_inputs, outputs,
+                run_id="r1", session_id="S1",
+            ):
+                yield ev
+            return
+        if step.id == "summary":
+            dispatched_context["summary"] = {
+                "user_language": match_inputs.get("user_language"),
+                "language_instruction": match_inputs.get("language_instruction"),
+            }
+            yield _StepDone(text="summary-done", status="ok")
+
+    paused = await orch.run_once(
+        MetaMatch(plan=plan, inputs=inputs),
+        run_id="r1",
+        session_id="S1",
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+    assert paused.paused is True
+
+    await orch.resume(
+        run_id="r1",
+        session_id="S1",
+        filled_fields={"destination": "纸盘动物", "days": 14, "language": "en"},
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+
+    summary = dispatched_context["summary"]
+    assert summary["user_language"] == "zh"
+    assert "English only" not in summary["language_instruction"]
+    assert "Simplified Chinese" in summary["language_instruction"]
+
+
+@pytest.mark.asyncio
+async def test_empty_form_resume_lets_llm_infer_all_clarify_fields(writer):
+    plan = _plan_with_collect_then_summary()
+    inputs = _seed_running_run(writer, plan)
+    inputs["user_message"] = "帮我给孩子安排一个北京三日游。"
+
+    async def fake_chat(_system: str, user: str) -> str:
+        payload = json.loads(user)
+        target_names = {
+            field["name"] for field in payload["fields_to_infer"]
+        }
+        assert target_names == {
+            "destination", "days", "language", "additional_notes",
+        }
+        return json.dumps(
+            {
+                "destination": "北京",
+                "days": 3,
+                "language": "zh",
+                "additional_notes": "按亲子节奏安排，不要太赶。",
+            },
+            ensure_ascii=False,
+        )
+
+    dispatched_context: dict[str, dict] = {}
+    orch = MetaOrchestrator(
+        agent_runner=None,  # type: ignore[arg-type]
+        skill_loader=None,
+        dao=writer,
+        llm_chat=fake_chat,
+    )
+
+    async def _dispatch(step, effective_skill, match_inputs, outputs):
+        if step.kind == "user_input":
+            async for ev in orch._dispatch_one_step(
+                step, effective_skill, match_inputs, outputs,
+                run_id="r1", session_id="S1",
+            ):
+                yield ev
+            return
+        if step.id == "summary":
+            dispatched_context["summary"] = {
+                "inputs_user_message": match_inputs.get("user_message"),
+                "inputs_collected": match_inputs.get("collected"),
+            }
+            yield _StepDone(text="summary-done", status="ok")
+
+    paused = await orch.run_once(
+        MetaMatch(plan=plan, inputs=inputs),
+        run_id="r1",
+        session_id="S1",
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+    assert paused.paused is True
+
+    await orch.resume(
+        run_id="r1",
+        session_id="S1",
+        filled_fields={},
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+
+    collected = dispatched_context["summary"]["inputs_collected"]["collect"]
+    assert collected == {
+        "destination": "北京",
+        "days": 3,
+        "language": "zh",
+        "additional_notes": "按亲子节奏安排，不要太赶。",
+    }
+    assert "按亲子节奏安排" in dispatched_context["summary"]["inputs_user_message"]
 
 
 @pytest.mark.asyncio
@@ -146,6 +344,64 @@ async def test_pause_then_resume_completes_dag(writer):
     assert sm["inputs_user_message"] == "I want to plan a trip"
     assert sm["inputs_collected"]["collect"]["destination"] == "Tokyo"
     assert sm["inputs_collected"]["collect"]["days"] == 5
+
+
+@pytest.mark.asyncio
+async def test_resume_injects_additional_notes_into_downstream_user_message(writer):
+    plan = _plan_with_collect_then_summary()
+    inputs = _seed_running_run(writer, plan)
+
+    dispatched_context: dict[str, dict] = {}
+
+    orch = MetaOrchestrator(
+        agent_runner=None,  # type: ignore[arg-type]
+        skill_loader=None,
+        dao=writer,
+    )
+
+    async def _dispatch(step, effective_skill, match_inputs, outputs):
+        if step.kind == "user_input":
+            async for ev in orch._dispatch_one_step(
+                step, effective_skill, match_inputs, outputs,
+                run_id="r1", session_id="S1",
+            ):
+                yield ev
+            return
+        if step.id == "summary":
+            dispatched_context["summary"] = {
+                "inputs_user_message": match_inputs.get("user_message"),
+                "inputs_collected": match_inputs.get("collected"),
+            }
+            yield _StepDone(text="summary-done", status="ok")
+
+    paused = await orch.run_once(
+        MetaMatch(plan=plan, inputs=inputs),
+        run_id="r1",
+        session_id="S1",
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+    assert paused.paused is True
+
+    await orch.resume(
+        run_id="r1",
+        session_id="S1",
+        filled_fields={
+            "destination": "Tokyo",
+            "days": 5,
+            "additional_notes": "Please avoid museums; kid wants trains.",
+        },
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+
+    sm = dispatched_context["summary"]
+    assert sm["inputs_collected"]["collect"]["additional_notes"] == (
+        "Please avoid museums; kid wants trains."
+    )
+    assert sm["inputs_user_message"].startswith("I want to plan a trip")
+    assert "Additional user notes" in sm["inputs_user_message"]
+    assert "Please avoid museums; kid wants trains." in sm["inputs_user_message"]
 
 
 @pytest.mark.asyncio
@@ -245,3 +501,76 @@ async def test_resume_writes_clarify_summary_into_outputs(writer):
     collect_md = summary_outputs.get("collect", "")
     assert "destination: Tokyo (from user)" in collect_md
     assert "days: 5 (from user)" in collect_md
+
+
+@pytest.mark.asyncio
+async def test_resume_persists_followup_step_lifecycle_and_usage(writer):
+    from opensquilla.engine.usage import UsageTracker
+    from opensquilla.persistence.meta_run_writer import summarize_run_record
+
+    plan = _plan_with_collect_then_summary()
+    inputs = _seed_running_run(writer, plan)
+    tracker = UsageTracker()
+    writer.begin_step_sync(
+        run_id="r1",
+        step=plan.steps[0],
+        effective_skill="collect",
+        rendered_inputs={},
+    )
+
+    orch = MetaOrchestrator(
+        agent_runner=None,  # type: ignore[arg-type]
+        skill_loader=None,
+        dao=writer,
+        usage_tracker=tracker,
+        session_key="S1",
+    )
+
+    async def _dispatch(step, effective_skill, match_inputs, outputs):
+        if step.kind == "user_input":
+            async for ev in orch._dispatch_one_step(
+                step, effective_skill, match_inputs, outputs,
+                run_id="r1", session_id="S1",
+            ):
+                yield ev
+            return
+        if step.id == "summary":
+            tracker.add(
+                "S1",
+                input_tokens=21,
+                output_tokens=9,
+                model_id="resume-model",
+                billed_cost=0.021,
+            )
+            yield _StepDone(text="summary-done", status="ok")
+
+    paused = await orch.run_once(
+        MetaMatch(plan=plan, inputs=inputs),
+        run_id="r1",
+        session_id="S1",
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+    assert paused.paused is True, "test fixture expected pause before resume"
+
+    final = await orch.resume(
+        run_id="r1",
+        session_id="S1",
+        filled_fields={"destination": "Tokyo", "days": 5},
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_sv,
+    )
+
+    assert final.ok is True
+    record = writer.get_run("r1")
+    assert record is not None
+    raw_steps = {step.step_id: step for step in record.steps}
+    assert raw_steps["collect"].status == "ok"
+    assert "destination: Tokyo" in (raw_steps["collect"].output_text or "")
+    summary = summarize_run_record(record)
+    by_step = {step["step_id"]: step for step in summary["steps"]}
+    assert by_step["collect"]["status"] == "ok"
+    assert by_step["summary"]["status"] == "ok"
+    assert by_step["summary"]["usage"]["available"] is True
+    assert by_step["summary"]["usage"]["input_tokens"] == 21
+    assert by_step["summary"]["usage"]["model"] == "resume-model"

@@ -13,14 +13,18 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
 import structlog
 
-from opensquilla.gateway.approval_queue import get_approval_queue
+from opensquilla.gateway.approval_queue import (
+    RESOLUTION_EXPIRED,
+    classify_command,
+    get_approval_queue,
+)
 from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend, build_bwrap_argv
 from opensquilla.sandbox.backend.noop import NoopBackend
 from opensquilla.sandbox.backend.seatbelt import (
@@ -56,11 +60,22 @@ _MAX_EXEC_TIMEOUT = 600.0
 _APPROVAL_RETRY_WAIT_SECONDS = 180.0
 _EXEC_TOOL_TIMEOUT_PADDING = _APPROVAL_RETRY_WAIT_SECONDS + 5.0
 _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
-_MAX_BACKGROUND_TIMEOUT = 3600.0
+_MAX_BACKGROUND_TIMEOUT = 5400.0
+_DEFAULT_PROCESS_WAIT_TIMEOUT = 600.0
+# Coding mode runs code-task (build/install for many minutes) via
+# background_process and awaits it; default a single wait to 1 hour so it
+# spans a full code-task run instead of timing out and making the agent
+# relaunch it.
+_CODING_PROCESS_WAIT_TIMEOUT = 5400.0
+_MAX_PROCESS_WAIT_TIMEOUT = _MAX_BACKGROUND_TIMEOUT
+_PROCESS_WAIT_TIMEOUT_PADDING = 5.0
 _BACKGROUND_TERMINATE_TIMEOUT = 1.0
 _BACKGROUND_KILL_TIMEOUT = 1.0
 _EXEC_TERMINATE_TIMEOUT = 0.25
 _EXEC_KILL_TIMEOUT = 0.25
+_EXEC_STDIN_WRITE_CHUNK_BYTES = 64 * 1024
+_EXEC_STDIN_GUARD_CHUNK_CHARS = 64 * 1024
+_EXEC_STDIN_GUARD_OVERLAP_CHARS = 1024
 _COMMAND_AUDIT_MAX_CHARS = 4096
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no network. Use http_request or web_fetch, "
@@ -82,7 +97,7 @@ _SHELL_NULL_REDIRECT_RE = re.compile(
     r"(?:(?<=^)|(?<=[\s;|&]))\d*[<>]{1,2}\s*/dev/null(?=$|[\s;|&])"
 )
 PROCESS_ACTIONS: frozenset[str] = frozenset(
-    {"eof", "kill", "list", "log", "poll", "remove", "submit", "write"}
+    {"eof", "kill", "list", "log", "poll", "remove", "submit", "wait", "write"}
 )
 
 # Background process session store
@@ -197,11 +212,45 @@ def _workdir_is_configured_workspace(workdir: str | None) -> bool:
         return False
 
 
+def _sensitive_payload_block(tool_name: str, text: str) -> str | None:
+    from opensquilla.tools.builtin.web import (
+        _sensitive_body_block,
+        _sensitive_body_marker,
+        _sensitive_url_marker,
+    )
+
+    for token in text.split():
+        stripped = token.strip("'\"")
+        if stripped.startswith(("http://", "https://")):
+            marker = _sensitive_url_marker(stripped)
+            if marker is not None:
+                return _sensitive_body_block(tool_name, marker)
+    marker = _sensitive_body_marker(text)
+    if marker is not None:
+        return _sensitive_body_block(tool_name, marker)
+    return None
+
+
+def _iter_stdin_guard_chunks(text: str) -> Iterator[str]:
+    if len(text) <= _EXEC_STDIN_GUARD_CHUNK_CHARS:
+        yield text
+        return
+    step = _EXEC_STDIN_GUARD_CHUNK_CHARS - _EXEC_STDIN_GUARD_OVERLAP_CHARS
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + _EXEC_STDIN_GUARD_CHUNK_CHARS)
+        yield text[start:end]
+        if end >= len(text):
+            break
+        start += step
+
+
 def _sensitive_shell_block(
     tool_name: str,
     command: str,
     *,
     workdir: str | None = None,
+    stdin: str | None = None,
 ) -> str | None:
     if _context_elevated_mode() == "full":
         return None
@@ -220,21 +269,27 @@ def _sensitive_shell_block(
             ensure_ascii=False,
         )
 
-    from opensquilla.tools.builtin.web import (
-        _sensitive_body_block,
-        _sensitive_body_marker,
-        _sensitive_url_marker,
-    )
+    payload_block = _sensitive_payload_block(tool_name, checked_text)
+    if payload_block is not None:
+        return payload_block
+    if stdin is None:
+        return None
 
-    for token in checked_text.split():
-        stripped = token.strip("'\"")
-        if stripped.startswith(("http://", "https://")):
-            marker = _sensitive_url_marker(stripped)
-            if marker is not None:
-                return _sensitive_body_block(tool_name, marker)
-    marker = _sensitive_body_marker(checked_text)
-    if marker is not None:
-        return _sensitive_body_block(tool_name, marker)
+    for stdin_chunk in _iter_stdin_guard_chunks(stdin):
+        marker = sensitive_path_in_text(stdin_chunk, workspace=workspace)
+        if marker is not None:
+            return json.dumps(
+                build_block_envelope(
+                    f"{checked_command}\n[stdin omitted]",
+                    marker,
+                    tool_name=tool_name,
+                ),
+                ensure_ascii=False,
+            )
+    for stdin_chunk in _iter_stdin_guard_chunks(stdin):
+        payload_block = _sensitive_payload_block(tool_name, stdin_chunk)
+        if payload_block is not None:
+            return payload_block
     return None
 
 
@@ -279,15 +334,25 @@ def _shell_write_targets(command: str) -> list[str]:
     return targets
 
 
+def _shell_write_targets_from_inputs(command: str, stdin: str | None) -> list[str]:
+    targets = _shell_write_targets(command)
+    if stdin is not None:
+        for stdin_chunk in _iter_stdin_guard_chunks(stdin):
+            targets.extend(_shell_write_targets(stdin_chunk))
+    return targets
+
+
 def _workspace_lockdown_shell_block(
     tool_name: str,
     command: str,
     workdir: str | None,
+    *,
+    stdin: str | None = None,
 ) -> dict[str, object] | None:
     roots = _workspace_lockdown_roots()
     if not roots:
         return None
-    for target in _shell_write_targets(command):
+    for target in _shell_write_targets_from_inputs(command, stdin):
         resolved = _resolve_shell_write_target(target, workdir)
         if _path_inside_any_root(resolved, roots):
             continue
@@ -312,6 +377,8 @@ def _workspace_write_deny_shell_block(
     tool_name: str,
     command: str,
     workdir: str | None,
+    *,
+    stdin: str | None = None,
 ) -> dict[str, object] | None:
     from opensquilla.tools.write_policy import (
         match_workspace_write_deny,
@@ -324,7 +391,7 @@ def _workspace_write_deny_shell_block(
         if ctx is not None and ctx.workspace_dir
         else None
     )
-    for target in _shell_write_targets(command):
+    for target in _shell_write_targets_from_inputs(command, stdin):
         resolved = _resolve_shell_write_target(target, workdir)
         deny_match = match_workspace_write_deny(
             resolved,
@@ -363,6 +430,25 @@ def _resolve_background_timeout(timeout: float | int | None) -> float:
     except (TypeError, ValueError):
         return _DEFAULT_BACKGROUND_TIMEOUT
     return max(0.01, min(value, _MAX_BACKGROUND_TIMEOUT))
+
+
+def _process_wait_default() -> float:
+    """Default process(wait) timeout: 1 hour while coding mode is on, else 10 min."""
+    ctx = current_tool_context.get()
+    if ctx is not None and getattr(ctx, "coding_mode", False):
+        return _CODING_PROCESS_WAIT_TIMEOUT
+    return _DEFAULT_PROCESS_WAIT_TIMEOUT
+
+
+def _resolve_process_wait_timeout(timeout: float | int | None) -> float:
+    default = _process_wait_default()
+    if timeout is None:
+        return default
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        return default
+    return max(0.01, min(value, _MAX_PROCESS_WAIT_TIMEOUT))
 
 
 def _effective_workdir(workdir: str | None) -> str | None:
@@ -580,6 +666,74 @@ async def _terminate_exec_process_tree(proc: Any) -> None:
         log.warning("exec_command_termination_timeout", pid=proc.pid)
 
 
+async def _write_exec_stdin(proc: Any, stdin_bytes: bytes | None) -> None:
+    if stdin_bytes is None or proc.stdin is None:
+        return
+    try:
+        for offset in range(0, len(stdin_bytes), _EXEC_STDIN_WRITE_CHUNK_BYTES):
+            proc.stdin.write(stdin_bytes[offset : offset + _EXEC_STDIN_WRITE_CHUNK_BYTES])
+            await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+
+
+async def _run_host_shell_command(
+    command: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    stdin_bytes: bytes | None,
+    effective_timeout: float,
+) -> str:
+    try:
+        with tempfile.TemporaryFile() as output_file:
+            subprocess_kwargs: dict[str, Any] = {
+                "stdin": asyncio.subprocess.PIPE if stdin_bytes is not None else None,
+                "stdout": output_file,
+                "stderr": asyncio.subprocess.STDOUT,
+                "cwd": cwd,
+                "env": env,
+            }
+            if os.name == "posix":
+                subprocess_kwargs["start_new_session"] = True
+            else:
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if creationflags:
+                    subprocess_kwargs["creationflags"] = creationflags
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + effective_timeout
+            timeout_result = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+
+            proc = await asyncio.create_subprocess_shell(command, **subprocess_kwargs)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                await _terminate_exec_process_tree(proc)
+                return timeout_result
+            try:
+                await asyncio.wait_for(_write_exec_stdin(proc, stdin_bytes), timeout=remaining)
+            except TimeoutError:
+                await _terminate_exec_process_tree(proc)
+                return timeout_result
+
+            remaining = deadline - loop.time()
+            if remaining <= 0 or not await _wait_exec_process(proc, remaining):
+                await _terminate_exec_process_tree(proc)
+                return timeout_result
+            if os.name == "posix":
+                _signal_exec_process_tree(proc, signal.SIGTERM)
+
+            output_file.flush()
+            output_file.seek(0)
+            output = output_file.read().decode("utf-8", errors="replace")
+            return f"exit_code={proc.returncode}\n{output}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
 async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
     try:
         await asyncio.wait_for(output_task, timeout=_BACKGROUND_KILL_TIMEOUT)
@@ -601,6 +755,10 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
             "description": "Extra environment variable overrides.",
             "additionalProperties": {"type": "string"},
         },
+        "stdin": {
+            "type": "string",
+            "description": "Data to write to the command's standard input.",
+        },
         "approval_id": {
             "type": "string",
             "description": "Approval record to consume for warned commands.",
@@ -616,6 +774,7 @@ async def exec_command(
     workdir: str | None = None,
     timeout: float = _DEFAULT_EXEC_TIMEOUT,
     env: dict[str, str] | None = None,
+    stdin: str | None = None,
     approval_id: str | None = None,
 ) -> str:
     import os
@@ -627,13 +786,19 @@ async def exec_command(
     if not result.allowed:
         raise ToolError(result.reason)
 
-    sensitive_block = _sensitive_shell_block("exec_command", command, workdir=cwd)
+    sensitive_block = _sensitive_shell_block(
+        "exec_command", command, workdir=cwd, stdin=stdin
+    )
     if sensitive_block is not None:
         return sensitive_block
-    lockdown_block = _workspace_lockdown_shell_block("exec_command", command, cwd)
+    lockdown_block = _workspace_lockdown_shell_block(
+        "exec_command", command, cwd, stdin=stdin
+    )
     if lockdown_block is not None:
         return json.dumps(lockdown_block, ensure_ascii=False)
-    deny_block = _workspace_write_deny_shell_block("exec_command", command, cwd)
+    deny_block = _workspace_write_deny_shell_block(
+        "exec_command", command, cwd, stdin=stdin
+    )
     if deny_block is not None:
         return json.dumps(deny_block, ensure_ascii=False)
 
@@ -659,6 +824,7 @@ async def exec_command(
     if env:
         merged_env.update(env)
     effective_timeout = _resolve_exec_timeout(timeout)
+    stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
 
     # /elevated on|bypass|full — route exec around the sandbox backend so host
     # paths are actually reachable. Approval is still handled above (elevated
@@ -681,7 +847,7 @@ async def exec_command(
             cwd=request.cwd,
             action_kind=request.action_kind,
             policy=request.policy,
-            stdin=None,
+            stdin=stdin_bytes,
             env=dict(merged_env),
             reason=request.reason,
         )
@@ -695,26 +861,13 @@ async def exec_command(
             )
             if isinstance(escalation, DenialResult):
                 return json.dumps(escalation.to_dict())
-            try:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=cwd,
-                    env=merged_env,
-                )
-                try:
-                    stdout_bytes, _ = await asyncio.wait_for(
-                        proc.communicate(), timeout=effective_timeout
-                    )
-                except TimeoutError:
-                    proc.kill()
-                    await proc.communicate()
-                    return f"[timeout after {effective_timeout}s]\ncommand: {command}"
-                output = stdout_bytes.decode("utf-8", errors="replace")
-                return f"exit_code={proc.returncode}\n{output}"
-            except Exception as e:
-                return f"[error] {e}"
+            return await _run_host_shell_command(
+                command,
+                cwd=cwd,
+                env=merged_env,
+                stdin_bytes=stdin_bytes,
+                effective_timeout=effective_timeout,
+            )
         output = sandbox_result.stdout
         if sandbox_result.stderr:
             output += sandbox_result.stderr
@@ -724,34 +877,13 @@ async def exec_command(
     if elevated_bypass:
         log.info("shell_exec_elevated_host", command=_audit_command(command))
 
-    try:
-        with tempfile.TemporaryFile() as output_file:
-            subprocess_kwargs: dict[str, Any] = {
-                "stdout": output_file,
-                "stderr": asyncio.subprocess.STDOUT,
-                "cwd": cwd,
-                "env": merged_env,
-            }
-            if os.name == "posix":
-                subprocess_kwargs["start_new_session"] = True
-            else:
-                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                if creationflags:
-                    subprocess_kwargs["creationflags"] = creationflags
-
-            proc = await asyncio.create_subprocess_shell(command, **subprocess_kwargs)
-            if not await _wait_exec_process(proc, effective_timeout):
-                await _terminate_exec_process_tree(proc)
-                return f"[timeout after {effective_timeout}s]\ncommand: {command}"
-            if os.name == "posix":
-                _signal_exec_process_tree(proc, signal.SIGTERM)
-
-            output_file.flush()
-            output_file.seek(0)
-            output = output_file.read().decode("utf-8", errors="replace")
-            return f"exit_code={proc.returncode}\n{output}"
-    except Exception as e:
-        return f"[error] {e}"
+    return await _run_host_shell_command(
+        command,
+        cwd=cwd,
+        env=merged_env,
+        stdin_bytes=stdin_bytes,
+        effective_timeout=effective_timeout,
+    )
 
 
 @tool(
@@ -762,7 +894,7 @@ async def exec_command(
         "workdir": {"type": "string", "description": "Working directory (default: cwd)."},
         "timeout": {
             "type": "number",
-            "description": "Timeout in seconds (default 1800, max 3600).",
+            "description": "Timeout in seconds (default 1800, max 5400).",
         },
         "approval_id": {
             "type": "string",
@@ -1002,11 +1134,15 @@ def get_bg_session(session_id: str) -> _BgSession | None:
 
 @tool(
     name="process",
-    description="Manage background_process sessions created by OpenSquilla.",
+    description=(
+        "Manage background_process sessions created by OpenSquilla. To await a "
+        "long-running background command, call action='wait' (blocks until it "
+        "exits or the timeout elapses) instead of polling in a loop."
+    ),
     params={
         "action": {
             "type": "string",
-            "description": "Action: list, poll, log, kill, remove, write, submit, eof.",
+            "description": "Action: list, poll, wait, log, kill, remove, write, submit, eof.",
         },
         "session_id": {
             "type": "string",
@@ -1028,8 +1164,19 @@ def get_bg_session(session_id: str) -> _BgSession | None:
             "type": "integer",
             "description": "For log, maximum characters to return.",
         },
+        "timeout": {
+            "type": "number",
+            "description": (
+                "For wait: max seconds to block for the process to exit (default "
+                "600, max 5400). On timeout, returns with the process still "
+                "running so you can wait again."
+            ),
+        },
     },
     required=["action"],
+    execution_timeout_seconds=_DEFAULT_PROCESS_WAIT_TIMEOUT + _PROCESS_WAIT_TIMEOUT_PADDING,
+    execution_timeout_argument="timeout",
+    execution_timeout_padding=_PROCESS_WAIT_TIMEOUT_PADDING,
 )
 async def process(
     action: str,
@@ -1038,6 +1185,7 @@ async def process(
     data: str | None = None,
     offset: int | None = None,
     limit: int | None = None,
+    timeout: float | None = None,
 ) -> str:
     if action == "list":
         sessions = [_bg_session_payload(session) for session in _iter_visible_bg_sessions()]
@@ -1049,6 +1197,37 @@ async def process(
     if action == "poll":
         return json.dumps(
             {"status": "ok", "action": action, "session": _bg_session_payload(session)}
+        )
+
+    if action == "wait":
+        wait_timeout = _resolve_process_wait_timeout(timeout)
+        exited = session.done or session.process.returncode is not None
+        if not exited:
+            exited = await _wait_bg_process(session, wait_timeout)
+        # The process can exit right at the timeout boundary, where
+        # _wait_bg_process reports False; re-read live state so we still drain +
+        # finalize instead of returning a stale "running" payload (codex review).
+        exited = exited or session.done or session.process.returncode is not None
+        if exited:
+            # Drain the collector so returncode/ended_at/output reflect the
+            # final state before reporting (codex review: no stale "running").
+            if session.collector_task is not None and not session.collector_task.done():
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.shield(session.collector_task),
+                        timeout=_BACKGROUND_KILL_TIMEOUT,
+                    )
+            if not session.done:
+                _finalize_bg_session(session)
+        # Do NOT set session.timed_out when the wait action itself times out —
+        # that field means the process exceeded its own lifetime (codex review).
+        return json.dumps(
+            {
+                "status": "ok",
+                "action": action,
+                "exited": bool(session.done or session.process.returncode is not None),
+                "session": _bg_session_payload(session),
+            }
         )
 
     if action == "log":
@@ -1159,7 +1338,7 @@ async def process(
             }
         )
 
-    raise ToolError("Invalid action: list|poll|log|kill|remove|write|submit|eof")
+    raise ToolError("Invalid action: list|poll|wait|log|kill|remove|write|submit|eof")
 
 
 def _sandbox_request_for(
@@ -1239,6 +1418,27 @@ def _wait_for_inline_browser_approval(background: bool) -> bool:
     return ctx is not None and ctx.caller_kind is CallerKind.WEB
 
 
+def _channel_approver_origin() -> str | None:
+    """Return the originating channel ``sender_id`` when one can be reached.
+
+    A channel-originated turn runs UNATTENDED, but if the originating user is
+    reachable on the channel (the run carries a channel caller, a delivery
+    target on the session, and the ``sender_id`` of whoever started the turn)
+    that user can be asked to approve out of band — exactly like the Web UI
+    poll path. Returns the ``sender_id`` to record as the approval owner, or
+    ``None`` when no approver channel is reachable (cron, subagent, or a
+    channel run that lost its sender).
+    """
+    ctx = current_tool_context.get()
+    if ctx is None or ctx.caller_kind is not CallerKind.CHANNEL:
+        return None
+    sender_id = (ctx.sender_id or "").strip()
+    channel_kind = (ctx.channel_kind or "").strip()
+    if not sender_id or not channel_kind:
+        return None
+    return sender_id
+
+
 def _apply_approval_elevated_mode(entry: object) -> None:
     params = getattr(entry, "params", None)
     if not isinstance(params, dict):
@@ -1249,6 +1449,40 @@ def _apply_approval_elevated_mode(entry: object) -> None:
     ctx = current_tool_context.get()
     if ctx is not None and ctx.is_owner:
         ctx.elevated = mode
+
+
+def _unapproved_envelope(
+    entry: object,
+    approval_id: str,
+    command: str,
+    warning: str,
+) -> dict[str, object]:
+    """Build the tool result for an approval that did not approve.
+
+    An expiry (deadline lapsed with no response) reads distinctly from a human
+    deny so the agent does not infer a deliberate refusal: it is told the action
+    simply was not run and may be re-requested. A real deny keeps its existing
+    message untouched.
+    """
+    if getattr(entry, "resolution", "") == RESOLUTION_EXPIRED:
+        return {
+            "status": "approval_denied",
+            "approval_id": approval_id,
+            "command": command,
+            "warning": warning,
+            "expired": True,
+            "message": (
+                "This action expired without a response and was not run; "
+                "ask again if it's still needed."
+            ),
+        }
+    return {
+        "status": "approval_denied",
+        "approval_id": approval_id,
+        "command": command,
+        "warning": warning,
+        "message": "Approval was denied.",
+    }
 
 
 async def _check_exec_approval(
@@ -1262,6 +1496,7 @@ async def _check_exec_approval(
     queue = get_approval_queue()
     settings = queue.get_settings()
     ctx = current_tool_context.get()
+    channel_owner_sender_id = _channel_approver_origin()
     params = {
         "toolName": tool_name,
         "command": command,
@@ -1270,6 +1505,12 @@ async def _check_exec_approval(
         "agent": ctx.agent_id if ctx is not None else "",
         "mode": "background" if background else "foreground",
     }
+    if channel_owner_sender_id is not None:
+        # Record who started the channel turn so only that user can resolve
+        # this approval from the channel (owner-only, default-deny on mismatch),
+        # and mark the origin channel so the notify bridge can route the prompt.
+        params["senderId"] = channel_owner_sender_id
+        params["channelKind"] = (ctx.channel_kind or "").strip() if ctx is not None else ""
 
     elevated_mode = _context_elevated_mode()
     elevated_full = elevated_mode == "full"
@@ -1321,6 +1562,27 @@ async def _check_exec_approval(
         )
         return deny_block
 
+    # Operator-configured allow/deny patterns. A deny match is a hard block on
+    # par with the guards above (deny precedence), so it runs before any
+    # elevated bypass. The allow side is evaluated later, where it can only
+    # short-circuit the prompt — never the hard guards.
+    pattern_class = classify_command(
+        command, settings.allow_patterns, settings.deny_patterns
+    )
+    if pattern_class == "deny":
+        log.warning(
+            "shell_approval_denied_pattern",
+            command=_audit_command(command),
+            tool=tool_name,
+        )
+        return {
+            "status": "approval_denied",
+            "approval_id": "",
+            "command": command,
+            "warning": warning,
+            "message": "This command was denied by the active approval policy.",
+        }
+
     # /elevated full — trusted operator has taken explicit responsibility.
     # Approvals are skipped entirely.
     if elevated_full:
@@ -1366,12 +1628,39 @@ async def _check_exec_approval(
         _elevate_current_call.set(True)
         return None
 
-    if ctx is not None and ctx.interaction_mode is InteractionMode.UNATTENDED:
+    if (
+        ctx is not None
+        and ctx.interaction_mode is InteractionMode.UNATTENDED
+        and channel_owner_sender_id is None
+    ):
+        # Unattended runs without a reachable approver (cron, subagent, or a
+        # channel run that lost its sender) cannot prompt anyone — fail fast
+        # before enqueuing so no orphaned approval is left pending. A channel
+        # run WITH a reachable owner falls through to enqueue + wait below; the
+        # interaction mode stays UNATTENDED so the UNATTENDED-gated tool-surface
+        # denials in policy_runtime are untouched.
         raise UnsupportedSurfaceError(
             f"Tool '{tool_name}' requires human approval, but this run is unattended. "
             "Use an interactive surface for approval-gated operations, or choose an "
             "operation that does not require approval."
         )
+
+    # Allow-pattern short-circuit: an operator-configured allow match skips the
+    # prompt, like auto-approve. It is gated on ``not sandbox_off_requires_approval``
+    # so it can never override the forced-approval-when-sandbox-off hard guard,
+    # and it only runs after the deny/sensitive/lockdown hard blocks above.
+    if (
+        approval_id is None
+        and not sandbox_off_requires_approval
+        and pattern_class == "allow"
+    ):
+        log.info(
+            "shell_approval_allowed_pattern",
+            command=_audit_command(command),
+            tool=tool_name,
+        )
+        _elevate_current_call.set(True)
+        return None
 
     # Intent-level short-circuit: if the user already approved the same
     # destructive intent recently (e.g. rm /x, and now os.remove("/x")),
@@ -1390,14 +1679,20 @@ async def _check_exec_approval(
 
     if approval_id is None:
         approval_id = queue.request(namespace="exec", params=params)
-        if _wait_for_inline_browser_approval(background):
+        # Both the Web UI poll path and a reachable channel approver let the
+        # tool call block on the queue and continue the instant the user
+        # resolves it. A channel approval only ever grants this one gated call
+        # (never session-wide elevation), so the per-call host grant is set but
+        # the session elevated-mode application is skipped for channel origins.
+        if _wait_for_inline_browser_approval(background) or channel_owner_sender_id is not None:
             try:
                 await queue.wait(approval_id, timeout=_APPROVAL_RETRY_WAIT_SECONDS)
             except TimeoutError:
                 pass
             entry = queue.get(approval_id)
             if entry.approved:
-                _apply_approval_elevated_mode(entry)
+                if channel_owner_sender_id is None:
+                    _apply_approval_elevated_mode(entry)
                 try:
                     queue.consume(approval_id)
                 except ValueError as exc:
@@ -1410,13 +1705,7 @@ async def _check_exec_approval(
                 )
                 _elevate_current_call.set(True)
                 return None
-            return {
-                "status": "approval_denied",
-                "approval_id": approval_id,
-                "command": command,
-                "warning": warning,
-                "message": "Approval was denied or timed out.",
-            }
+            return _unapproved_envelope(entry, approval_id, command, warning)
         status = "approval_required"
         message = (
             "Resolve this approval via exec.approval.resolve and retry with the returned "
@@ -1466,13 +1755,7 @@ async def _check_exec_approval(
                 ),
             }
     if not entry.approved:
-        return {
-            "status": "approval_denied",
-            "approval_id": approval_id,
-            "command": command,
-            "warning": warning,
-            "message": "Approval was denied.",
-        }
+        return _unapproved_envelope(entry, approval_id, command, warning)
     try:
         _apply_approval_elevated_mode(entry)
         queue.consume(approval_id)

@@ -81,7 +81,7 @@ def test_g2_passes_on_valid_p1() -> None:
 
 EXISTING_META_BUNDLES = [
     "meta-pdf-intelligence", "meta-travel-planner",
-    "meta-migration-assistant", "meta-web-research-to-report",
+    "meta-migration-assistant",
     "meta-stack-trace-investigator", "meta-paper-write",
     "meta-skill-creator",
 ]

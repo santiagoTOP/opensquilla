@@ -1,0 +1,97 @@
+{
+  "name": "@opensquilla/desktop-electron",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Electron desktop shell for the OpenSquilla Control UI.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/opensquilla/opensquilla.git"
+  },
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:gateway": "node scripts/build-gateway.mjs",
+    "build:web": "cd ../../opensquilla-webui && npm run build",
+    "dev": "npm run build && electron .",
+    "dist:local": "npm run build:web && npm run build:gateway && npm run dist",
+    "pack:local": "npm run build:web && npm run build:gateway && npm run pack",
+    "verify:package": "node scripts/verify-package.mjs",
+    "start": "electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "electron": "^42.3.3",
+    "electron-builder": "^26.8.1",
+    "playwright": "^1.60.0",
+    "typescript": "^6.0.3"
+  },
+  "build": {
+    "appId": "ai.opensquilla.desktop",
+    "productName": "OpenSquilla",
+    "artifactName": "OpenSquilla-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "output": "../../dist/desktop-electron"
+    },
+    "files": [
+      "dist/**",
+      "assets/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "src/boot.html",
+        "to": "boot.html"
+      },
+      {
+        "from": "runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "icon": "assets/icon.icns",
+      "backgroundColor": "#ffffff",
+      "iconSize": 92,
+      "window": {
+        "width": 540,
+        "height": 380
+      },
+      "contents": [
+        {
+          "x": 170,
+          "y": 205,
+          "type": "file"
+        },
+        {
+          "x": 370,
+          "y": 205,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

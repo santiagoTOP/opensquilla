@@ -83,6 +83,28 @@ async def test_no_skip_raises_meta_paused_after_successful_cas():
     assert kwargs["awaiting_since"] == 1700000000.0
 
 
+@pytest.mark.asyncio
+async def test_claim_failure_reports_missing_run_instead_of_generic_rejection():
+    dao = MagicMock()
+    dao.try_claim_awaiting.return_value = False
+    dao.get_run.return_value = None
+
+    with pytest.raises(RuntimeError) as exc:
+        await run_user_input_step(
+            _step(_cfg()),
+            inputs={"user_message": "hi", "collected": {}},
+            outputs={"upstream": "some output"},
+            run_id="missing-run",
+            session_id="S1",
+            dao=dao,
+            now=lambda: 1700000000.0,
+        )
+
+    message = str(exc.value)
+    assert "meta run 'missing-run' was not found" in message
+    assert "awaiting claim rejected" not in message
+
+
 def test_clarify_copy_renders_against_inputs_and_outputs():
     cfg = ClarifyStepConfig(
         mode="form",
@@ -174,6 +196,57 @@ async def test_english_pause_filters_cjk_cancel_keywords_and_prompts():
 
 
 @pytest.mark.asyncio
+async def test_pause_uses_explicit_localized_intro_and_prompts():
+    cfg = ClarifyStepConfig(
+        mode="form",
+        fields=(
+            ClarifyField(
+                name="topic",
+                type="string",
+                required=True,
+                prompt="主题 / Topic",
+                prompt_by_language={"zh": "主题", "en": "Topic"},
+            ),
+        ),
+        intro="补充信息 / Add details",
+        intro_by_language={
+            "zh": "请补充信息。",
+            "en": "Please add details.",
+        },
+    )
+
+    dao = MagicMock()
+    dao.try_claim_awaiting.return_value = True
+    with pytest.raises(MetaPaused) as zh_exc:
+        await run_user_input_step(
+            _step(cfg),
+            inputs={"user_message": "写一份报告", "user_language": "zh", "collected": {}},
+            outputs={},
+            run_id="r1",
+            session_id="S1",
+            dao=dao,
+            now=lambda: 1700000000.0,
+        )
+
+    assert zh_exc.value.schema.intro == "请补充信息。"
+    assert zh_exc.value.schema.fields[0].prompt == "主题"
+
+    with pytest.raises(MetaPaused) as en_exc:
+        await run_user_input_step(
+            _step(cfg),
+            inputs={"user_message": "write a report", "user_language": "en", "collected": {}},
+            outputs={},
+            run_id="r2",
+            session_id="S1",
+            dao=dao,
+            now=lambda: 1700000001.0,
+        )
+
+    assert en_exc.value.schema.intro == "Please add details."
+    assert en_exc.value.schema.fields[0].prompt == "Topic"
+
+
+@pytest.mark.asyncio
 async def test_cas_failure_does_not_raise_meta_paused():
     """When the DAO rejects the claim, the executor signals a normal failure
     by raising RuntimeError. The orchestrator treats it as a regular step
@@ -215,9 +288,8 @@ async def test_cancelled_error_propagates_unchanged():
     """If the DAO call is cancelled mid-call, the executor must not swallow
     the CancelledError — the scheduler relies on it to tear down siblings.
 
-    `try_claim_awaiting` is a SYNCHRONOUS method on MetaRunWriter; the
-    executor wraps it with asyncio.to_thread. We simulate the raise by
-    giving the MagicMock a sync `side_effect`."""
+    `try_claim_awaiting` is a SYNCHRONOUS method on MetaRunWriter. We
+    simulate the raise by giving the MagicMock a sync `side_effect`."""
     dao = MagicMock()
     dao.try_claim_awaiting = MagicMock(side_effect=asyncio.CancelledError())
 
@@ -302,6 +374,57 @@ async def test_prefill_scan_seeds_awaiting_filled_with_known_values() -> None:
     assert "days" not in filled
     ambiguous = {a["name"] for a in audit["ambiguous"]}
     assert "days" in ambiguous
+
+
+@pytest.mark.asyncio
+async def test_prefill_scan_ignores_empty_sentinel_from_catch_all_field() -> None:
+    """Prefill runs before the user has answered, so an extractor that follows
+    a catch-all prompt's empty-input instruction must not make ``(empty)`` look
+    like a real user confirmation."""
+    dao = MagicMock()
+    dao.try_claim_awaiting.return_value = True
+    chat = _llm_returning({
+        "intent": "FILL",
+        "fields": {"review": "(empty)"},
+        "ambiguous_fields": [],
+        "unknown_mentions": [],
+    })
+    cfg = _cfg_with_nl_extract(
+        ClarifyField(
+            name="review",
+            type="string",
+            required=True,
+            prompt=(
+                "The user's verbatim reply about the script draft. "
+                "If the user's reply is empty or pure whitespace, emit \"(empty)\"."
+            ),
+        ),
+    )
+
+    with pytest.raises(MetaPaused) as exc:
+        await run_user_input_step(
+            _step(cfg),
+            inputs={"user_message": "生成一个短剧，啥都行", "collected": {}},
+            outputs={"script_draft": "draft text"},
+            run_id="r1",
+            session_id="S1",
+            dao=dao,
+            now=lambda: 1700000000.0,
+            llm_chat=chat,
+            prefill_context={
+                "original_user_message": "生成一个短剧，啥都行",
+                "prior_step_outputs": {"script_draft": "draft text"},
+            },
+        )
+
+    kwargs = dao.try_claim_awaiting.call_args.kwargs
+    filled = json.loads(kwargs["awaiting_filled_json"])
+    assert "review" not in filled
+    audit = filled.get("__prefill_audit__")
+    assert audit
+    assert "review" not in audit.get("fields", [])
+    assert audit.get("dropped_empty_sentinels") == ["review"]
+    assert exc.value.confirmed_fields is None
 
 
 def test_deterministic_prefill_skips_empty_list_and_unspecified_sentinels() -> None:

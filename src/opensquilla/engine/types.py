@@ -7,6 +7,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 from opensquilla.execution_status import ExecutionStatus
+from opensquilla.session.compaction_lifecycle import (
+    DEFAULT_FLUSH_TRIGGERS,
+    normalize_flush_triggers_strict,
+)
 from opensquilla.tool_boundary import ToolCall as ToolCall
 from opensquilla.tool_boundary import ToolResult as ToolResult
 
@@ -58,6 +62,12 @@ class ThinkingEvent:
 class TextDeltaEvent:
     kind: Literal["text_delta"] = field(default="text_delta", init=False)
     text: str = ""
+    # Whether this text is the turn's final answer (render as a card) or
+    # intermediate narration between tool calls (render as a lightweight purple
+    # ✱ line). Decided by the agent from whether the producing provider call
+    # ended up making tool calls — see agent.py. Defaults to "answer" so any
+    # producer that does not set it keeps the pre-existing card behavior.
+    presentation: Literal["intermediate", "answer"] = "answer"
 
 
 @dataclass
@@ -75,6 +85,13 @@ class ToolUseStartEvent:
     tool_use_id: str = ""
     tool_name: str = ""
     synthetic_from_text: bool = False
+
+
+@dataclass
+class ToolUseDeltaEvent:
+    kind: Literal["tool_use_delta"] = field(default="tool_use_delta", init=False)
+    tool_use_id: str = ""
+    json_fragment: str = ""
 
 
 @dataclass
@@ -113,6 +130,7 @@ class ArtifactEvent:
     created_at: str = ""
     download_url: str = ""
     store: str = "artifacts"
+    has_thumbnail: bool = False
 
 
 @dataclass
@@ -164,6 +182,14 @@ class DoneEvent:
     session_totals: SessionTotalsSnapshot | None = None
     routing_applied: bool = True
     rollout_phase: str = "full"
+    image_route_reason: str | None = None
+    vision_followup_gate_decision: str | None = None
+    vision_followup_gate_confidence: float | None = None
+    vision_followup_gate_reason: str | None = None
+    vision_followup_gate_source: str | None = None
+    vision_followup_gate_model: str | None = None
+    vision_followup_needs_image: bool | None = None
+    vision_followup_fallback: str | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -196,6 +222,83 @@ class RouterDecisionEvent:
     prompt_policy: str = ""
     routing_applied: bool = True
     rollout_phase: str = "full"
+    context_window: int | None = None
+
+
+@dataclass
+class MetaPreflightEvent:
+    """Emitted before a MetaSkill run begins when the plan declares a
+    ``request_template``. This is a non-blocking preview of the interpreted
+    request and declared assumptions; the scheduler continues after emitting it.
+    """
+
+    kind: Literal["meta_preflight"] = field(default="meta_preflight", init=False)
+    run_id: str = ""
+    meta_skill_name: str = ""
+    request_template: dict[str, Any] = field(default_factory=dict)
+    interpreted_request: str = ""
+    missing_fields: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    can_skip: bool = True
+    requires_confirmation: bool = False
+
+
+@dataclass
+class MetaRunAnnouncedEvent:
+    """Emitted once when a MetaSkill run starts and its plan has been
+    compiled. WebUI uses this to seed the step ribbon with all declared
+    step ids, labels, kinds, and dependency edges. `parent_run_id` is
+    reserved for nested meta-skill rollouts (always None today).
+    """
+
+    kind: Literal["meta_run_announced"] = field(default="meta_run_announced", init=False)
+    run_id: str = ""
+    meta_skill_name: str = ""
+    language: str = ""
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    total: int = 0
+    parent_run_id: str | None = None
+
+
+@dataclass
+class MetaStepStateEvent:
+    """One state transition for a single MetaSkill step within a run.
+
+    `state` is one of pending / running / succeeded / failed / skipped /
+    substituted. `status_text` is an optional short human-readable label
+    shown under the active chip; `error` carries the failure message when
+    `state == "failed"`; `substitute_for` is set on the substitute step
+    yielded after an `on_failure` branch fires.
+    """
+
+    kind: Literal["meta_step_state"] = field(default="meta_step_state", init=False)
+    run_id: str = ""
+    step_id: str = ""
+    state: Literal[
+        "pending", "running", "succeeded", "failed", "skipped", "substituted"
+    ] = "pending"
+    status_text: str | None = None
+    error: str | None = None
+    substitute_for: str | None = None
+    rescue: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MetaRunCompletedEvent:
+    """Terminal event for a MetaSkill run. `outcome` is one of
+    ok / failed / cancelled. The three step-id lists let the WebUI freeze
+    the final ribbon state without scanning back through the stream.
+    `recovered_steps` keeps the audit trail for failed steps whose
+    on-failure substitute completed successfully.
+    """
+
+    kind: Literal["meta_run_completed"] = field(default="meta_run_completed", init=False)
+    run_id: str = ""
+    outcome: Literal["ok", "failed", "cancelled"] = "ok"
+    completed_steps: list[str] = field(default_factory=list)
+    failed_steps: list[str] = field(default_factory=list)
+    recovered_steps: list[str] = field(default_factory=list)
+    skipped_steps: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +346,7 @@ AgentEvent = (
     | TextDeltaEvent
     | RunHeartbeatEvent
     | ToolUseStartEvent
+    | ToolUseDeltaEvent
     | ToolResultEvent
     | RouterControlReplayEvent
     | ArtifactEvent
@@ -252,6 +356,10 @@ AgentEvent = (
     | CompactionEvent
     | WarningEvent
     | RouterDecisionEvent
+    | MetaPreflightEvent
+    | MetaRunAnnouncedEvent
+    | MetaStepStateEvent
+    | MetaRunCompletedEvent
 )
 
 
@@ -308,9 +416,10 @@ class AgentConfig:
     context_overflow_threshold: float = 0.85  # trigger at 85%
     max_overflow_retries: int = 2
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
+    preserve_historical_images: bool = False
     # Retry policy for transient LLM errors (429, 500, 503)
     max_provider_retries: int = 3
-    length_capped_continuations: int = 1
+    length_capped_continuations: int = 3
     retry_base_backoff_ms: int = 1000
     retry_max_backoff_ms: int = 30_000
     # Prompt caching breakpoints (list of {"text": ..., "cache": "true"})
@@ -325,6 +434,10 @@ class AgentConfig:
     skills_context_prompt: str | None = None
     # Pre-compaction memory flush
     flush_enabled: bool = False
+    flush_triggers: list[str] = field(
+        default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS)
+    )
+    flush_pre_compaction: bool = False
     flush_timeout_seconds: float = 15.0
     flush_background_timeout_seconds: float = 120.0
     flush_backoff_initial_seconds: float = 30.0
@@ -332,6 +445,8 @@ class AgentConfig:
     flush_archive_max_bytes: int = 800_000
     flush_compaction_requires_safe_receipt: bool = False
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
+    compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
+    compaction_protected_recent_messages: int = 0
     repair_enabled: bool = True
     repair_interval_seconds: float = 60.0
     repair_max_items_per_tick: int = 5
@@ -363,6 +478,13 @@ class AgentConfig:
     tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
     tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))
+        self.compaction_protected_recent_messages = max(
+            0,
+            int(self.compaction_protected_recent_messages or 0),
+        )
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:
         """Return (enabled, budget_tokens) based on the thinking field.

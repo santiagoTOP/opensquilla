@@ -42,15 +42,22 @@ async def run_tui_runtime(
             with contextlib.suppress(Exception):
                 await abort_turn
 
-        def _cancel_inflight_turn() -> None:
+        def _cancel_inflight_turn() -> asyncio.Task[None] | None:
             task = turn_task
             if task is not None and not task.done():
+                abort_task: asyncio.Task[None] | None = None
+                runtime_state.clear_pending()
                 with contextlib.suppress(Exception):
                     abort_turn = hooks.on_cancel_active_turn()
-                    asyncio.create_task(_schedule_abort(abort_turn))
+                    abort_task = asyncio.create_task(_schedule_abort(abort_turn))
                 task.cancel()
+                return abort_task
+            return None
 
-        tui_surface.set_cancel_callback(_cancel_inflight_turn)
+        def _cancel_callback() -> None:
+            _cancel_inflight_turn()
+
+        tui_surface.set_cancel_callback(_cancel_callback)
 
         def _shutdown_drain_then_exit() -> None:
             tui_surface.emit_eof()
@@ -116,6 +123,16 @@ async def run_tui_runtime(
 
         next_line_task: asyncio.Task[str | None] | None = None
 
+        async def _ensure_next_line_task() -> None:
+            nonlocal next_line_task
+            if next_line_task is not None:
+                return
+            next_line_task = asyncio.create_task(
+                tui_surface.next_line(),
+                name=f"chat-input-{task_name}",
+            )
+            await asyncio.sleep(0)
+
         async def _drop_next_line() -> None:
             nonlocal next_line_task
             if next_line_task is None:
@@ -130,15 +147,21 @@ async def run_tui_runtime(
 
         try:
             while True:
-                if next_line_task is None:
-                    next_line_task = asyncio.create_task(
-                        tui_surface.next_line(),
-                        name=f"chat-input-{task_name}",
-                    )
+                can_read_input = (
+                    config.concurrent_input_during_turn
+                    or turn_task is None
+                    or turn_task.done()
+                )
+                if next_line_task is None and can_read_input:
+                    await _ensure_next_line_task()
 
-                waitables: set[asyncio.Task[Any]] = {next_line_task}
+                waitables: set[asyncio.Task[Any]] = set()
+                if next_line_task is not None:
+                    waitables.add(next_line_task)
                 if turn_task is not None and not turn_task.done():
                     waitables.add(turn_task)
+                if not waitables:
+                    continue
                 await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
 
                 if turn_task is not None and turn_task.done():
@@ -155,10 +178,10 @@ async def run_tui_runtime(
                         )
                         turn_task = asyncio.create_task(_run_dispatch(queued), name=task_name)
                         continue
-                    if not next_line_task.done():
+                    if next_line_task is None or not next_line_task.done():
                         continue
 
-                if not next_line_task.done():
+                if next_line_task is None or not next_line_task.done():
                     continue
                 user_input = next_line_task.result()
                 next_line_task = None
@@ -187,11 +210,13 @@ async def run_tui_runtime(
                 if category is TuiInputKind.DESTRUCTIVE:
                     runtime_state.clear_pending()
                     if turn_task is not None and not turn_task.done():
-                        turn_task.cancel()
+                        abort_task = _cancel_inflight_turn()
                         try:
                             await turn_task
                         except asyncio.CancelledError:
                             hooks.clear_current_cancel()
+                        if abort_task is not None:
+                            await abort_task
                         turn_task = None
                     keep_going = await _run_dispatch(user_input)
                     if not keep_going:
@@ -223,6 +248,8 @@ async def run_tui_runtime(
                     runtime_state.enqueue(user_input)
                     continue
 
+                if config.concurrent_input_during_turn:
+                    await _ensure_next_line_task()
                 turn_task = asyncio.create_task(_run_dispatch(user_input), name=task_name)
         finally:
             if hooks.clear_exposed_surface is not None:

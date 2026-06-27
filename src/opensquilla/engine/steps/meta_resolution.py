@@ -35,11 +35,17 @@ from typing import Any
 import structlog
 
 from opensquilla.engine.pipeline import TurnContext
+from opensquilla.skills.meta.clarify_autofill import (
+    autofill_required_clarify_fields,
+    is_empty_clarify_submission,
+)
 from opensquilla.skills.meta.clarify_nl_extract import extract as _nl_extract
 from opensquilla.skills.meta.clarify_text import parse_clarify_reply
-from opensquilla.skills.meta.inputs import make_meta_inputs
+from opensquilla.skills.meta.inputs import (
+    make_meta_inputs,
+    meta_input_overrides_from_metadata,
+)
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
-from opensquilla.skills.meta.semantic_guards import semantic_meta_skill_allowed
 from opensquilla.skills.meta.types import MetaMatch
 from opensquilla.skills.retrieval import HybridRetriever
 from opensquilla.skills.types import SkillSpec
@@ -143,6 +149,20 @@ def _clamp_thinking_for_meta(ctx: TurnContext) -> None:
     ctx.metadata["thinking_source"] = "meta_resolution"
 
 
+def _input_provenance_kind(ctx: TurnContext) -> str:
+    """Return normalized input provenance kind from pipeline metadata."""
+
+    metadata = getattr(ctx, "metadata", {})
+    provenance = metadata.get("input_provenance")
+    if isinstance(provenance, Mapping):
+        kind = provenance.get("kind")
+        return str(kind) if kind is not None and str(kind) else ""
+    if isinstance(provenance, str):
+        return provenance
+    kind = metadata.get("input_provenance_kind")
+    return str(kind) if kind is not None and str(kind) else ""
+
+
 def _hits_cancel_keywords(message: str, keywords: tuple[str, ...]) -> bool:
     if not keywords:
         return False
@@ -151,6 +171,17 @@ def _hits_cancel_keywords(message: str, keywords: tuple[str, ...]) -> bool:
         if kw and kw in lower:
             return True
     return False
+
+
+def _clarify_errors_allow_autofill(errors: list[str]) -> bool:
+    if not errors:
+        return True
+    for error in errors:
+        lowered = str(error).lower()
+        if "required field" in lowered or "empty value" in lowered:
+            continue
+        return False
+    return True
 
 
 def _current_semantic_text(ctx: TurnContext) -> str:
@@ -389,7 +420,39 @@ def _deserialize_awaiting_schema(schema_json: str):
 
 
 _META_SKILL_EXPLANATION_RE = re.compile(
-    r"\b(how|what|why|explain|describe)\b.*\bmeta-skill\b"
+    r"\b(how|what|why|explain|describe)\b.*\bmeta[-\s]?skills?\b"
+)
+
+_META_SKILL_SUBJECT_RE = re.compile(
+    r"(?:meta[-_\s]?skills?|元技能|meta\s*技能)",
+    re.IGNORECASE,
+)
+_META_SKILL_DISCUSSION_CUES = (
+    "吗",
+    "么",
+    "是否",
+    "有没有",
+    "调用了",
+    "调用过",
+    "为什么",
+    "怎么",
+    "如何",
+    "机制",
+    "教程",
+    "注意",
+    "原因",
+    "质量",
+    "好差",
+    "太差",
+    "生成的差",
+    "generated poorly",
+    "bad quality",
+    "called",
+    "invoked",
+    "why",
+    "how",
+    "explain",
+    "describe",
 )
 
 _PASTED_CONTEXT_MARKERS = (
@@ -426,6 +489,18 @@ def _looks_like_pasted_context(message: str) -> bool:
     if not marker_hit:
         return False
     return len(text) > 1200 or text.count("\n") >= 8
+
+
+def _is_meta_skill_discussion_intent(query: str) -> bool:
+    """Detect questions about meta-skills themselves, not requests to run one."""
+
+    text = (query or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if not _META_SKILL_SUBJECT_RE.search(lower):
+        return False
+    return any(cue in lower for cue in _META_SKILL_DISCUSSION_CUES)
 
 
 def _trigger_match_text(message: str) -> str:
@@ -487,6 +562,59 @@ def _highest_text_tier(ctx: TurnContext) -> tuple[str, str] | None:
         return None
     _key, tier_name, model = max(candidates, key=lambda item: item[0])
     return tier_name, model
+
+
+def _text_tier_at_least(ctx: TurnContext, minimum: str) -> tuple[str, str] | None:
+    """Return the lowest configured text tier at or above ``minimum``."""
+
+    router_cfg = getattr(getattr(ctx, "config", None), "squilla_router", None)
+    tiers = getattr(router_cfg, "tiers", None)
+    if not isinstance(tiers, dict) or not tiers:
+        return None
+    minimum_key = _tier_sort_key(minimum, 0)[0]
+
+    candidates: list[tuple[tuple[int, int], str, str]] = []
+    for index, (name, tier_cfg) in enumerate(tiers.items()):
+        if not isinstance(tier_cfg, dict):
+            continue
+        if bool(tier_cfg.get("image_only", False)):
+            continue
+        model = str(tier_cfg.get("model") or "").strip()
+        tier_name = str(name).strip()
+        tier_key = _tier_sort_key(tier_name, index)
+        if tier_name and model and tier_key[0] >= minimum_key:
+            candidates.append((tier_key, tier_name, model))
+    if not candidates:
+        return None
+    _key, tier_name, model = min(candidates, key=lambda item: item[0])
+    return tier_name, model
+
+
+def _upgrade_meta_entry_model(
+    ctx: TurnContext,
+    *,
+    tier_name: str,
+    model: str,
+    source: str,
+) -> None:
+    baseline_model = str(getattr(ctx, "model", "") or "")
+    ctx.model = model
+    ctx.metadata["meta_required_tier"] = tier_name
+    ctx.metadata["meta_required_model"] = model
+    ctx.metadata["meta_required_source"] = source
+    ctx.metadata.setdefault("baseline_model", baseline_model)
+    ctx.metadata["routed_tier"] = tier_name
+    ctx.metadata["routed_model"] = model
+    ctx.metadata["routing_source"] = "meta_skill_required_tier"
+    ctx.metadata["routing_confidence"] = 1.0
+    ctx.metadata["routing_applied"] = True
+    ctx.metadata["applied_model"] = model
+    ctx.metadata["meta_resolution_model_upgrade"] = {
+        "from_model": baseline_model,
+        "to_model": model,
+        "to_tier": tier_name,
+        "source": source,
+    }
 
 
 def _trigger_matches(trigger: str, message_lower: str) -> bool:
@@ -650,8 +778,6 @@ def _semantic_meta_candidate(
     if not ranked:
         return None
     chosen_name = getattr(ranked[0], "name", "")
-    if not semantic_meta_skill_allowed(str(chosen_name), str(query)):
-        return None
     for priority, name, plan, _spec in candidates:
         if name == chosen_name:
             return (priority, name, plan, "semantic")
@@ -818,7 +944,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
             previously_filled = raw_filled
             if isinstance(prefill_audit, dict) and prefill_audit:
                 ctx.metadata["meta_clarify_prefill_audit"] = prefill_audit
-            if schema.nl_extract:
+            is_structured_clarify_form = _input_provenance_kind(ctx) == "clarify_form"
+            if schema.nl_extract and not is_structured_clarify_form:
                 # PR9+: when explicitly enabled, prefer LLM extraction over
                 # deterministic text parsing. Validators are reapplied inside
                 # extract() so prompt-injection in user_message cannot bypass
@@ -954,7 +1081,11 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                                 # PROCEED_NOW — resume the DAG so the
                                 # workflow moves forward on its own.
                                 parsed, errors = cumulative, []
-            if not parsed and (not schema.nl_extract or not nl_attempted):
+            if not parsed and (
+                not schema.nl_extract
+                or not nl_attempted
+                or is_structured_clarify_form
+            ):
                 # Bug-X + Bug-Y mirror for the deterministic path: the
                 # parser's ``_check_required`` only sees this turn's
                 # reply and wipes ``parsed`` to ``{}`` on any error
@@ -982,6 +1113,61 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                 )
                 if not errors and parsed and previously_filled:
                     parsed = {**previously_filled, **parsed}
+            if errors and not parsed and ctx.message.strip():
+                from dataclasses import replace
+
+                relaxed_schema = replace(
+                    schema,
+                    fields=tuple(replace(field, required=False) for field in schema.fields),
+                )
+                partial, partial_errors = parse_clarify_reply(
+                    ctx.message,
+                    relaxed_schema,
+                    surface=getattr(ctx, "surface_kind", "unknown"),
+                )
+                if not partial_errors and partial:
+                    parsed = {**previously_filled, **partial}
+            candidate_fields = {**previously_filled, **parsed}
+            infer_optional_fields = (
+                is_structured_clarify_form
+                and is_empty_clarify_submission(candidate_fields)
+            )
+            if infer_optional_fields or _clarify_errors_allow_autofill(errors):
+                try:
+                    inputs_for_autofill = _json_object(awaiting.inputs_json)
+                    outputs_for_autofill = _json_object(awaiting.step_outputs_json)
+                    filled_auto, completed_auto = await autofill_required_clarify_fields(
+                        schema=schema,
+                        filled_fields=candidate_fields,
+                        user_message=str(inputs_for_autofill.get("user_message") or ""),
+                        clarify_reply=ctx.message,
+                        prior_step_outputs=outputs_for_autofill,
+                        llm_chat=ctx.metadata.get("meta_llm_chat"),
+                        infer_optional_fields=infer_optional_fields,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "meta_resolution.clarify_autofill_failed",
+                        error=str(exc),
+                    )
+                    filled_auto, completed_auto = candidate_fields, {}
+            else:
+                filled_auto, completed_auto = candidate_fields, {}
+            missing_after_autofill = [
+                field.name
+                for field in schema.fields
+                if field.required and field.name not in filled_auto
+            ]
+            if completed_auto:
+                parsed = filled_auto
+                if not missing_after_autofill:
+                    errors = []
+                ctx.metadata["meta_clarify_autofilled_fields"] = sorted(
+                    completed_auto.keys()
+                )
+            elif infer_optional_fields and not missing_after_autofill:
+                parsed = filled_auto
+                errors = []
             if errors:
                 failure_count = writer.increment_parse_failures(
                     run_id=awaiting.run_id,
@@ -1015,6 +1201,16 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
             _sticky_drop(session_id)
             return ctx
 
+    # Manual-only mode: automatic activation is disabled. Resume of an in-flight
+    # run is handled by the awaiting branch above and still works; here we
+    # short-circuit BEFORE any fresh keyword/semantic matching, soft-hint
+    # injection, model upgrade, or sticky-cache write, so meta-skills only run
+    # via the explicit /meta command.
+    from opensquilla.skills.meta.enabled import is_meta_auto_trigger_enabled
+
+    if not is_meta_auto_trigger_enabled(getattr(ctx, "config", None)):
+        return ctx
+
     # ── Original trigger-matching path (with sticky continuation) ──
     loader = ctx.metadata.get("skill_loader")
     if loader is None:
@@ -1041,6 +1237,10 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
     pasted_context = _looks_like_pasted_context(semantic_text)
     if pasted_context:
         _sticky_drop(session_id)
+
+    if _is_meta_skill_discussion_intent(semantic_text):
+        _sticky_drop(session_id)
+        return ctx
 
     # Sticky-cancel: explicit user opt-out always wins over a stale match.
     if _hits_cancel_keywords(semantic_text, _STICKY_CANCEL_KEYWORDS):
@@ -1144,6 +1344,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         inputs=make_meta_inputs(
             user_message=semantic_text,
             system_prompt=getattr(ctx, "system_prompt", ""),
+            **meta_input_overrides_from_metadata(getattr(ctx, "metadata", {})),
         ),
     )
     ctx.metadata["meta_match"] = match
@@ -1171,18 +1372,23 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         highest = _highest_text_tier(ctx)
         if highest is not None:
             tier_name, model = highest
-            baseline_model = str(getattr(ctx, "model", "") or "")
-            ctx.model = model
-            ctx.metadata["meta_required_tier"] = tier_name
-            ctx.metadata["meta_required_model"] = model
-            ctx.metadata["meta_required_source"] = "meta-skill-creator"
-            ctx.metadata.setdefault("baseline_model", baseline_model)
-            ctx.metadata["routed_tier"] = tier_name
-            ctx.metadata["routed_model"] = model
-            ctx.metadata["routing_source"] = "meta_skill_required_tier"
-            ctx.metadata["routing_confidence"] = 1.0
-            ctx.metadata["routing_applied"] = True
-            ctx.metadata["applied_model"] = model
+            _upgrade_meta_entry_model(
+                ctx,
+                tier_name=tier_name,
+                model=model,
+                source="meta-skill-creator",
+            )
+    else:
+        minimum = _text_tier_at_least(ctx, "c2")
+        current_tier_key = _tier_sort_key(str(ctx.metadata.get("routed_tier") or ""), 0)[0]
+        if minimum is not None and 0 <= current_tier_key < 2:
+            tier_name, model = minimum
+            _upgrade_meta_entry_model(
+                ctx,
+                tier_name=tier_name,
+                model=model,
+                source="meta-skill-entry",
+            )
 
     # ── Soft-hint injection ────────────────────────────────────────────
     # Append to the uncached suffix slot of system_prompt so cache

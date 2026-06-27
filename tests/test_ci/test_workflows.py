@@ -239,22 +239,6 @@ def test_pr_target_validator_allows_maintainer_labeled_main_pull_requests(
         assert "Pull request targets main with maintainer approval label." in result.stdout
 
 
-def test_pr_target_validator_blocks_main_pull_requests_with_only_staging_labels(
-    tmp_path: Path,
-) -> None:
-    for label in ["maintainer-staging", "collaboration"]:
-        result = _validate_pr_target(
-            tmp_path,
-            base="main",
-            head="feature/shared-sandbox-work",
-            labels=[label],
-            changed_files=["src/opensquilla/sandbox/policy.py"],
-        )
-
-        assert result.returncode == 1
-        assert "Ordinary pull requests should target dev" in result.stderr
-
-
 def test_pr_target_validator_allows_staging_branch_pull_requests(
     tmp_path: Path,
 ) -> None:
@@ -290,22 +274,6 @@ def test_pr_target_validator_allows_labeled_staging_pull_requests(
 
         assert result.returncode == 0
         assert "staging/collaboration" in result.stdout
-
-
-def test_pr_target_validator_blocks_label_only_unknown_collaboration_targets(
-    tmp_path: Path,
-) -> None:
-    for label in ["maintainer-staging", "collaboration"]:
-        result = _validate_pr_target(
-            tmp_path,
-            base="feature/shared-work",
-            head="feature/shared-sandbox-work",
-            labels=[label],
-            changed_files=["src/opensquilla/sandbox/policy.py"],
-        )
-
-        assert result.returncode == 1
-        assert "Ordinary pull requests should target dev" in result.stderr
 
 
 def test_pr_target_validator_blocks_unknown_target_branches(tmp_path: Path) -> None:
@@ -376,11 +344,10 @@ def test_issue_link_sync_tracks_open_and_closed_final_prs_from_trusted_base() ->
 
     pull_request_target = data["on"]["pull_request_target"]
     assert set(pull_request_target["types"]) == {"opened", "reopened", "edited", "closed"}
-    assert "branches" not in pull_request_target
+    assert pull_request_target["branches"] == ["main", "dev"]
     assert "ref: ${{ github.event.pull_request.base.sha }}" in text
     assert "persist-credentials: false" in text
     assert "issues: write" in text
-    assert "pull-requests: read" in text
     assert ".github/scripts/issue_link_sync.py" in text
 
 

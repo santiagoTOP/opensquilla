@@ -33,11 +33,53 @@ OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, Qwen/DashScope,
 and 20+ other LLM providers with no change to your code or config
 schema.
 
-OpenSquilla 0.3.1 is the current release.
+OpenSquilla 0.4.0 is the current release.
 
 For task-oriented product documentation, start with the
 [OpenSquilla Product Guide](README.product.md) or the
 [documentation index](docs/README.md).
+
+---
+
+## Anonymous Installation Telemetry
+
+OpenSquilla includes anonymous installation telemetry to estimate install
+counts, version distribution, and runtime compatibility. The telemetry path
+is enabled by default and sends to the official OpenSquilla telemetry collector.
+
+The gateway sends a best-effort install event on first startup and one version
+event the first time each OpenSquilla version runs. This covers source, pip,
+Docker, and desktop installs when they start the gateway. Uploads use a short
+timeout and never block startup.
+
+The telemetry payload contains only:
+
+- random `install_id`
+- OpenSquilla version
+- event type (`install` or `version_seen`)
+- install method (`pip`, `source`, `docker`, `desktop`, or `unknown`)
+- operating system, OS version, CPU architecture, and Python major/minor
+  version
+- first-seen and sent timestamps
+
+The telemetry payload does not include usernames, email addresses, hostnames,
+local paths, API keys, provider configuration, chat history, session data,
+memory, agent content, file names, or file contents. HTTP servers can
+technically observe source IP addresses at the transport/logging layer; IP
+addresses are not part of the telemetry payload and should not be used as an
+install-count field by the collector.
+
+Disable telemetry with:
+
+```sh
+OPENSQUILLA_TELEMETRY_DISABLED=true
+```
+
+Point telemetry at a collector you control with:
+
+```sh
+OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install
+```
 
 ---
 
@@ -46,19 +88,25 @@ For task-oriented product documentation, start with the
 OpenSquilla runs on Windows, macOS, and Linux. Pick the path that
 matches your use case.
 
-Windows portable and Quick terminal install give you a prebuilt
-**release** — no Git required. The other two — Install from source
-and Develop from source — build **from a Git checkout** (`git clone` +
-Git LFS).
+Desktop installers, Windows portable, and Quick terminal install give you a
+prebuilt **release** — no Git required. The other two — Install from source and
+Develop from source — build **from a Git checkout** (`git clone` + Git LFS).
 
 Release install commands use published GitHub release assets. The
 Windows portable zip also has a `/releases/latest/download/` alias for
 the current release. Python wheel installs use versioned wheel filenames
 because installers validate the version embedded in the wheel filename.
 
+For 0.4.0 desktop use, prefer the signed desktop installers from the GitHub
+Release: `OpenSquilla-0.4.0-mac-arm64.dmg` on macOS and
+`OpenSquilla-0.4.0-win-x64.exe` on Windows. The Windows portable zip remains
+available as a legacy compatibility package for scripts and portable-folder
+workflows.
+
 | Path | Audience | When to use |
 | --- | --- | --- |
-| [Windows portable](#windows-portable-no-python) | Windows users | No Python toolchain; one-zip launch |
+| [Desktop installers](#desktop-installers) **(recommended desktop)** | macOS and Windows users | Signed packaged desktop app |
+| [Windows portable](#windows-portable-no-python) | Windows users | Legacy compatibility; no Python toolchain; one-zip launch |
 | [Quick terminal install](#quick-terminal-install) **(recommended)** | End users on any OS | Release wheel from a terminal |
 | [Install from source](#install-from-source) | Users tracking `main` | Run from a checkout, not edit it |
 | [Develop from source](#develop-from-source) | Contributors | Edit, test, or debug the source |
@@ -89,10 +137,21 @@ Install links: [Git](https://git-scm.com/downloads) ·
 [Git LFS](https://git-lfs.com/) ·
 [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
+### Desktop installers
+
+The 0.4.0 desktop installers package the Vue control console and gateway
+runtime in an Electron shell.
+
+- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/OpenSquilla-0.4.0-mac-arm64.dmg>
+- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/OpenSquilla-0.4.0-win-x64.exe>
+
+Quit any running OpenSquilla desktop app before upgrading. Existing
+`~/.opensquilla/config.toml` and session data are reused.
+
 ### Windows portable (no Python)
 
-The fastest path on Windows — the zip ships a bundled CPython runtime,
-so no separate Python install is required.
+The legacy compatibility path on Windows — the zip ships a bundled CPython
+runtime, so no separate Python install is required.
 
 1. Download the current portable zip:
    <https://github.com/opensquilla/opensquilla/releases/latest/download/OpenSquilla-windows-x64-portable.zip>
@@ -160,7 +219,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Install OpenSquilla** — the same command on every platform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.3.1/opensquilla-0.3.1-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/opensquilla-0.4.0-py3-none-any.whl"
 ```
 
 This installs the OpenSquilla wheel from the release URL, then lets
@@ -181,7 +240,7 @@ opensquilla gateway run
 > a new terminal, or re-run the PATH line from step 1.
 
 For a fully pinned install, use the versioned wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.3.1/opensquilla-0.3.1-py3-none-any.whl`.
+`https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/opensquilla-0.4.0-py3-none-any.whl`.
 
 ### Install from source
 
@@ -361,7 +420,8 @@ examples assume the relevant API key is already in the environment):
 ```sh
 opensquilla configure provider --provider openai --model gpt-4o --api-key-env OPENAI_API_KEY
 opensquilla configure router --router recommended
-opensquilla configure search   --search-provider brave --api-key-env BRAVE_SEARCH_API_KEY
+opensquilla configure search   --search-provider duckduckgo
+opensquilla configure search   --search-provider exa --api-key-env EXA_API_KEY
 opensquilla configure channels
 ```
 
@@ -480,27 +540,36 @@ settings live in `opensquilla.toml.example`.
 
 ---
 
-## What's New in 0.3.1
+## What's New in 0.4.0
 
-OpenSquilla 0.3.1 is a maintenance release for the 0.3 line. It updates the
-stable install metadata and brings selected channel, chat, provider, and
-workflow fixes from the integration branch onto the stable release line:
+OpenSquilla 0.4.0 updates the daily control surfaces, workflow launch model,
+coding workflow, search providers, terminal preview path, and runtime hardening:
 
-- **Channel setup and replies** — Slack Socket Mode, app mentions, signing
-  secrets, and threaded replies preserve the channel context needed for setup
-  and replies.
-- **Media and voice workflow handoffs** — short-drama/video helper workflows
-  remain bundled, generated media flows have clearer review pauses, and
-  voice/audio handoffs are usable end to end.
-- **Chat formatting** — user message bubbles preserve multiline text and read
-  like authored messages instead of compressed UI labels.
-- **Provider request hardening** — malformed tool-call history is kept away
-  from providers before it becomes invalid request state.
-- **Install and release checks** — installer URLs, release metadata, version
-  consistency tests, and CI impact gates are updated for 0.3.1.
+- **Refreshed Control UI** — the local console is easier to scan and operate,
+  with conversation navigation, a Settings modal, Sessions ledger, artifact
+  previews, share export, deliverables, turn trace, mobile tabs, and clearer
+  Skills, Usage, Cron, Logs, and Approvals areas.
+- **Manual MetaSkills with `/meta`** — MetaSkills no longer auto-trigger by
+  default. Use `/meta` to list workflows and `/meta <name>` to run one. Set
+  `meta_skill.auto_trigger = true` only when you intentionally want the older
+  automatic behavior.
+- **Coding mode and code-task** — coding mode can route code changes through
+  `opensquilla code-task`, which works in an isolated run directory, requires a
+  trusted-host confirmation, and verifies before persisting changes back to
+  source.
+- **Broader web search** — DuckDuckGo, Bocha, Brave, Tavily, and Exa are
+  runtime-supported search providers, with source-backed `web_search` and
+  lightweight `web_discover` roles.
+- **OpenTUI preview backend** — the stable Python-native terminal backend stays
+  the default, while OpenTUI is available as an explicit preview path with
+  Router HUD and replay benchmark documentation.
+- **Provider and safety hardening** — `openai_responses` exposes OpenAI's native
+  Responses API shape alongside `openai`; provider stream parsing, Gemini
+  thought-signature replay, SSRF fake-IP DNS guidance, session recovery,
+  artifact handling, and approval event delivery are tightened across surfaces.
 
 Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.3.1.md`](docs/releases/0.3.1.md).
+[`docs/releases/0.4.0.md`](docs/releases/0.4.0.md).
 
 ## What's New in 0.2.1
 
@@ -530,9 +599,9 @@ scheduling, and long-running tool work:
   and applies imports from existing OpenClaw/Hermes homes, including memory,
   persona files, skills, MCP/channel config, conflict handling, and migration
   reports.
-- **Usable chat CLI** — `opensquilla chat` now has a persistent terminal UI,
-  streaming output, queued input, slash-mode discovery, tool/status strips, and
-  more deterministic live prompt behavior.
+- **Usable chat CLI** — `opensquilla chat` has a stable terminal UI, streaming
+  output, queued input, slash-mode discovery, tool/status strips, and more
+  deterministic live prompt behavior.
 - **Cross-surface cron automation** — cron jobs now cover structured schedules,
   timezone-aware exact/every/cron runs, channel or webhook delivery, failure
   destinations, manual runs, and WebUI/CLI/RPC parity.
@@ -558,13 +627,13 @@ Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
 
 | Capability | What it does |
 | --- | --- |
-| **Token-efficient routing** | `SquillaRouter` — a local LightGBM + ONNX classifier in the `recommended` extra — scores each turn on length, language, code, keywords, and semantic embeddings, then routes it across four tiers (T0–T3) to the cheapest capable model. Classification runs on-device; your prompt never leaves the machine to make that decision. |
+| **Token-efficient routing** | `SquillaRouter` — a local LightGBM + ONNX classifier in the `recommended` extra — scores each turn on length, language, code, keywords, and semantic embeddings, then routes it across four tiers (C0–C3; legacy T0–T3 names are aliases) to the cheapest capable model. Classification runs on-device; your prompt never leaves the machine to make that decision. |
 | **Adaptive reasoning and prompts** | OpenSquilla requests extended reasoning only for turns the router scores as complex, and the system prompt scales with task complexity — lightweight for trivial turns, full instructions for complex ones. |
 | **20+ LLM providers** | The provider registry targets 20+ LLM backends — OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, DashScope/Qwen, Moonshot, Mistral, Groq, Zhipu, SiliconFlow, vLLM, LM Studio, and more, with primary-plus-fallback selection; first-run onboarding exposes the verified subset. |
 | **On-demand skills and MCP** | 15 bundled skills (coding, GitHub, cron, pptx/docx/xlsx/pdf, summarization, tmux, weather, and more) load only when the task needs them. OpenSquilla is an MCP client, and can also run as an MCP server — `opensquilla mcp-server run` needs the `mcp` extra (install `opensquilla[recommended,mcp]`). Skills can be authored, installed, and published from the CLI. |
 | **Persistent local memory** | A curated `MEMORY.md` plus dated Markdown notes, searched with SQLite full-text keyword search and `sqlite-vec` semantic recall. Embeddings run on-device via bundled ONNX, or swap to OpenAI/Ollama. Optional exponential decay and opt-in "dream" consolidation are available. |
 | **Layered security sandbox** | Three policy tiers (Standard / Strict / Locked) on a permission matrix. Bubblewrap isolates code execution on Linux; the macOS Seatbelt backend currently renders profiles only (execution pending), and there is no sandbox backend on Windows yet. A denial ledger auto-pauses autonomous runs after repeated denials, rejected outputs are purged, and skill metadata and tool results are XML-escaped against prompt injection. |
-| **Built-in tools** | File read/write/edit, shell and background processes, git, web search (Brave or DuckDuckGo) and fetch behind an SSRF guard, spreadsheet/PPTX/PDF authoring, image generation, and text-to-speech. |
+| **Built-in tools** | File read/write/edit, shell and background processes, git, web search (DuckDuckGo, Bocha, Brave, Tavily, or Exa) and fetch behind an SSRF guard, spreadsheet/PPTX/PDF authoring, image generation, and text-to-speech. |
 | **Unified gateway** | A Starlette ASGI server on `127.0.0.1:18791` with WebSocket RPC and an embedded control console (`/control/`). Web UI, CLI, and channels for Terminal, WebSocket, Slack, Telegram, Discord, Feishu, DingTalk, WeCom, Matrix, and QQ all share one `TurnRunner`. |
 | **Durable sessions, subagents, and scheduling** | SQLite-backed session, transcript, and replay storage with per-agent workspaces. Agents spawn depth-bounded subagents, and a `SchedulerEngine` with an in-tree cron parser runs recurring jobs via `opensquilla cron`. |
 | **Operator controls** | Human-in-the-loop approvals can pause sensitive tool calls for a decision; per-turn and per-session token and cost rollups (`opensquilla cost`) and diagnostics are available from the CLI and Web UI. |

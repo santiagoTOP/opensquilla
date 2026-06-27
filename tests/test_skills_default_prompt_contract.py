@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +11,6 @@ from opensquilla.engine.steps.skills_filter import filter_skills
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.skills.eligibility import EligibilityContext
 from opensquilla.skills.loader import SkillLoader
-from opensquilla.skills.meta.semantic_guards import semantic_meta_skill_allowed
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
@@ -23,13 +22,18 @@ AUDIO_DEFAULTS = {
     "voiceover-studio",
 }
 DEFAULTS = {
+    "AwesomeWebpageMetaSkill",
     "ai-video-script",
+    "audio-cog",
+    "code-task",
     "cron",
     "deep-research",
     "docx",
+    "filesystem",
     "git-diff",
     "github",
     "history-explorer",
+    "html-coder",
     "html-to-pdf",
     "http-fetch",
     "latex-compile",
@@ -58,6 +62,7 @@ DEFAULTS = {
     "srt-from-script",
     "sub-agent",
     "subtitle-burner",
+    "swe-bench",
     "summarize",
     "text-file-read",
     "title-card-image",
@@ -65,10 +70,17 @@ DEFAULTS = {
     "video-merger",
     "video-still-animator",
     "weather",
+    "web-search",
     "xlsx",
 } | AUDIO_DEFAULTS
 PROMPT_DEFAULTS_WITHOUT_AUDIO_TOOLS = DEFAULTS - AUDIO_DEFAULTS
+# Gated out of the default prompt unless coding mode is ON (default OFF).
+CODING_MODE_GATED = {"code-task"}
 INTERNAL_HELPERS = {
+    "awesome-webpage-image-download",
+    "awesome-webpage-research",
+    "nano-banana-pro-openrouter",
+    "openrouter-video-generator",
     "skill-creator-linter",
     "skill-creator-proposals",
     "skill-creator-smoke-test",
@@ -78,28 +90,6 @@ INTERNAL_HELPERS = {
     "stack-trace-python-probe",
     "stack-trace-rust-probe",
 }
-STABLE_META_BOUNDARY_CASES = [
-    (
-        "meta-kid-project-planner",
-        "Help my kid build a child science fair school project with safe materials.",
-        "Help me design an adult craft logo display, not a child school project.",
-    ),
-    (
-        "meta-paper-write",
-        "Draft a paper as a LaTeX manuscript with citations and experiment placeholders.",
-        "Summarize this paper and list the main claims; do not draft a manuscript.",
-    ),
-    (
-        "meta-short-drama",
-        "Generate a short drama from this topic and render the shot list to final MP4.",
-        "Write a short script idea, not a video or MP4.",
-    ),
-    (
-        "meta-skill-creator",
-        "Create a meta-skill that orchestrates existing skills for PDF digest workflows.",
-        "Create a normal standalone skill, not a meta-skill.",
-    ),
-]
 
 
 def _ctx(
@@ -165,19 +155,6 @@ def test_skill_filter_defaults_are_release_safe(monkeypatch: pytest.MonkeyPatch)
     assert cfg.skills.filter_strategy == "lexical"
 
 
-@pytest.mark.parametrize(
-    ("skill_name", "positive_prompt", "negative_prompt"),
-    STABLE_META_BOUNDARY_CASES,
-)
-def test_semantic_guards_cover_stable_bundled_meta_skill_boundaries(
-    skill_name: str,
-    positive_prompt: str,
-    negative_prompt: str,
-) -> None:
-    assert semantic_meta_skill_allowed(skill_name, positive_prompt)
-    assert not semantic_meta_skill_allowed(skill_name, negative_prompt)
-
-
 @pytest.mark.asyncio
 async def test_default_prompt_only_injects_retained_bundled_skills(
     tmp_path: Path,
@@ -201,20 +178,70 @@ async def test_default_prompt_only_injects_retained_bundled_skills(
                 "python3": True,
                 "tmux": True,
             },
+            env_cache={
+                "ARK_API_KEY": "set",
+                "BYTEPLUS_API_KEY": "set",
+                "GEMINI_API_KEY": "set",
+                "OPENAI_API_KEY": "set",
+                "OPENROUTER_API_KEY": "set",
+                "VOLC_ARK_API_KEY": "set",
+            },
         ),
     )
     loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
 
-    ctx = await filter_skills(_ctx(loader))
+    ctx = _ctx(loader)
+    # Meta-skills are injected only when meta auto-trigger is opted in
+    # (manual-only is the default), so enable it here to assert the full
+    # default catalog, including the kind="meta" entries.
+    ctx.config.meta_skill = SimpleNamespace(enabled=True, auto_trigger=True)
+    ctx = await filter_skills(ctx)
 
     prompt = ctx.system_prompt[1]
-    for name in PROMPT_DEFAULTS_WITHOUT_AUDIO_TOOLS:
+    for name in PROMPT_DEFAULTS_WITHOUT_AUDIO_TOOLS - CODING_MODE_GATED:
         assert f"<name>{name}</name>" in prompt
     for name in AUDIO_DEFAULTS:
         assert f"<name>{name}</name>" not in prompt
     for name in INTERNAL_HELPERS:
         assert f"<name>{name}</name>" not in prompt
+    # Coding-mode skills stay out of the default (coding mode OFF) prompt.
+    for name in CODING_MODE_GATED:
+        assert f"<name>{name}</name>" not in prompt
     assert "<name>healthcheck</name>" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_coding_mode_on_surfaces_code_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # code-task requires the ``git`` bin + ``OPENROUTER_API_KEY``; fake them so
+    # the test asserts the coding-mode gate, not the host environment.
+    monkeypatch.setattr(
+        skills_filter_step,
+        "_elig_ctx",
+        EligibilityContext(
+            os_name="linux",
+            has_bin_cache={"git": True},
+            env_cache={"OPENROUTER_API_KEY": "set"},
+        ),
+    )
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
+    ctx = _ctx(
+        loader,
+        message="please change the code",
+        skills_config=SimpleNamespace(
+            filter_enabled=False,
+            max_skills_prompt_chars=100_000,
+            injection_mode="system",
+            coding_mode=True,
+        ),
+    )
+
+    ctx = await filter_skills(ctx)
+
+    prompt = ctx.system_prompt[1]
+    assert "<name>code-task</name>" in prompt
 
 
 @pytest.mark.asyncio
@@ -223,144 +250,17 @@ async def test_default_prompt_prefers_matching_meta_skills_over_direct_answers(
 ) -> None:
     loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
 
-    ctx = await filter_skills(_ctx(loader))
+    ctx = _ctx(loader)
+    # The meta-orchestration guidance is part of the prompt only when meta
+    # auto-trigger is enabled; the manual-only default omits it.
+    ctx.config.meta_skill = SimpleNamespace(enabled=True, auto_trigger=True)
+    ctx = await filter_skills(ctx)
 
     prompt = ctx.system_prompt[1]
     assert "When a kind=\"meta\" entry clearly matches" in prompt
     assert "prefer `meta_invoke(name=\"<name>\")` over answering directly" in prompt
     assert "Do not call `skill_view` for kind=\"meta\" entries" in prompt
     assert "multi-skill orchestration" in prompt
-
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("skill_name", "prompt"),
-    [
-        (
-            "meta-short-drama",
-            "Write a short script idea, not a video or MP4.",
-        ),
-        (
-            "meta-kid-project-planner",
-            "Help me design an adult craft logo display, not a child school project.",
-        ),
-    ],
-)
-async def test_hybrid_filter_hides_neighboring_meta_workflows(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    skill_name: str,
-    prompt: str,
-) -> None:
-    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
-
-    class FakeRetriever:
-        def retrieve(self, skills, query: str, top_k: int = 5):
-            assert query == prompt
-            by_name = {s.name: s for s in skills}
-            return [by_name[skill_name]][:top_k]
-
-    monkeypatch.setattr(skills_filter_step, "_get_retriever", lambda _cfg: FakeRetriever())
-
-    ctx = await filter_skills(
-        _ctx(
-            loader,
-            message=prompt,
-            skills_config=SimpleNamespace(
-                filter_enabled=True,
-                filter_top_k=5,
-                filter_strategy="hybrid",
-                filter_lexical_top_n=20,
-                filter_semantic_top_n=20,
-                filter_rrf_k=60,
-                filter_embedding_model="BAAI/bge-small-zh-v1.5",
-                max_skills_prompt_chars=100_000,
-                injection_mode="system",
-            ),
-        )
-    )
-
-    assert skill_name not in ctx.metadata["filtered_skill_ids"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("skill_name", "positive_prompt", "negative_prompt"),
-    STABLE_META_BOUNDARY_CASES,
-)
-async def test_hybrid_filter_applies_stable_meta_boundary_guards_both_directions(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    skill_name: str,
-    positive_prompt: str,
-    negative_prompt: str,
-) -> None:
-    monkeypatch.setattr(
-        skills_filter_step,
-        "_elig_ctx",
-        EligibilityContext(
-            os_name="linux",
-            has_bin_cache={
-                "bibtex": True,
-                "codex": True,
-                "curl": True,
-                "ffmpeg": True,
-                "ffprobe": True,
-                "xelatex": True,
-                "nano-pdf": True,
-                "python": True,
-                "python3": True,
-                "tmux": True,
-            },
-        ),
-    )
-    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
-
-    class FakeRetriever:
-        prompt = positive_prompt
-
-        def retrieve(self, skills, query: str, top_k: int = 5):
-            assert query == self.prompt
-            by_name = {s.name: s for s in skills}
-            return [by_name[skill_name]][:top_k]
-
-    retriever = FakeRetriever()
-    monkeypatch.setattr(skills_filter_step, "_get_retriever", lambda _cfg: retriever)
-
-    def skills_config() -> SimpleNamespace:
-        return SimpleNamespace(
-            filter_enabled=True,
-            filter_top_k=5,
-            filter_strategy="hybrid",
-            filter_lexical_top_n=20,
-            filter_semantic_top_n=20,
-            filter_rrf_k=60,
-            filter_embedding_model="BAAI/bge-small-zh-v1.5",
-            max_skills_prompt_chars=100_000,
-            injection_mode="system",
-        )
-
-    positive_ctx = await filter_skills(
-        _ctx(
-            loader,
-            message=positive_prompt,
-            skills_config=skills_config(),
-        )
-    )
-
-    assert skill_name in positive_ctx.metadata["filtered_skill_ids"]
-
-    retriever.prompt = negative_prompt
-    negative_ctx = await filter_skills(
-        _ctx(
-            loader,
-            message=negative_prompt,
-            skills_config=skills_config(),
-        )
-    )
-
-    assert skill_name not in negative_ctx.metadata["filtered_skill_ids"]
 
 
 @pytest.mark.asyncio

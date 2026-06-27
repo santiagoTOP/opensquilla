@@ -494,91 +494,6 @@ async def test_run_one_streaming_rejects_disabled_meta_skill(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_one_streaming_rejects_competitive_intel_without_cue(tmp_path) -> None:
-    """meta_invoke must not start competitive-intel for a generic company profile.
-
-    This covers the default skill-filter-off path where all retained skills can
-    appear in <available_skills> and the model may choose meta_invoke directly.
-    """
-    from opensquilla.engine.agent import Agent
-    from opensquilla.engine.types import AgentConfig
-    from opensquilla.skills.loader import SkillLoader
-    from opensquilla.tool_boundary import ToolCall, ToolResult
-    from opensquilla.tools.builtin import meta_tools  # noqa: F401
-    from opensquilla.tools.registry import get_default_registry
-    from opensquilla.tools.types import ToolContext
-
-    bundled = tmp_path / "skills" / "bundled"
-    skill_dir = bundled / "meta-competitive-intel"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\n"
-        "name: meta-competitive-intel\n"
-        "kind: meta\n"
-        "description: competitive-intel monitoring over named competitors\n"
-        "triggers: [competitive intel]\n"
-        "composition:\n"
-        "  steps:\n"
-        "    - id: c\n"
-        "      kind: llm_classify\n"
-        "      output_choices: [A, B]\n"
-        "      with: {text: \"x\"}\n"
-        "---\n"
-        "# meta-competitive-intel\n",
-        encoding="utf-8",
-    )
-    loader = SkillLoader(bundled_dir=bundled, snapshot_path=tmp_path / "snap.json")
-    loader.invalidate_cache()
-    loader.load_all()
-
-    class _NullProvider:
-        provider_name = "null"
-
-        async def chat(self, *_args, **_kwargs):
-            raise AssertionError("competitive-intel guard must stop execution")
-
-        async def list_models(self):
-            return []
-
-    agent = Agent(
-        provider=_NullProvider(),  # type: ignore[arg-type]
-        config=AgentConfig(
-            model_id="stub",
-            metadata={"skill_loader": loader, "bootstrap_workspace_dir": str(tmp_path)},
-        ),
-        tool_definitions=[],
-        tool_handler=None,
-        tool_registry=get_default_registry(),
-    )
-    agent._current_turn_message = (
-        "inception labs,创始团队和核心员工有哪些？现在估值，"
-        "核心技术路线和进展是啥？然后每一轮交割大概节奏和估值股东等信息列出来。"
-    )
-    tc = ToolCall(
-        tool_use_id="u1",
-        tool_name="meta_invoke",
-        arguments={"name": "meta-competitive-intel"},
-    )
-    tool_ctx = ToolContext(
-        workspace_dir=str(tmp_path),
-        is_owner=True,
-        allowed_tools={"meta_invoke"},
-        surfaced_tools={"meta_invoke"},
-    )
-
-    final = None
-    async for ev in agent._run_one_streaming(tc, tool_ctx):
-        if isinstance(ev, ToolResult):
-            final = ev
-
-    assert final is not None
-    assert final.is_error is True
-    assert "competitive-intel" in final.content
-    assert "does not match" in final.content
-    assert final.terminates_turn is False
-
-
-@pytest.mark.asyncio
 async def test_run_one_streaming_rejects_meta_invoke_when_meta_skill_config_disabled(
     tmp_path,
 ) -> None:
@@ -767,6 +682,124 @@ async def test_run_one_streaming_propagates_current_turn_message_to_inputs(
     assert captured.get("inputs", {}).get("system_prompt") == "outer system prompt", (
         f"expected system_prompt to propagate into meta-skill inputs; got {captured!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_one_streaming_reuses_resolved_meta_match_control_inputs(
+    tmp_path,
+) -> None:
+    from opensquilla.engine.agent import Agent
+    from opensquilla.engine.types import AgentConfig
+    from opensquilla.skills.loader import SkillLoader
+    from opensquilla.skills.meta.parser import parse_meta_plan
+    from opensquilla.skills.meta.types import MetaMatch, MetaResult
+    from opensquilla.tool_boundary import ToolCall, ToolResult
+    from opensquilla.tools.registry import get_default_registry
+    from opensquilla.tools.types import ToolContext
+
+    bundled = tmp_path / "skills" / "bundled"
+    bundled.mkdir(parents=True)
+    skill_dir = bundled / "meta-tiny"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: meta-tiny\n"
+        "kind: meta\n"
+        "description: t\n"
+        "triggers: [t]\n"
+        "composition:\n"
+        "  request:\n"
+        "    mode: confirm\n"
+        "    fields:\n"
+        "      - name: audience\n"
+        "        required: true\n"
+        "  steps:\n"
+        "    - id: c\n"
+        "      kind: llm_classify\n"
+        "      output_choices: [A, B]\n"
+        "      with: {text: x}\n"
+        "---\n# meta-tiny\n",
+        encoding="utf-8",
+    )
+    loader = SkillLoader(bundled_dir=bundled, snapshot_path=tmp_path / "snap.json")
+    loader.invalidate_cache()
+    specs = loader.load_all()
+    plan = parse_meta_plan(next(spec for spec in specs if spec.name == "meta-tiny"))
+    assert plan is not None
+    resolved = MetaMatch(
+        plan=plan,
+        inputs={
+            "user_message": "Visible request only",
+            "audience": "decision owner",
+            "meta_preflight_confirmed": True,
+            "meta_preflight_run_id": "01CONTROL",
+        },
+        run_id="01CONTROL",
+    )
+
+    class _NullProvider:
+        provider_name = "null"
+
+        async def chat(self, *_a, **_kw):
+            raise AssertionError("provider.chat must not fire")
+
+        async def list_models(self):
+            return []
+
+    agent = Agent(
+        provider=_NullProvider(),  # type: ignore[arg-type]
+        config=AgentConfig(
+            model_id="stub",
+            max_iterations=1,
+            system_prompt="outer system prompt",
+            metadata={
+                "skill_loader": loader,
+                "bootstrap_workspace_dir": str(tmp_path),
+                "meta_match": resolved,
+            },
+        ),
+        tool_definitions=[],
+        tool_handler=None,
+        tool_registry=get_default_registry(),
+    )
+    agent._current_turn_message = "Visible request only"  # type: ignore[attr-defined]
+
+    captured: dict[str, object] = {}
+    import opensquilla.skills.meta.orchestrator as orch_mod
+
+    original_iter_events = orch_mod.MetaOrchestrator.iter_events
+
+    async def fake_iter_events(self, match):  # noqa: ARG001
+        captured["inputs"] = dict(match.inputs)
+        captured["run_id"] = match.run_id
+        yield MetaResult(ok=True, final_text="captured")
+
+    orch_mod.MetaOrchestrator.iter_events = fake_iter_events  # type: ignore[assignment]
+    try:
+        tc = ToolCall(
+            tool_use_id="u1",
+            tool_name="meta_invoke",
+            arguments={"name": "meta-tiny"},
+        )
+        tool_ctx = ToolContext(workspace_dir=str(tmp_path), is_owner=True)
+
+        final: ToolResult | None = None
+        async for ev in agent._run_one_streaming(tc, tool_ctx):
+            if isinstance(ev, ToolResult):
+                final = ev
+    finally:
+        orch_mod.MetaOrchestrator.iter_events = original_iter_events  # type: ignore[assignment]
+
+    assert final is not None
+    assert final.is_error is False
+    assert captured["run_id"] == "01CONTROL"
+    assert captured["inputs"] == {
+        "user_message": "Visible request only",
+        "audience": "decision owner",
+        "meta_preflight_confirmed": True,
+        "meta_preflight_run_id": "01CONTROL",
+        "system_prompt": "outer system prompt",
+    }
 
 
 # ---------------------------------------------------------------------------

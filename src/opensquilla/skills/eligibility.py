@@ -86,6 +86,11 @@ def check_eligibility(spec: SkillSpec, ctx: EligibilityContext) -> bool:
             if not _has_env(e, ctx):
                 return False
 
+        # 7. envAny (at least one env var must exist)
+        if meta.requires.env_any:
+            if not any(_has_env(e, ctx) for e in meta.requires.env_any):
+                return False
+
     return True
 
 
@@ -111,6 +116,7 @@ class EligibilityReport:
     reasons: list[str] = field(default_factory=list)
     missing_bins: list[str] = field(default_factory=list)
     missing_env: list[str] = field(default_factory=list)
+    missing_env_any: list[list[str]] = field(default_factory=list)
     install_hints: list[InstallHint] = field(default_factory=list)
     disabled: bool = False
     wrong_os: bool = False
@@ -124,15 +130,13 @@ def _is_declared(spec: SkillSpec) -> bool:
     declaration. ``requires.config`` is excluded — reserved/future,
     doesn't currently affect eligibility.
     """
-    return (
-        spec.metadata is not None
-        and spec.metadata.requires is not None
-        and bool(
-            spec.metadata.requires.bins
-            or spec.metadata.requires.any_bins
-            or spec.metadata.requires.env
-        )
+    if spec.metadata is None:
+        return False
+    requires = spec.metadata.requires
+    requires_declared = bool(
+        requires and (requires.bins or requires.any_bins or requires.env or requires.env_any)
     )
+    return requires_declared or bool(spec.metadata.install)
 
 
 def _render_install_command(spec: SkillInstallSpec) -> str:
@@ -167,6 +171,7 @@ def diagnose_eligibility(spec: SkillSpec, ctx: EligibilityContext) -> Eligibilit
     reasons: list[str] = []
     missing_bins: list[str] = []
     missing_env: list[str] = []
+    missing_env_any: list[list[str]] = []
     disabled = False
     wrong_os = False
 
@@ -203,6 +208,11 @@ def diagnose_eligibility(spec: SkillSpec, ctx: EligibilityContext) -> Eligibilit
                     missing_env.append(e)
                     reasons.append(f"Missing env var: {e}")
 
+            if meta.requires.env_any:
+                if not any(_has_env(e, ctx) for e in meta.requires.env_any):
+                    missing_env_any.append(list(meta.requires.env_any))
+                    reasons.append(f"Need one env var from: {', '.join(meta.requires.env_any)}")
+
     # Match missing bins against install specs to produce hints
     install_hints: list[InstallHint] = []
     if meta and missing_bins:
@@ -223,8 +233,79 @@ def diagnose_eligibility(spec: SkillSpec, ctx: EligibilityContext) -> Eligibilit
         reasons=reasons,
         missing_bins=missing_bins,
         missing_env=missing_env,
+        missing_env_any=missing_env_any,
         install_hints=install_hints,
         disabled=disabled,
         wrong_os=wrong_os,
         declared=_is_declared(spec),
     )
+
+
+# ---------------------------------------------------------------------------
+# Coding-mode availability
+# ---------------------------------------------------------------------------
+# Skills whose availability is governed by the operator "coding mode" toggle
+# rather than the generic disabled list. code-task (the coding plugin) is
+# available ONLY when coding mode is ON; turning coding mode off makes it
+# unreachable through every skill API.
+CODING_MODE_SKILLS: frozenset[str] = frozenset({"code-task"})
+
+
+def effective_disabled(disabled: set[str] | list[str] | None, coding_mode: bool) -> set[str]:
+    """The set of skill names to gate, given the operator config.
+
+    Coding mode is AUTHORITATIVE for the coding-mode skills (code-task):
+    when ON they are available regardless of the ``disabled`` list (so an
+    upgraded user whose old toggle persisted "code-task" in ``disabled`` can
+    still enable coding mode); when OFF they are gated regardless of it. All
+    other skills follow the explicit ``disabled`` list.
+    """
+    result = set(disabled or ())
+    if coding_mode:
+        result -= CODING_MODE_SKILLS
+    else:
+        result |= CODING_MODE_SKILLS
+    return result
+
+
+def is_skill_available(
+    name: str, *, disabled: set[str] | list[str] | None, coding_mode: bool
+) -> bool:
+    """Whether a skill may be surfaced or invoked under the operator config.
+
+    Single source of truth used by every skill surface (skill list/view,
+    the pre-turn skill gate) so coding mode cannot be bypassed via one path.
+    """
+    return name not in effective_disabled(disabled, coding_mode)
+
+
+# ---------------------------------------------------------------------------
+# Live operator gate (shared by every skill-reach path)
+# ---------------------------------------------------------------------------
+# Set once at gateway boot to a callable returning the live skills config, so
+# coding-mode / disabled changes take effect immediately. Used by the skill
+# tools AND the meta-skill executors so a disabled/coding-gated skill cannot be
+# reached through any path (codex review).
+_live_skills_cfg_getter: object | None = None
+
+
+def set_live_skills_config_getter(getter: object | None) -> None:
+    """Register the live skills-config getter (called by gateway boot)."""
+    global _live_skills_cfg_getter
+    _live_skills_cfg_getter = getter
+
+
+def is_skill_available_live(name: str) -> bool:
+    """Whether ``name`` is available under the CURRENT operator config.
+
+    When no getter is registered (gate un-wired — degraded boot or a unit test),
+    coding-mode skills FAIL CLOSED: code-task is gated, because OFF is the
+    default and the safe state. All other skills remain available so the
+    un-wired case never gates ordinary skills (codex review).
+    """
+    if _live_skills_cfg_getter is None:
+        return name not in CODING_MODE_SKILLS
+    cfg = _live_skills_cfg_getter()  # type: ignore[operator]
+    disabled = getattr(cfg, "disabled", None) or []
+    coding_mode = bool(getattr(cfg, "coding_mode", False))
+    return is_skill_available(name, disabled=disabled, coding_mode=coding_mode)

@@ -16,6 +16,7 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     prove_provider_payload_from_env,
 )
+from .stream_assembly import ReasoningAccumulator
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -410,7 +411,7 @@ class AnthropicProvider:
         output_tokens = 0
         cached_tokens = 0
         cache_creation_tokens = 0
-        thinking_parts: list[str] = []
+        reasoning = ReasoningAccumulator()
         thinking_signature: str | None = None
         stop_reason = "end_turn"
 
@@ -440,9 +441,14 @@ class AnthropicProvider:
                         return
 
                     async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
+                        # SSE spec: a single optional space after the colon
+                        # is part of the field syntax. Some gateways emit
+                        # "data:{...}" without the space — accept both.
+                        if not line.startswith("data:"):
                             continue
-                        data_str = line[6:]
+                        data_str = line[5:]
+                        if data_str.startswith(" "):
+                            data_str = data_str[1:]
                         if data_str == "[DONE]":
                             break
                         try:
@@ -488,7 +494,9 @@ class AnthropicProvider:
                                 else:
                                     log.debug("anthropic.unknown_delta_index", index=index)
                             elif dtype == "thinking_delta":
-                                thinking_parts.append(delta.get("thinking", ""))
+                                reasoning_event = reasoning.emit(delta.get("thinking", ""))
+                                if reasoning_event is not None:
+                                    yield reasoning_event
                             elif dtype == "signature_delta":
                                 thinking_signature = delta.get("signature") or thinking_signature
 
@@ -533,7 +541,7 @@ class AnthropicProvider:
                             stop_reason = event.get("delta", {}).get("stop_reason", "end_turn")
 
                         elif etype == "message_stop":
-                            reasoning_content = "".join(thinking_parts) or None
+                            reasoning_content = reasoning.finalize()
                             yield DoneEvent(
                                 stop_reason=stop_reason,
                                 input_tokens=input_tokens,

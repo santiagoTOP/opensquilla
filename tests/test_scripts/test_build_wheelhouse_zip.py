@@ -148,6 +148,9 @@ def test_release_wheel_allows_router_provenance_markdown() -> None:
     unrelated_skill_reference = (
         "opensquilla/skills/bundled/example/references/private-notes.md"
     )
+    skill_readme = "opensquilla/skills/bundled/filesystem/README.md"
+    skill_license = "opensquilla/skills/bundled/filesystem/LICENSE.md"
+    skill_card = "opensquilla/skills/bundled/filesystem/skill-card.md"
     unrelated_router_doc = (
         "opensquilla/squilla_router/models/v4.2_phase3_inference/README.md"
     )
@@ -160,6 +163,9 @@ def test_release_wheel_allows_router_provenance_markdown() -> None:
             "opensquilla/skills/bundled/example/SKILL.md",
             pptx_reference,
             unrelated_skill_reference,
+            skill_readme,
+            skill_license,
+            skill_card,
         )
     )
 
@@ -169,6 +175,9 @@ def test_release_wheel_allows_router_provenance_markdown() -> None:
     assert pptx_reference not in violations
     assert unrelated_router_doc in violations
     assert unrelated_skill_reference in violations
+    assert skill_readme in violations
+    assert skill_license in violations
+    assert skill_card in violations
 
 
 def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> None:
@@ -179,6 +188,9 @@ def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> 
     force_includes = wheel_config.get("force-include", {})
 
     assert "src/opensquilla/skills/bundled/**/THIRD_PARTY_NOTICES.md" in excludes
+    assert "src/opensquilla/skills/bundled/**/README.md" in excludes
+    assert "src/opensquilla/skills/bundled/**/LICENSE.md" in excludes
+    assert "src/opensquilla/skills/bundled/**/skill-card.md" in excludes
     assert "src/opensquilla/skills/bundled/**/references/*.md" in excludes
     assert "src/opensquilla/skills/exp/**" in excludes
     assert "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md" in excludes
@@ -805,10 +817,13 @@ def test_release_workflow_publishes_windows_portable_zip_and_wheel() -> None:
     workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
 
     assert "concurrency:" in workflow
-    assert "windows-release-assets-${{" in workflow
+    assert "release-assets-${{" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "timeout-minutes: 90" in workflow
+    assert "timeout-minutes: 120" in workflow
     assert "timeout-minutes: 20" in workflow
+    assert "build-desktop-macos:" in workflow
+    assert "build-desktop-windows:" in workflow
     assert "Validate workflow inputs" in workflow
     assert "python_runtime_release must be a YYYYMMDD" in workflow
     assert "python_runtime_version must be a CPython 3.12 patch version" in workflow
@@ -828,8 +843,10 @@ def test_release_workflow_publishes_windows_portable_zip_and_wheel() -> None:
     assert "is_prerelease = bool(re.search" in workflow
     assert "if not is_prerelease:" in workflow
     assert "OpenSquilla-windows-x64-portable.zip" in workflow
+    assert "OpenSquilla-{version}-mac-arm64.dmg" in workflow
+    assert "OpenSquilla-{version}-win-x64.exe" in workflow
     assert "opensquilla-latest-py3-none-any.whl" not in workflow
-    assert "dist/*.zip dist/*.whl dist/SHA256SUMS" in workflow
+    assert "gh release upload \"${TAG}\" dist/* --clobber" in workflow
     assert "dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS" not in workflow
     assert "Git LFS pointer leaked into wheel" in workflow
     assert "Verify GitHub Release assets" in workflow

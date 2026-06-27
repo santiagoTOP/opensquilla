@@ -15,9 +15,9 @@ read [`../authoring/meta-skills.md`](../authoring/meta-skills.md).
 | Skill | One focused task pattern, instruction set, script, or tool helper. |
 | Meta-skill | A reusable workflow made of multiple steps, skills, checks, or outputs. |
 
-For example, "summarize this document" is skill-shaped. "Turn this contract,
-quote, and email into a sign, reject, or negotiate recommendation with risks and
-next actions" is meta-skill-shaped.
+For example, "summarize this document" is skill-shaped. "Plan a safe child
+science project with materials, adult setup, child steps, presentation notes, and
+final safety review" is meta-skill-shaped.
 
 ## Stable Built-In MetaSkills
 
@@ -43,26 +43,53 @@ requirements from child skills.
 - `meta-paper-write` needs `xelatex` and `bibtex` for PDF compilation.
 - `meta-short-drama` needs `ffmpeg` and `ffprobe` for local video rendering,
   merge, and subtitle steps.
-- Document/report MetaSkills inherit readiness from child skills such as
-  `docx`, `xlsx`, `pdf-toolkit`, `pptx`, `multi-search-engine`, and `weather`.
+- MetaSkills inherit readiness from their child skills; for example,
+  `meta-paper-write` surfaces LaTeX/PDF requirements and
+  `meta-short-drama` surfaces local video-tool requirements.
 
-## How to Ask
+## Run MetaSkills
+
+MetaSkills are manual-only by default. They do not auto-trigger from message
+keywords or appear in the runtime prompt unless you explicitly opt into the old
+automatic behavior.
+
+In Web chat and the CLI gateway TUI:
+
+```text
+/meta
+/meta meta-kid-project-planner
+```
+
+`/meta` lists available MetaSkills. `/meta <name>` starts the selected
+workflow. Channel and standalone CLI surfaces can list MetaSkills with `/meta`,
+but they do not run MetaSkills from chat text.
+
+To restore automatic model-triggered behavior, set:
+
+```toml
+[meta_skill]
+auto_trigger = true
+```
+
+Use this compatibility mode only when you want MetaSkills to be considered by
+the model during ordinary chat turns.
+
+## How to Prepare the Request
 
 Ask for the outcome and the standard:
 
 ```text
-Create a decision memo comparing travel eSIM, carrier roaming, and local SIM
-options for my parents' 8-day Japan trip. Include sources, risks, a final
-recommendation, and what I should order tonight.
+Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
+materials, adult setup, child steps, safety notes, and a presentation outline.
 ```
 
-For important or easily confused work, name the workflow:
+When you start a workflow, include the task after the command:
 
 ```text
-Use meta-skill `meta-paper-write`.
+/meta meta-kid-project-planner
 
-Draft a workshop paper about local-first agent orchestration with citation
-planning, a clear experiment placeholder section, and a LaTeX-ready outline.
+Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
+materials, adult setup, child steps, safety notes, and a presentation outline.
 ```
 
 A strong request usually includes:
@@ -76,7 +103,13 @@ A strong request usually includes:
 
 ## Discover Meta-Skills
 
-List and search skills:
+Use chat slash commands for the runtime list:
+
+```text
+/meta
+```
+
+Use the CLI for inventory and inspection:
 
 ```sh
 opensquilla skills list

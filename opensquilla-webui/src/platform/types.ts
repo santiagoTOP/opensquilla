@@ -1,0 +1,112 @@
+export type PlatformId = 'web' | 'desktop'
+
+export interface GatewayStatus {
+  url: string
+  port: number
+  owned: boolean
+  status: 'starting' | 'ready' | 'stopped' | 'error'
+  logPath: string
+  error?: string
+}
+
+export interface DesktopSettings {
+  provider: string
+  model: string
+  baseUrl: string
+  apiKeyConfigured: boolean
+  searchProvider: string
+  searchApiKeyEnv: string
+  searchApiKeyConfigured: boolean
+  searchProviders?: SearchProviderOption[]
+  providers?: ProviderOption[]
+  gateway: GatewayStatus
+}
+
+export interface ProviderOption {
+  providerId: string
+  label: string
+  model?: string
+  baseUrl?: string
+  requiresApiKey?: boolean
+  note?: string
+}
+
+export interface SearchProviderOption {
+  providerId: string
+  label: string
+  envKey?: string
+  requiresApiKey?: boolean
+  note?: string
+  keyPlaceholder?: string
+}
+
+export interface DesktopSettingsPayload {
+  provider?: string
+  model?: string
+  baseUrl?: string
+  apiKey?: string
+  searchProvider?: string
+  searchApiKey?: string
+}
+
+export interface PlatformCapabilities {
+  isDesktop: boolean
+  ownsGateway: boolean
+  canManageLocalApiKeys: boolean
+  canRevealGatewayLog: boolean
+  canRestartGateway: boolean
+  hasDesktopOnboarding: boolean
+  hasWebConfig: boolean
+  /**
+   * The host can open a generated artifact with the OS default application.
+   * Set on desktop, where `window.open` is denied by the shell handler so the
+   * in-browser blob-popup path can never succeed.
+   */
+  canOpenArtifactsNatively: boolean
+}
+
+export interface ArtifactOpenRequest {
+  /** Raw artifact bytes, already fetched (and authenticated) by the renderer. */
+  data: ArrayBuffer
+  /** Original filename; its extension drives the OS default-app association. */
+  name: string
+  /** Content-Type, used as a fallback when the name carries no extension. */
+  mime: string
+}
+
+export interface ArtifactNativeOpenResult {
+  ok: boolean
+  message?: string
+}
+
+export interface PlatformFilesApi {
+  /** Write the bytes to a temp file and open it with the OS default app. */
+  openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+}
+
+export interface PlatformGatewayApi {
+  getStatus(): Promise<GatewayStatus>
+  revealLog?: () => Promise<boolean>
+  retryStartup?: () => Promise<unknown>
+}
+
+export interface PlatformSettingsApi {
+  getDesktopSettings?: () => Promise<DesktopSettings>
+  saveDesktopSettings?: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
+  resetDesktopSettings?: () => Promise<{ ok: boolean }>
+}
+
+export interface PlatformOnboardingApi {
+  getDefaults?: () => Promise<unknown>
+  save?: (payload: unknown) => Promise<unknown>
+  cancel?: () => Promise<unknown>
+}
+
+export interface Platform {
+  id: PlatformId
+  capabilities: PlatformCapabilities
+  gateway: PlatformGatewayApi
+  settings: PlatformSettingsApi
+  onboarding: PlatformOnboardingApi
+  files: PlatformFilesApi
+}

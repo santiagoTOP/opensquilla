@@ -64,17 +64,23 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TurnErrorPersistPort,
     TurnMemoryCapturePort,
 )
+from opensquilla.session.compaction_lifecycle import normalize_flush_triggers_strict
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from opensquilla.engine.agent import Agent, ToolHandler
+    from opensquilla.engine.agent_injection import PendingInputProvider
     from opensquilla.engine.runtime import TurnRunner
     from opensquilla.engine.types import AgentConfig, AgentEvent, DoneEvent, ErrorEvent
     from opensquilla.observability.prompt_report import PromptReport
     from opensquilla.observability.turn_call_log import TurnCallLogger
     from opensquilla.provider.protocol import LLMProvider
     from opensquilla.tools.types import ToolContext
+
+
+def _coerce_flush_triggers(value: Any) -> list[str]:
+    return list(normalize_flush_triggers_strict(value))
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +199,30 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
         self,
         request: RunPipelineRequest,
     ) -> tuple[Any, Any]:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        kwargs: dict[str, Any] = {
+            "semantic_message": request.semantic_message,
+            "ingress_pipeline_steps": request.ingress_pipeline_steps,
+            "prev_assistant_text": request.prev_assistant_text,
+            "prev_assistant_usage": request.prev_assistant_usage,
+            "history_user_texts": request.history_user_texts,
+            "history_has_recent_image": request.history_has_recent_image,
+            "history_image_turn_count": request.history_image_turn_count,
+            "vision_sticky_remaining": request.vision_sticky_remaining,
+            "turns_since_last_image": request.turns_since_last_image,
+            "last_image_turn_text": request.last_image_turn_text,
+            "vision_candidate_turns": request.vision_candidate_turns,
+            "flags_text_override": request.flags_text_override,
+            "tool_context": request.tool_context,
+            "normalization_metadata": request.normalization_metadata,
+            "input_provenance": request.input_provenance,
+        }
+        accepted_kwargs = {
+            name: value
+            for name, value in kwargs.items()
+            if _accepts_keyword_arg(self._runner._run_pipeline, name)
+        }
         return await self._runner._run_pipeline(
             request.runtime_message,
             request.session_key,
@@ -201,14 +231,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             request.tool_defs,
             request.base_prompt,
             request.attachments,
-            semantic_message=request.semantic_message,
-            ingress_pipeline_steps=request.ingress_pipeline_steps,
-            prev_assistant_text=request.prev_assistant_text,
-            prev_assistant_usage=request.prev_assistant_usage,
-            history_user_texts=request.history_user_texts,
-            flags_text_override=request.flags_text_override,
-            tool_context=request.tool_context,
-            normalization_metadata=request.normalization_metadata,
+            **accepted_kwargs,
         )
 
 class _TurnRunnerRouterContextAdapter(RouterContextPort):
@@ -432,6 +455,11 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
             if runner._config
             else None
         )
+        compaction_cfg = (
+            getattr(runner._config, "compaction", None)
+            if runner._config
+            else None
+        )
         thinking = runner._resolve_turn_thinking(turn)
         return _AgentConfigAuxiliaries(
             thinking=thinking,
@@ -441,6 +469,10 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
             ),
             tool_result_store_session_id=session_id_for_log or session_key,
             flush_enabled=getattr(mem_cfg, "flush_enabled", False),
+            flush_triggers=_coerce_flush_triggers(
+                getattr(mem_cfg, "flush_triggers", None)
+            ),
+            flush_pre_compaction=getattr(mem_cfg, "flush_pre_compaction", False),
             flush_timeout_seconds=getattr(mem_cfg, "flush_timeout_seconds", 15.0),
             flush_background_timeout_seconds=getattr(
                 mem_cfg, "flush_background_timeout_seconds", 120.0
@@ -463,6 +495,16 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 mem_cfg,
                 "flush_compaction_safety_mode",
                 "protect",
+            ),
+            compaction_profile=getattr(
+                compaction_cfg,
+                "compaction_profile",
+                "conversation",
+            ),
+            compaction_protected_recent_messages=getattr(
+                compaction_cfg,
+                "protected_recent_messages",
+                0,
             ),
             tool_result_projection_max_inline_chars=getattr(
                 agent_token_cfg,
@@ -682,11 +724,10 @@ class _RequestContextPrependAdapter(RequestContextPrependPort):
 class _TurnRunnerAgentRunAdapter(AgentRunPort):
     """Bind ``agent.run_turn(turn_input, extra_messages=..., **kwargs)``.
 
-    Folds the ``_accepts_keyword_arg(agent.run_turn, "semantic_message")``
-    introspection inside the adapter so the stage body never imports
-    ``inspect``. ``semantic_message`` is forwarded only when the agent
-    accepts the keyword; otherwise the call uses the two-arg
-    invocation. The agent is supplied per-call so the stage can be
+    Folds ``_accepts_keyword_arg(agent.run_turn, ...)`` introspection inside
+    the adapter so the stage body never imports ``inspect``. Optional keywords
+    are forwarded only when the agent accepts them; otherwise the call uses the
+    older invocation. The agent is supplied per-call so the stage can be
     instantiated once and reused across turns.
     """
 
@@ -697,12 +738,15 @@ class _TurnRunnerAgentRunAdapter(AgentRunPort):
         turn_input: str,
         extra_messages: list[Any] | None,
         semantic_message: str | None,
+        pending_input_provider: PendingInputProvider | None = None,
     ) -> AsyncIterator[AgentEvent]:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         kwargs: dict[str, Any] = {}
         if _accepts_keyword_arg(agent.run_turn, "semantic_message"):
             kwargs["semantic_message"] = semantic_message
+        if _accepts_keyword_arg(agent.run_turn, "pending_input_provider"):
+            kwargs["pending_input_provider"] = pending_input_provider
         return agent.run_turn(
             turn_input,
             extra_messages=extra_messages,

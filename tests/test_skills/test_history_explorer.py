@@ -83,14 +83,12 @@ def test_meta_usage_counts_meta_skill_invocations(tmp_path: Path) -> None:
         _make_log_line(["meta-paper-write"], "t2"),
         _make_log_line(["meta-short-drama", "sub-agent"], "t3"),
         _make_log_line(["meta-kid-project-planner", "sub-agent"], "t4"),
-        _make_log_line(["meta-web-research-to-report", "sub-agent"], "t5"),
     ]) + "\n", encoding="utf-8")
     out = _run_explore(tmp_path, "anything", window_days=30)
     usage = {row["meta_skill_id"]: row["invocation_count"] for row in out["meta_usage"]}
     assert usage["meta-paper-write"] == 2
     assert usage["meta-short-drama"] == 1
     assert usage["meta-kid-project-planner"] == 1
-    assert "meta-web-research-to-report" not in usage
 
 
 def test_co_occurrence_uses_redacted_intent_summary(tmp_path: Path) -> None:

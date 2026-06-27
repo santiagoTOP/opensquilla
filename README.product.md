@@ -14,7 +14,7 @@ This guide is the product and usage entry point. The existing
 1. Install OpenSquilla:
 
    ```sh
-   uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.3.1/opensquilla-0.3.1-py3-none-any.whl"
+   uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/opensquilla-0.4.0-py3-none-any.whl"
    ```
 
 2. Configure your provider:
@@ -130,7 +130,8 @@ Use the CLI for routine changes:
 opensquilla onboard --if-needed
 opensquilla configure provider --provider openrouter --api-key-env OPENROUTER_API_KEY
 opensquilla configure router --router recommended
-opensquilla configure search --search-provider brave --api-key-env BRAVE_SEARCH_API_KEY
+opensquilla configure search --search-provider duckduckgo
+opensquilla configure search --search-provider tavily --api-key-env TAVILY_API_KEY
 opensquilla configure channels
 opensquilla config get llm.provider
 opensquilla config set gateway.port 18791
@@ -165,6 +166,8 @@ user re-describe the same multi-step process. They are useful for repeatable
 research reports, document-to-decision work, daily operating briefs, account
 watching, job-search preparation, kid project planning, academic paper drafting,
 and MetaSkill proposal creation.
+
+By default, launch them deliberately with `/meta` and `/meta <name>`.
 
 Read: [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
 [`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md),
