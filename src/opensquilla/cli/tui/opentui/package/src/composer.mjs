@@ -636,6 +636,11 @@ export function createComposer(deps) {
     routerNode.add(new TextRenderable(renderer, { id: "router-context", content: fixedRouterRow("ctx", routerState.context), fg: THEME.warning }));
     inputBox.add(routerNode);
     renderCompletionMenu();
+    // The theme picker shares the overlay layer, so a footer re-render (pulse
+    // tick while a turn streams, router update, keystroke) clears it via
+    // renderCompletionMenu's clearOverlay. Re-mount it whenever it is open so it
+    // never "flashes" away and gets stuck modally swallowing keys while invisible.
+    if (themePicker?.active) renderThemePicker();
     syncTerminalCursorToCaret();
     renderer.requestRender?.();
   }

@@ -223,9 +223,15 @@ async function main() {
   setInterval(() => {
     if (!statusActive) return;
     pulseFrame += 1;
-    activeTurn?.refreshPulse(pulseFrame);
-    composer.tickPulse(pulseFrame);
-    renderer.requestRender?.();
+    try {
+      activeTurn?.refreshPulse(pulseFrame);
+      composer.tickPulse(pulseFrame);
+      renderer.requestRender?.();
+    } catch {
+      // A single frame's render error must never throw out of the always-on
+      // pulse interval — an uncaught throw here would stop the timer and freeze
+      // the TUI. Skip this tick; the next one re-renders from current state.
+    }
   }, 180).unref?.();
 
   ipc.send({ type: "ready" });

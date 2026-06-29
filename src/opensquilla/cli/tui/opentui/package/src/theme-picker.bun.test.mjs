@@ -65,3 +65,46 @@ test("openThemePicker renders a titled panel listing every theme, active one mar
   expect(text.toLowerCase()).toContain("preview"); // the key hint
   renderer.destroy?.();
 });
+
+test("picker survives footer re-renders (pulse tick) instead of flashing away", async () => {
+  // Regression: a footer re-render (pulse tick while a turn streams, router
+  // update, keystroke) ran renderCompletionMenu -> clearOverlay, wiping the
+  // picker while it stayed modally active — picker flashed once then the TUI
+  // looked frozen (keys swallowed by an invisible modal). It must stay mounted.
+  applyTheme("opensquilla-dark");
+  const { renderer, renderOnce, captureSpans } = await createTestRenderer({ width: 50, height: 20 });
+  const conversationBox = new BoxRenderable(renderer, {
+    id: "conversation", position: "absolute", left: 0, top: 0, right: 0, height: 14,
+  });
+  renderer.root.add(conversationBox);
+  const inputBox = new BoxRenderable(renderer, {
+    id: "input-region", position: "absolute", left: 0, right: 0, bottom: 0, height: 6,
+  });
+  renderer.root.add(inputBox);
+  const overlayLayer = new BoxRenderable(renderer, {
+    id: "overlay-layer", position: "absolute", left: 0, top: 0, right: 0, bottom: 0,
+    zIndex: 1000, shouldFill: false, visible: false,
+  });
+  renderer.root.add(overlayLayer);
+  const composer = createComposer({
+    renderer, BoxRenderable, TextRenderable, conversationBox, inputBox, overlayLayer,
+    footerHeight: 6, sendHostMessage: () => {},
+  });
+  try {
+    composer.install();
+  } catch {
+    composer.rerender();
+  }
+
+  composer.openThemePicker();
+  // Simulate footer re-renders that previously wiped the picker.
+  composer.rerender();
+  composer.rerender();
+  await renderOnce();
+  const text = captureSpans()
+    .lines.map((line) => line.spans.map((span) => span.text).join(""))
+    .join("\n");
+  expect(text).toContain("theme"); // panel title still present
+  expect(text).toContain("midnight"); // theme rows still present after re-renders
+  renderer.destroy?.();
+});
