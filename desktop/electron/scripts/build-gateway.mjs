@@ -118,10 +118,14 @@ function addBinaryArg(sourcePath, destinationDir) {
   return ['--add-binary', `${sourcePath}${addDataSeparator}${destinationDir}`]
 }
 
-function platformLightgbmLibraryName() {
-  if (process.platform === 'win32') return 'lib_lightgbm.dll'
-  if (process.platform === 'darwin') return 'lib_lightgbm.dylib'
-  return 'lib_lightgbm.so'
+function platformLightgbmLibraryPath() {
+  if (process.platform === 'win32') return join('bin', 'lib_lightgbm.dll')
+  if (process.platform === 'darwin') return join('lib', 'lib_lightgbm.dylib')
+  return join('lib', 'lib_lightgbm.so')
+}
+
+function platformLightgbmBundleDir() {
+  return process.platform === 'win32' ? 'lightgbm/bin' : 'lightgbm/lib'
 }
 
 function readFileHead(path, bytes = 96) {
@@ -210,8 +214,8 @@ mkdirSync(runtimeGatewayDir, { recursive: true })
 mkdirSync(pyinstallerWorkDir, { recursive: true })
 
 const lightgbmBinaryArgs = addBinaryArg(
-  pythonPackageFile('lightgbm', join('lib', platformLightgbmLibraryName())),
-  'lightgbm/lib',
+  pythonPackageFile('lightgbm', platformLightgbmLibraryPath()),
+  platformLightgbmBundleDir(),
 )
 const macOpenMpBinaryArgs = process.platform === 'darwin'
   ? addBinaryArg(pythonPackageFile('sklearn', join('.dylibs', 'libomp.dylib')), '.')

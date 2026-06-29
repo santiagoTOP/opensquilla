@@ -152,6 +152,9 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "'--collect-all',\n  'sklearn'" not in build_gateway
     assert "'--collect-all',\n  'lightgbm'" not in build_gateway
     assert "'--collect-binaries',\n  'sklearn'" in build_gateway
+    assert "join('bin', 'lib_lightgbm.dll')" in build_gateway
+    assert "platformLightgbmBundleDir()" in build_gateway
+    assert "'lightgbm/bin'" in build_gateway
     assert "lib_lightgbm.dylib" in build_gateway
     assert "libomp.dylib" in build_gateway
     assert "Git LFS pointer file, not the real router artifact" in build_gateway
@@ -170,6 +173,21 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "code-task', 'smoke-imports'" in verifier
     assert "code-task', 'smoke-router'" in verifier
     assert "timeout: 120000" in verifier
+
+
+def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> None:
+    workflow = _read(".github/workflows/wheelhouse-release.yml")
+    windows_build = _section(
+        workflow,
+        "      - name: Build Windows installer",
+        "      - name: Verify Electron package",
+    )
+
+    assert "shell: bash" in windows_build
+    assert "set -euo pipefail" in windows_build
+    assert windows_build.index("npm run build:gateway") < windows_build.index(
+        "          npm run build\n"
+    )
 
 
 def test_desktop_native_artifact_open_allows_active_documents_with_file_extensions() -> None:

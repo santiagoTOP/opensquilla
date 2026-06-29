@@ -364,9 +364,11 @@ jobs:
 
       - name: Build Windows installer
         working-directory: desktop/electron
+        shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
+          set -euo pipefail
           npm run build:web
           npm run build:gateway
           npm run build
