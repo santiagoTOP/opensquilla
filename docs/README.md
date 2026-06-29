@@ -37,6 +37,7 @@ root release README with task-oriented guides.
 
 ## Surfaces and Operations
 
+- [`releases/0.4.1.md`](releases/0.4.1.md) - OpenSquilla 0.4.1 release notes.
 - [`releases/0.4.0.md`](releases/0.4.0.md) - OpenSquilla 0.4.0 release notes.
 - [`releases/0.3.0.md`](releases/0.3.0.md) - OpenSquilla 0.3.0 release notes.
 - [`channels.md`](channels.md) - supported messaging channels and setup flow.
@@ -67,8 +68,7 @@ root release README with task-oriented guides.
 
 Documentation improvements are welcome. Start with
 [`contributing-docs.md`](contributing-docs.md) for docs-specific guidance, then
-open a small pull request against `main`. Existing `dev` pull requests may
-continue during the branch transition.
+open a small pull request against `main`.
 
 Fast paths:
 

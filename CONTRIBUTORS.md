@@ -5,6 +5,16 @@ human-readable ledger together for contributor attribution. This file records
 release-surface community work that can be harder to see when a release is
 squash-merged or replayed onto `main`.
 
+## OpenSquilla 0.4.1
+
+The 0.4.1 release records new human contributor work after the 0.4.0
+attribution ledger was merged. It intentionally does not repeat the larger
+0.4.0 contributor list.
+
+| Contributor | 0.4.1 contribution | Evidence |
+| --- | --- | --- |
+| [@ab2ence](https://github.com/ab2ence) | Hardened install telemetry so CI and test environments are not counted as installs, and allowed desktop HTML artifacts to open natively. | [#348](https://github.com/opensquilla/opensquilla/pull/348), [#355](https://github.com/opensquilla/opensquilla/pull/355) |
+
 ## OpenSquilla 0.4.0
 
 The 0.4.0 release is prepared from current `dev` after `v0.3.1`. This section

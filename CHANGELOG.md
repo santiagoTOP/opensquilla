@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.4.1] - 2026-06-30
+
+### Added
+
 - `opensquilla uninstall` removes OpenSquilla across install methods (uv-tool,
   pip, pipx, and source; portable removes its venv; Docker and desktop print
   guided removal steps). It keeps your data by default — pass `--purge-state`,
@@ -16,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   exact remove/keep/manual plan without touching anything. Deletion is contained
   to the OpenSquilla home; a relocated or shared root is refused. The desktop
   Settings → Runtime panel gains a matching "Danger zone".
+- The Control UI and desktop client now ship first-class localization for
+  English, Simplified Chinese, Japanese, French, German, and Spanish, including
+  first-paint desktop boot text, settings surfaces, and persisted language
+  selection.
 
 ### Changed
 
@@ -25,8 +37,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `OPENSQUILLA_GATEWAY_GRACEFUL_TIMEOUT`); on Windows, an owner-only
   `POST /api/system/shutdown` endpoint provides the same graceful stop where
   POSIX signals are unavailable.
+- OpenSquilla now treats `main` as the active development and release
+  integration branch, with release guidance and pull-request targeting language
+  aligned around `main`.
+- Desktop packaging now fails fast when SquillaRouter assets are missing or
+  still Git LFS pointer files, and the packaged gateway smoke tests exercise
+  coding mode, `code-task`, and the router runtime before release assets are
+  uploaded.
 
 ### Fixed
+
+- Install telemetry now skips CI and test environments before creating local
+  telemetry state or uploading install events, so GitHub Actions and pytest
+  runs do not count as user installs.
+- The Windows Electron app, installer, and uninstaller now use the OpenSquilla
+  icon.
+- Web UI fixes keep streaming turns, stale task events, session deletion,
+  settings restore, topbar connection state, status line breaks, and desktop
+  HTML artifact opening stable across refreshed sessions.
+- Provider and router fixes improve Volcengine and BytePlus profiles, macOS
+  router runtime diagnostics, and the target labels shown for model requests.
 
 ## [0.4.0] - 2026-06-27
 

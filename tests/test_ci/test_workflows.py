@@ -171,7 +171,7 @@ def _validate_pr_target(
     )
 
 
-def test_default_ci_blocks_pull_requests_and_main_and_dev_pushes() -> None:
+def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     ci_path = WORKFLOW_DIR / "ci.yml"
     if not ci_path.exists():
         return
@@ -180,7 +180,7 @@ def test_default_ci_blocks_pull_requests_and_main_and_dev_pushes() -> None:
     text = ci_path.read_text(encoding="utf-8")
 
     assert {"pull_request", "push", "workflow_dispatch"} <= _trigger_keys(data)
-    assert "branches: [main, dev]" in text
+    assert "branches: [main]" in text
     assert "PYTHONPATH: ${{ github.workspace }}" in text
     assert "Configure runtime directories" in text
     assert 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\\n' in text
@@ -223,13 +223,13 @@ def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
     assert "Pull request targets main." in result.stdout
 
 
-def test_pr_target_validator_allows_dev_pull_requests_during_transition(
+def test_pr_target_validator_blocks_dev_pull_requests(
     tmp_path: Path,
 ) -> None:
     result = _validate_pr_target(tmp_path, base="dev")
 
-    assert result.returncode == 0
-    assert "main-default transition" in result.stdout
+    assert result.returncode == 1
+    assert "Ordinary pull requests should target main" in result.stderr
 
 
 def test_pr_target_validator_allows_docs_only_main_pull_requests(
@@ -377,7 +377,7 @@ def test_issue_link_sync_tracks_open_and_closed_final_prs_from_trusted_base() ->
 
     pull_request_target = data["on"]["pull_request_target"]
     assert set(pull_request_target["types"]) == {"opened", "reopened", "edited", "closed"}
-    assert pull_request_target["branches"] == ["main", "dev"]
+    assert pull_request_target["branches"] == ["main"]
     assert "ref: ${{ github.event.pull_request.base.sha }}" in text
     assert "persist-credentials: false" in text
     assert "issues: write" in text

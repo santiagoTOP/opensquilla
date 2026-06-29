@@ -6,9 +6,9 @@ Non-goals:
 
 ## Branch
 
-Base branch: main | dev (transition) | staging/collaboration
+Base branch: main | staging/collaboration
 
-Target exception: N/A | dev-transition | release | hotfix | staging/collaboration | maintainer-approved
+Target exception: N/A | release | hotfix | staging/collaboration | maintainer-approved
 
 ## Issue
 

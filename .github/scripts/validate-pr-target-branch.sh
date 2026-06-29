@@ -17,11 +17,6 @@ if [[ "${base_ref}" == "main" ]]; then
   exit 0
 fi
 
-if [[ "${base_ref}" == "dev" ]]; then
-  echo "Pull request targets dev during the main-default transition."
-  exit 0
-fi
-
 event_label_names() {
   if [[ -n "${PR_LABELS:-}" ]]; then
     tr ',' '\n' <<< "${PR_LABELS}"
@@ -77,7 +72,7 @@ has_allowed_label() {
 
 is_staging_branch() {
   case "${base_ref}" in
-    sandbox-* | integration/* | staging/* | release/*)
+    sandbox-* | integration/* | staging/* | release/* | hotfix/*)
       return 0
       ;;
   esac
@@ -87,14 +82,13 @@ is_staging_branch() {
 
 if is_staging_branch || has_allowed_label staging; then
   echo "Pull request targets a staging/collaboration branch."
-  echo "This is not a final integration path; final integration should target main, or dev during the transition window."
+  echo "This is not a final integration path; final integration should target main."
   exit 0
 fi
 
 {
   echo "::error title=Wrong PR target::Ordinary pull requests should target main."
-  echo "Use dev only for existing pull requests during the transition window or when maintainers explicitly request it."
-  echo "Use sandbox-*, integration/*, staging/*, release/*, or a maintainer-staging/collaboration label for maintainer collaboration PRs."
-  echo "Retarget this pull request to main, dev during transition, or an approved staging/collaboration branch."
+  echo "Use sandbox-*, integration/*, staging/*, release/*, hotfix/*, or a maintainer-staging/collaboration label for maintainer collaboration PRs."
+  echo "Retarget this pull request to main or an approved staging/collaboration branch."
 } >&2
 exit 1

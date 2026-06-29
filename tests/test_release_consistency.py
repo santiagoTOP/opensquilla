@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
-CURRENT_VERSION = "0.4.0"
+CURRENT_VERSION = "0.4.1"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 PREVIEW_VERSION = "0.2.0rc1"
 PREVIEW_TAG = f"v{PREVIEW_VERSION}"
@@ -188,6 +189,34 @@ def test_readme_release_install_uses_latest_assets_and_pinned_alternative() -> N
     assert "Release install commands use published GitHub release assets" in readme
 
 
+def test_user_facing_install_docs_use_current_release_wheel() -> None:
+    current_wheel_url = (
+        f"releases/download/{CURRENT_TAG}/opensquilla-{CURRENT_VERSION}-py3-none-any.whl"
+    )
+    wheel_url_pattern = re.compile(
+        r"releases/download/v(?P<tag_version>[^/]+)/"
+        r"opensquilla-(?P<file_version>[^/]+)-py3-none-any\.whl"
+    )
+    install_docs = [
+        Path("README.md"),
+        Path("README.product.md"),
+        Path("docs/quickstart.md"),
+        Path("docs/cli.md"),
+        Path("docs/mcp-server.md"),
+        Path("docs/operations.md"),
+    ]
+
+    for path in install_docs:
+        text = path.read_text(encoding="utf-8")
+        wheel_urls = list(wheel_url_pattern.finditer(text))
+
+        assert wheel_urls, f"{path} must include a pinned release wheel URL"
+        assert current_wheel_url in text, f"{path} must install from {CURRENT_TAG}"
+        for match in wheel_urls:
+            assert match.group("tag_version") == CURRENT_VERSION
+            assert match.group("file_version") == CURRENT_VERSION
+
+
 def test_release_installers_default_to_current_tag() -> None:
     for path in [Path("install.sh"), Path("install.ps1")]:
         text = path.read_text(encoding="utf-8")
@@ -210,14 +239,42 @@ def test_release_workflow_marks_preview_tags_as_prereleases() -> None:
     assert "opensquilla-latest-py3-none-any.whl" not in workflow
 
 
-def test_040_release_notes_prioritize_desktop_and_legacy_portable() -> None:
+def test_historical_040_release_notes_remain_available() -> None:
     notes = Path("docs/releases/0.4.0.md").read_text(encoding="utf-8")
+
+    assert "# OpenSquilla 0.4.0" in notes
+    assert "OpenSquilla-0.4.0-mac-arm64.dmg" in notes
+
+
+def test_current_release_notes_prioritize_desktop_and_legacy_portable() -> None:
+    notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
 
     assert "## Downloads" in notes
     assert f"OpenSquilla-{CURRENT_VERSION}-mac-arm64.dmg" in notes
+    assert f"OpenSquilla-{CURRENT_VERSION}-mac-arm64.zip" in notes
     assert f"OpenSquilla-{CURRENT_VERSION}-win-x64.exe" in notes
+    assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
     assert "Legacy Windows portable" in notes
     assert "legacy compatibility" in notes
+    assert "## Upgrading from 0.4.0" in notes
     assert "## Acknowledgements" in notes
     assert "@ab2ence" in notes
-    assert "@nice-code-la" in notes
+
+
+def test_docs_index_links_current_release_notes() -> None:
+    index = Path("docs/README.md").read_text(encoding="utf-8")
+
+    assert f"releases/{CURRENT_VERSION}.md" in index
+    assert "releases/0.4.0.md" in index
+
+
+def test_current_contributor_ledger_records_041_attribution_without_repeating_040() -> None:
+    ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
+    section = ledger.split("## OpenSquilla 0.4.1", 1)[1].split("## OpenSquilla 0.4.0", 1)[0]
+
+    assert "@ab2ence" in section
+    assert "#348" in section
+    assert "#355" in section
+    assert "@nice-code-la" not in section
+    assert "Codex" not in section
+    assert "Claude Code" not in section

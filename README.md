@@ -33,7 +33,7 @@ OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, Qwen/DashScope,
 and 20+ other LLM providers with no change to your code or config
 schema.
 
-OpenSquilla 0.4.0 is the current release.
+OpenSquilla 0.4.1 is the current release.
 
 For task-oriented product documentation, start with the
 [OpenSquilla Product Guide](README.product.md) or the
@@ -55,9 +55,9 @@ Windows portable zip also has a `/releases/latest/download/` alias for
 the current release. Python wheel installs use versioned wheel filenames
 because installers validate the version embedded in the wheel filename.
 
-For 0.4.0 desktop use, prefer the signed desktop installers from the GitHub
-Release: `OpenSquilla-0.4.0-mac-arm64.dmg` on macOS and
-`OpenSquilla-0.4.0-win-x64.exe` on Windows. The Windows portable zip remains
+For 0.4.1 desktop use, prefer the signed desktop installers from the GitHub
+Release: `OpenSquilla-0.4.1-mac-arm64.dmg` on macOS and
+`OpenSquilla-0.4.1-win-x64.exe` on Windows. The Windows portable zip remains
 available as a legacy compatibility package for scripts and portable-folder
 workflows.
 
@@ -105,11 +105,11 @@ Install links: [Git](https://git-scm.com/downloads) ·
 
 ### Desktop installers
 
-The 0.4.0 desktop installers package the Vue control console and gateway
+The 0.4.1 desktop installers package the Vue control console and gateway
 runtime in an Electron shell.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/OpenSquilla-0.4.0-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/OpenSquilla-0.4.0-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.4.1/OpenSquilla-0.4.1-mac-arm64.dmg>
+- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.4.1/OpenSquilla-0.4.1-win-x64.exe>
 
 Quit any running OpenSquilla desktop app before upgrading. Existing
 `~/.opensquilla/config.toml` and session data are reused.
@@ -185,7 +185,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Install OpenSquilla** — the same command on every platform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/opensquilla-0.4.0-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.4.1/opensquilla-0.4.1-py3-none-any.whl"
 ```
 
 This installs the OpenSquilla wheel from the release URL, then lets
@@ -209,7 +209,7 @@ opensquilla gateway run
 > a new terminal, or re-run the PATH line from step 1.
 
 For a fully pinned install, use the versioned wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.4.0/opensquilla-0.4.0-py3-none-any.whl`.
+`https://github.com/opensquilla/opensquilla/releases/download/v0.4.1/opensquilla-0.4.1-py3-none-any.whl`.
 
 ### Install from source
 
@@ -573,36 +573,27 @@ settings live in `opensquilla.toml.example`.
 
 ---
 
-## What's New in 0.4.0
+## What's New in 0.4.1
 
-OpenSquilla 0.4.0 updates the daily control surfaces, workflow launch model,
-coding workflow, search providers, terminal preview path, and runtime hardening:
+OpenSquilla 0.4.1 is a maintenance release for the desktop and Control UI line:
 
-- **Refreshed Control UI** — the local console is easier to scan and operate,
-  with conversation navigation, a Settings modal, Sessions ledger, artifact
-  previews, share export, deliverables, turn trace, mobile tabs, and clearer
-  Skills, Usage, Cron, Logs, and Approvals areas.
-- **Manual MetaSkills with `/meta`** — MetaSkills no longer auto-trigger by
-  default. Use `/meta` to list workflows and `/meta <name>` to run one. Set
-  `meta_skill.auto_trigger = true` only when you intentionally want the older
-  automatic behavior.
-- **Coding mode and code-task** — coding mode can route code changes through
-  `opensquilla code-task`, which works in an isolated run directory, requires a
-  trusted-host confirmation, and verifies before persisting changes back to
-  source.
-- **Broader web search** — DuckDuckGo, Bocha, Brave, Tavily, and Exa are
-  runtime-supported search providers, with source-backed `web_search` and
-  lightweight `web_discover` roles.
-- **OpenTUI preview backend** — the stable Python-native terminal backend stays
-  the default, while OpenTUI is available as an explicit preview path with
-  Router HUD and replay benchmark documentation.
-- **Provider and safety hardening** — `openai_responses` exposes OpenAI's native
-  Responses API shape alongside `openai`; provider stream parsing, Gemini
-  thought-signature replay, SSRF fake-IP DNS guidance, session recovery,
-  artifact handling, and approval event delivery are tightened across surfaces.
+- **Desktop reliability** - packaged gateway checks now cover Coding mode,
+  `code-task`, and SquillaRouter startup, and desktop window/artifact handling
+  is more stable.
+- **Six-language client support** - the Control UI and desktop client support
+  English, Simplified Chinese, Japanese, French, German, and Spanish across
+  first-paint and settings surfaces.
+- **Coding mode and router packaging** - desktop builds fail fast if router
+  assets are missing or still Git LFS pointers, preventing degraded release
+  packages.
+- **Telemetry and Windows polish** - install telemetry skips CI and test
+  environments, and Windows desktop assets use the OpenSquilla logo.
+- **Mainline governance** - ordinary pull requests and release integration are
+  aligned around `main`, with maintainer branches reserved for release, hotfix,
+  staging, integration, and sandbox work.
 
 Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.4.0.md`](docs/releases/0.4.0.md).
+[`docs/releases/0.4.1.md`](docs/releases/0.4.1.md).
 
 ## What's New in 0.2.1
 
