@@ -44,11 +44,19 @@ async def run_tui_runtime(
             with contextlib.suppress(Exception):
                 await abort_turn
 
+        def _notice_queue_discarded(dropped: tuple[str, ...]) -> None:
+            """Tell the user when queued messages are dropped, so a cancel or a
+            destructive command never silently swallows their typed-ahead input."""
+            count = len(dropped)
+            if count and hooks.notice is not None:
+                suffix = "" if count == 1 else "s"
+                hooks.notice(f"[yellow]Discarded {count} queued message{suffix}.[/yellow]")
+
         def _cancel_inflight_turn() -> asyncio.Task[None] | None:
             task = turn_task
             if task is not None and not task.done():
                 abort_task: asyncio.Task[None] | None = None
-                runtime_state.clear_pending()
+                _notice_queue_discarded(runtime_state.clear_pending())
                 with contextlib.suppress(Exception):
                     abort_turn = hooks.on_cancel_active_turn()
                     abort_task = asyncio.create_task(_schedule_abort(abort_turn))
@@ -235,7 +243,7 @@ async def run_tui_runtime(
                 )
 
                 if category is TuiInputKind.DESTRUCTIVE:
-                    runtime_state.clear_pending()
+                    _notice_queue_discarded(runtime_state.clear_pending())
                     if turn_task is not None and not turn_task.done():
                         abort_task = _cancel_inflight_turn()
                         try:
