@@ -1453,6 +1453,8 @@
     "downloadImage": "Bild herunterladen",
     "deliverables": "Ergebnisse",
     "deliverablesCount": "Ergebnisse ({count})",
+    "contextPressure": "Kontext {pct} %",
+    "contextPressureTitle": "Kontextfenster {used}k / {window}k Tokens — nahe der Komprimierungsschwelle",
     "sessionDeliverables": "Sitzungsergebnisse",
     "noDeliverables": "Noch keine Ergebnisse.",
     "openArtifact": "{title}, {subtitle} öffnen",

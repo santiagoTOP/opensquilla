@@ -72,6 +72,11 @@
           <Icon name="share" :size="14" />
           <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
         </button>
+        <span
+          v-if="contextWarning"
+          class="chat-chip chat-ctx-warn"
+          :title="t('chat.contextPressureTitle', { used: contextWarning.usedK, window: contextWarning.windowK, pct: contextWarning.pct })"
+        >{{ t('chat.contextPressure', { pct: contextWarning.pct }) }}</span>
         <span class="chat-chip" :class="runStatusChipClass" :title="runStatusTitle">{{ runStatusLabel }}</span>
       </div>
     </div>
@@ -840,6 +845,7 @@ const chatUsageWidget = useChatUsageWidget({
 const {
   usageAccum,
   usageModel,
+  contextWarning,
   resetSavingsPopupCooldown,
   saveWidgetState,
   restoreWidgetState,
@@ -1389,7 +1395,12 @@ const runStatusTitle = computed(() => {
 })
 
 const isNewChatLanding = computed(() => {
-  return messages.value.length === 0 &&
+  // Only the draft route (/chat/new — bare /chat redirects here) shows the
+  // "new chat" landing. Without this gate, switching between existing
+  // conversations briefly cleared `messages` and flashed the landing, because
+  // the empty-thread moment of a session load looked identical to a new draft.
+  return isDraftRoute() &&
+    messages.value.length === 0 &&
     !isStreaming.value &&
     pendingQueue.value.length === 0 &&
     !compactStatus.value.visible
