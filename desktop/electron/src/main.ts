@@ -20,7 +20,7 @@ interface GatewayState {
 
 type SecretEncryption = 'safeStorage' | 'plain'
 type RouterMode = 'recommended' | 'openrouter-mix' | 'disabled'
-type TextRouterTier = 't0' | 't1' | 't2' | 't3'
+type TextRouterTier = 'c0' | 'c1' | 'c2' | 'c3'
 
 interface ProviderCatalogEntry {
   id: string
@@ -261,7 +261,20 @@ function sendBootError(error: unknown): void {
   mainWindow?.webContents.send('desktop:boot:error', bootError)
 }
 
-const TEXT_ROUTER_TIERS: TextRouterTier[] = ['t0', 't1', 't2', 't3']
+const TEXT_ROUTER_TIERS: TextRouterTier[] = ['c0', 'c1', 'c2', 'c3']
+// Legacy desktop builds (and any credential.json written before the c0-c3
+// rename) used t0-t3. Canonicalize those on read so upgrading users don't end
+// up with duplicate tier keys in their generated config.
+const LEGACY_TEXT_TIER_ALIASES: Record<string, TextRouterTier> = {
+  t0: 'c0',
+  t1: 'c1',
+  t2: 'c2',
+  t3: 'c3',
+}
+
+function canonicalTierKey(name: string): string {
+  return LEGACY_TEXT_TIER_ALIASES[name] ?? name
+}
 const ROUTER_PROFILE_IDS = new Set(['openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
 
 const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
@@ -450,53 +463,53 @@ const SEARCH_PROVIDER_BY_ID = new Map(
 
 const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
   openrouter: {
-    t0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
-    t1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
-    t2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
-    t3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
+    c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
+    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
+    c2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
+    c3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
     image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true, thinkingLevel: 'medium' },
   },
   openai: {
-    t0: { provider: 'openai', model: 'gpt-5.4-nano', description: 'Fast simple work', thinkingLevel: 'none' },
-    t1: { provider: 'openai', model: 'gpt-5.4-mini', description: 'Balanced agent work', thinkingLevel: 'low' },
-    t2: { provider: 'openai', model: 'gpt-5.5', description: 'Complex text tasks', thinkingLevel: 'medium' },
-    t3: { provider: 'openai', model: 'gpt-5.5', description: 'Deep reasoning', thinkingLevel: 'high' },
+    c0: { provider: 'openai', model: 'gpt-5.4-nano', description: 'Fast simple work', thinkingLevel: 'none' },
+    c1: { provider: 'openai', model: 'gpt-5.4-mini', description: 'Balanced agent work', thinkingLevel: 'low' },
+    c2: { provider: 'openai', model: 'gpt-5.5', description: 'Complex text tasks', thinkingLevel: 'medium' },
+    c3: { provider: 'openai', model: 'gpt-5.5', description: 'Deep reasoning', thinkingLevel: 'high' },
   },
   dashscope: {
-    t0: { provider: 'dashscope', model: 'qwen3.6-flash', description: 'Fast simple work' },
-    t1: { provider: 'dashscope', model: 'qwen3.6-plus', description: 'Balanced agent work' },
-    t2: { provider: 'dashscope', model: 'qwen3-max', description: 'Complex text tasks' },
-    t3: { provider: 'dashscope', model: 'qwen3-max', description: 'Deep reasoning' },
+    c0: { provider: 'dashscope', model: 'qwen3.6-flash', description: 'Fast simple work' },
+    c1: { provider: 'dashscope', model: 'qwen3.6-plus', description: 'Balanced agent work' },
+    c2: { provider: 'dashscope', model: 'qwen3-max', description: 'Complex text tasks' },
+    c3: { provider: 'dashscope', model: 'qwen3-max', description: 'Deep reasoning' },
   },
   deepseek: {
-    t0: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Fast simple work' },
-    t1: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Balanced agent work' },
-    t2: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Complex text tasks' },
-    t3: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Deep reasoning' },
+    c0: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Fast simple work' },
+    c1: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Balanced agent work' },
+    c2: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Complex text tasks' },
+    c3: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Deep reasoning' },
   },
   gemini: {
-    t0: { provider: 'gemini', model: 'gemini-2.5-flash-lite', description: 'Fast simple work' },
-    t1: { provider: 'gemini', model: 'gemini-2.5-flash', description: 'Balanced agent work' },
-    t2: { provider: 'gemini', model: 'gemini-2.5-pro', description: 'Complex text tasks' },
-    t3: { provider: 'gemini', model: 'gemini-2.5-pro', description: 'Deep reasoning' },
+    c0: { provider: 'gemini', model: 'gemini-2.5-flash-lite', description: 'Fast simple work' },
+    c1: { provider: 'gemini', model: 'gemini-2.5-flash', description: 'Balanced agent work' },
+    c2: { provider: 'gemini', model: 'gemini-2.5-pro', description: 'Complex text tasks' },
+    c3: { provider: 'gemini', model: 'gemini-2.5-pro', description: 'Deep reasoning' },
   },
   moonshot: {
-    t0: { provider: 'moonshot', model: 'kimi-k2.5', description: 'Fast simple work' },
-    t1: { provider: 'moonshot', model: 'kimi-k2.5', description: 'Balanced agent work' },
-    t2: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Complex text and image work', supportsImage: true },
-    t3: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Deep reasoning and image work', supportsImage: true },
+    c0: { provider: 'moonshot', model: 'kimi-k2.5', description: 'Fast simple work' },
+    c1: { provider: 'moonshot', model: 'kimi-k2.5', description: 'Balanced agent work' },
+    c2: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Complex text and image work', supportsImage: true },
+    c3: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Deep reasoning and image work', supportsImage: true },
   },
   volcengine: {
-    t0: { provider: 'volcengine', model: 'doubao-seed-2-0-mini-260215', description: 'Fast simple work' },
-    t1: { provider: 'volcengine', model: 'doubao-seed-2-0-lite-260215', description: 'Balanced agent work' },
-    t2: { provider: 'volcengine', model: 'doubao-seed-2-0-pro-260215', description: 'Complex text tasks' },
-    t3: { provider: 'volcengine', model: 'doubao-seed-2-0-code-preview-260215', description: 'Code-heavy deep reasoning' },
+    c0: { provider: 'volcengine', model: 'doubao-seed-2-0-mini-260215', description: 'Fast simple work' },
+    c1: { provider: 'volcengine', model: 'doubao-seed-2-0-lite-260215', description: 'Balanced agent work' },
+    c2: { provider: 'volcengine', model: 'doubao-seed-2-0-pro-260215', description: 'Complex text tasks' },
+    c3: { provider: 'volcengine', model: 'doubao-seed-2-0-code-preview-260215', description: 'Code-heavy deep reasoning' },
   },
   zhipu: {
-    t0: { provider: 'zhipu', model: 'glm-4.7-flashx', description: 'Fast simple work' },
-    t1: { provider: 'zhipu', model: 'glm-5', description: 'Balanced agent work' },
-    t2: { provider: 'zhipu', model: 'glm-5.1', description: 'Complex text tasks' },
-    t3: { provider: 'zhipu', model: 'glm-5.1', description: 'Deep reasoning' },
+    c0: { provider: 'zhipu', model: 'glm-4.7-flashx', description: 'Fast simple work' },
+    c1: { provider: 'zhipu', model: 'glm-5', description: 'Balanced agent work' },
+    c2: { provider: 'zhipu', model: 'glm-5.1', description: 'Complex text tasks' },
+    c3: { provider: 'zhipu', model: 'glm-5.1', description: 'Deep reasoning' },
   },
 }
 
@@ -524,7 +537,8 @@ function normalizeProvider(raw: unknown): string {
 
 function normalizeTextTier(raw: unknown): TextRouterTier {
   const value = String(raw || '').trim().toLowerCase()
-  return TEXT_ROUTER_TIERS.includes(value as TextRouterTier) ? value as TextRouterTier : 't1'
+  const canonical = canonicalTierKey(value)
+  return TEXT_ROUTER_TIERS.includes(canonical as TextRouterTier) ? canonical as TextRouterTier : 'c1'
 }
 
 function normalizeRouterMode(raw: unknown, provider: string): RouterMode {
@@ -545,8 +559,9 @@ function normalizeRouterTiers(raw: unknown, fallback: Record<string, RouterTier>
   if (!raw || typeof raw !== 'object') return cloneRouterTiers(fallback)
   const source = raw as Record<string, unknown>
   const out = cloneRouterTiers(fallback)
-  for (const [name, value] of Object.entries(source)) {
+  for (const [rawName, value] of Object.entries(source)) {
     if (!value || typeof value !== 'object') continue
+    const name = canonicalTierKey(rawName)
     const tier = value as Record<string, unknown>
     const provider = String(tier.provider || out[name]?.provider || '').trim()
     const model = String(tier.model || out[name]?.model || '').trim()
@@ -565,7 +580,7 @@ function normalizeRouterTiers(raw: unknown, fallback: Record<string, RouterTier>
 }
 
 function routerDefaultModel(tiers: Record<string, RouterTier>, defaultTier: TextRouterTier): string {
-  return tiers[defaultTier]?.model || tiers.t1?.model || tiers.t0?.model || ''
+  return tiers[defaultTier]?.model || tiers.c1?.model || tiers.c0?.model || ''
 }
 
 function searchProviderDefaults(provider: string): SearchProviderCatalogEntry {
@@ -1165,7 +1180,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step3.back': '返回',
     'onboarding.step3.next': '下一步',
     'onboarding.step4.badge': '模型',
-    'onboarding.step4.heading': '查看层级模型',
+    'onboarding.step4.heading': '候选模型池',
     'onboarding.step4.subtitle': '选择默认文本层级并保留 CLI 默认值，或在启动前自定义模型 id。',
     'onboarding.step4.back': '返回',
     'onboarding.step4.next': '下一步',
@@ -1524,7 +1539,7 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     fixedTitle: 'Use one fixed model',
     fixedBody: 'Skip Smart Router and send every request to the direct model.',
     routerHintDisabled: 'Requests will use the direct model field from the provider step.',
-    routerHintActive: '{mode} is active. The next step shows the exact t0-t3 and image model ids before saving.',
+    routerHintActive: '{mode} is active. The next step shows the exact c0-c3 and image model ids before saving.',
     directModelLabel: 'Direct model',
     noModel: 'No model',
     directModelNote: 'Smart Router is off. Every request uses this model directly.',
@@ -1557,7 +1572,7 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     fixedTitle: '使用一个固定模型',
     fixedBody: '跳过 Smart Router，将每个请求都发送到直连模型。',
     routerHintDisabled: '请求将使用提供商步骤中的直连模型字段。',
-    routerHintActive: '{mode} 已启用。下一步将在保存前显示确切的 t0-t3 和图像模型 id。',
+    routerHintActive: '{mode} 已启用。下一步将在保存前显示确切的 c0-c3 和图像模型 id。',
     directModelLabel: '直连模型',
     noModel: '无模型',
     directModelNote: 'Smart Router 已关闭。每个请求都直接使用此模型。',
@@ -1590,7 +1605,7 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     fixedTitle: '固定モデルを 1 つ使用',
     fixedBody: 'Smart Router をスキップし、すべてのリクエストを直接モデルに送信します。',
     routerHintDisabled: 'リクエストはプロバイダー手順の直接モデルフィールドを使用します。',
-    routerHintActive: '{mode} が有効です。次の手順では保存前に正確な t0-t3 と画像モデルの id を表示します。',
+    routerHintActive: '{mode} が有効です。次の手順では保存前に正確な c0-c3 と画像モデルの id を表示します。',
     directModelLabel: '直接モデル',
     noModel: 'モデルなし',
     directModelNote: 'Smart Router はオフです。すべてのリクエストでこのモデルを直接使用します。',
@@ -1623,7 +1638,7 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     fixedTitle: 'Utiliser un seul modèle fixe',
     fixedBody: 'Ignorer Smart Router et envoyer chaque requête au modèle direct.',
     routerHintDisabled: 'Les requêtes utiliseront le champ de modèle direct de l\'étape fournisseur.',
-    routerHintActive: '{mode} est actif. L\'étape suivante affiche les id exacts t0-t3 et du modèle d\'image avant l\'enregistrement.',
+    routerHintActive: '{mode} est actif. L\'étape suivante affiche les id exacts c0-c3 et du modèle d\'image avant l\'enregistrement.',
     directModelLabel: 'Modèle direct',
     noModel: 'Aucun modèle',
     directModelNote: 'Smart Router est désactivé. Chaque requête utilise directement ce modèle.',
@@ -1656,7 +1671,7 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     fixedTitle: 'Ein festes Modell verwenden',
     fixedBody: 'Smart Router überspringen und jede Anfrage an das direkte Modell senden.',
     routerHintDisabled: 'Anfragen verwenden das Feld für das direkte Modell aus dem Anbieterschritt.',
-    routerHintActive: '{mode} ist aktiv. Der nächste Schritt zeigt vor dem Speichern die genauen t0-t3- und Bildmodell-ids.',
+    routerHintActive: '{mode} ist aktiv. Der nächste Schritt zeigt vor dem Speichern die genauen c0-c3- und Bildmodell-ids.',
     directModelLabel: 'Direktes Modell',
     noModel: 'Kein Modell',
     directModelNote: 'Smart Router ist aus. Jede Anfrage verwendet dieses Modell direkt.',
@@ -1689,7 +1704,7 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     fixedTitle: 'Usar un solo modelo fijo',
     fixedBody: 'Omitir Smart Router y enviar cada solicitud al modelo directo.',
     routerHintDisabled: 'Las solicitudes usarán el campo de modelo directo del paso del proveedor.',
-    routerHintActive: '{mode} está activo. El siguiente paso muestra los id exactos t0-t3 y del modelo de imagen antes de guardar.',
+    routerHintActive: '{mode} está activo. El siguiente paso muestra los id exactos c0-c3 y del modelo de imagen antes de guardar.',
     directModelLabel: 'Modelo directo',
     noModel: 'Sin modelo',
     directModelNote: 'Smart Router está desactivado. Cada solicitud usa este modelo directamente.',
@@ -2733,7 +2748,7 @@ function onboardingHtml(): string {
         });
         return;
       }
-      const defaultTier = document.getElementById('routerDefaultTier')?.value || 't1';
+      const defaultTier = document.getElementById('routerDefaultTier')?.value || 'c1';
       const tierButtons = textTiers.map((tier) => (
         '<button class="tier-button' + (tier === defaultTier ? ' active' : '') + '" type="button" data-default-tier="' + tier + '">' +
         '<strong>' + tier.toUpperCase() + '</strong><small title="' + escapeAttr(routerTiers[tier]?.model || t.noModel) + '">' + escapeHtml(shortModel(routerTiers[tier]?.model || t.noModel)) + '</small></button>'
@@ -2757,7 +2772,7 @@ function onboardingHtml(): string {
         '<details><summary>' + escapeHtml(t.customizeTiers) + '</summary><div class="editor-grid">' + editor + '</div></details>';
       tierBody.querySelectorAll('[data-default-tier]').forEach((button) => {
         button.addEventListener('click', () => {
-          document.getElementById('routerDefaultTier').value = button.dataset.defaultTier || 't1';
+          document.getElementById('routerDefaultTier').value = button.dataset.defaultTier || 'c1';
           renderTiers();
         });
       });
@@ -2894,7 +2909,7 @@ function onboardingHtml(): string {
       if (step === 1 && selected.requiresApiKey && !document.getElementById('apiKey').value.trim()) return fmt('apiKeyRequired', { label: selected.label });
       if (step === 3 && routerMode.value === 'disabled' && !model.value.trim()) return t.directModelRequiredDisabled;
       if (step === 3 && routerMode.value !== 'disabled') {
-        const defaultTier = document.getElementById('routerDefaultTier')?.value || 't1';
+        const defaultTier = document.getElementById('routerDefaultTier')?.value || 'c1';
         if (!routerTiers[defaultTier] || !routerTiers[defaultTier].model) return t.defaultTierRequiresModel;
       }
       if (step === 4 && selectedSearch.requiresApiKey && !document.getElementById('searchApiKey').value.trim()) return fmt('searchApiKeyRequired', { label: selectedSearch.label });
@@ -2934,7 +2949,7 @@ function onboardingHtml(): string {
           baseUrl: baseUrl.value,
           model: model.value,
           routerMode: routerMode.value,
-          routerDefaultTier: document.getElementById('routerDefaultTier')?.value || 't1',
+          routerDefaultTier: document.getElementById('routerDefaultTier')?.value || 'c1',
           routerTiers,
           searchProvider: searchProvider.value,
           searchApiKey: document.getElementById('searchApiKey').value,
@@ -4386,7 +4401,7 @@ ipcMain.handle('desktop:onboarding:defaults', () => ({
   searchProviders: SEARCH_PROVIDER_CATALOG,
   router: {
     modes: ['recommended', 'openrouter-mix', 'disabled'],
-    defaultTier: 't1',
+    defaultTier: 'c1',
     textTiers: TEXT_ROUTER_TIERS,
     profiles: ROUTER_PROFILES,
   },
