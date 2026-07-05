@@ -175,13 +175,13 @@ from opensquilla.paths import media_root_from_config
 from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
-from opensquilla.provider.types import (
-    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
-)
 from opensquilla.provider import (
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
+)
+from opensquilla.provider.types import (
+    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
 from opensquilla.router_control import (
     RouterControlHoldStore,

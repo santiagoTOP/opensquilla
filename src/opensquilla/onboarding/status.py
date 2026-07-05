@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from opensquilla.gateway.config import GatewayConfig, LEGACY_OPENROUTER_MODEL_OPTIONS
+from opensquilla.gateway.config import LEGACY_OPENROUTER_MODEL_OPTIONS, GatewayConfig
 from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
 from opensquilla.onboarding.config_store import default_config_path
 from opensquilla.onboarding.image_generation_specs import (

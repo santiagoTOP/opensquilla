@@ -16,9 +16,9 @@ handler bodies.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-import os
 from typing import Any
 
 from opensquilla.gateway.config_secrets import inherit_runtime_secrets
@@ -448,7 +448,9 @@ async def _router_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     default_tier = params.get("defaultTier") if isinstance(params, dict) else None
     tiers = params.get("tiers") if isinstance(params, dict) else None
     cross_provider_tiers = params.get("crossProviderTiers") if isinstance(params, dict) else None
-    tier_provider_mismatch = params.get("tierProviderMismatch") if isinstance(params, dict) else None
+    tier_provider_mismatch = (
+        params.get("tierProviderMismatch") if isinstance(params, dict) else None
+    )
     with _validation_error("onboarding.router.invalid"):
         res = upsert_router(
             cfg,

@@ -504,8 +504,12 @@ def upsert_router(
         source_tiers = tiers
         if router_mode == "openrouter-mix":
             if provider != "openrouter":
-                raise ValueError("openrouter-mix router mode is only valid for openrouter LLM provider")
-            source_tiers = tiers if tiers is not None else getattr(config.squilla_router, "tiers", {})
+                raise ValueError(
+                    "openrouter-mix router mode is only valid for openrouter LLM provider"
+                )
+            source_tiers = (
+                tiers if tiers is not None else getattr(config.squilla_router, "tiers", {})
+            )
         merged_tiers = _merge_router_tiers(base_tiers, source_tiers)
         writes_packaged_profile = (
             router_mode in {"recommended", "openrouter-mix"}
