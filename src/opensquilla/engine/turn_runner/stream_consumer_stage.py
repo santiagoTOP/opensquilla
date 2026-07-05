@@ -982,12 +982,16 @@ class StreamConsumerStage:
             ArtifactEvent,
             CompactionEvent,
             DoneEvent,
+            EnsembleProgressEvent,
             ErrorEvent,
             TextDeltaEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
             ToolUseStartEvent,
             WarningEvent,
+        )
+        from opensquilla.provider.types import (
+            EnsembleProgressEvent as ProviderEnsembleProgressEvent,
         )
 
         state = inp.state
@@ -1021,6 +1025,20 @@ class StreamConsumerStage:
             elif isinstance(event, CompactionEvent):
                 await self._compaction_handler.handle(event, inp)
                 transformed = _SUPPRESS
+            elif isinstance(event, ProviderEnsembleProgressEvent):
+                transformed = EnsembleProgressEvent(
+                    event_type=event.event_type,
+                    proposer_index=event.proposer_index,
+                    proposer_label=event.proposer_label,
+                    proposer_model=event.proposer_model,
+                    proposer_provider=event.proposer_provider,
+                    sample_index=event.sample_index,
+                    elapsed_ms=event.elapsed_ms,
+                    input_tokens=event.input_tokens,
+                    output_tokens=event.output_tokens,
+                    cost_usd=event.cost_usd,
+                    error=event.error,
+                )
             else:
                 transformed = event
 

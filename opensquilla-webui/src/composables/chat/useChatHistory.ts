@@ -7,7 +7,10 @@ import type {
 } from '@/types/chat'
 import type { ChatHistoryMessage, ChatHistoryResponse } from '@/types/rpc'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
-import { reconcileHistoryMessages } from '@/utils/chat/historyMerge'
+import {
+  reconcileHistoryMessages,
+  reconcileRunningHistoryMessages,
+} from '@/utils/chat/historyMerge'
 
 type RpcClient = {
   waitForConnection: () => Promise<void>
@@ -48,6 +51,7 @@ export interface UseChatHistoryOptions {
   threadRef?: Ref<HTMLElement | null>
   lastHeaderRole: Ref<string>
   lastHeaderDay: Ref<string>
+  preserveLiveTail?: Ref<boolean>
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
 }
@@ -169,9 +173,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       const msgs = data.messages || []
       updateHistoryState(data)
       loadingHistoryKey = ''
+      const preserveLiveTail = Boolean(options.preserveLiveTail?.value)
 
       if (msgs.length === 0 && !params.prepend) {
-        options.messages.value = []
+        options.messages.value = preserveLiveTail
+          ? reconcileRunningHistoryMessages(options.messages.value, [])
+          : []
         options.lastHeaderRole.value = ''
         options.lastHeaderDay.value = ''
         flushPendingHistorySync()
@@ -185,6 +192,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           ...mapped.filter(msg => !existing.has(messageKey(msg))),
           ...options.messages.value,
         ]
+      } else if (preserveLiveTail) {
+        options.messages.value = reconcileRunningHistoryMessages(options.messages.value, mapped)
       } else if (historyMergeEnabled) {
         // Same-session sync: reconcile by messageId so live-only fields survive
         // the snapshot instead of being clobbered. isCurrentRequest() already

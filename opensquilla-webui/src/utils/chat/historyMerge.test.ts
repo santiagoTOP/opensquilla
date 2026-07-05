@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { mergeLiveOnlyFields, reconcileHistoryMessages } from './historyMerge'
+import {
+  mergeLiveOnlyFields,
+  reconcileHistoryMessages,
+  reconcileRunningHistoryMessages,
+} from './historyMerge'
 import type { ChatMessage, ChatReasoning } from '@/types/chat'
 
 function msg(overrides: Partial<ChatMessage>): ChatMessage {
@@ -66,5 +70,67 @@ describe('reconcileHistoryMessages', () => {
     const prev = [msg({ messageId: 'm1', reasoning: reasoning(9) })]
     const out = reconcileHistoryMessages(prev, [msg({ messageId: undefined, reasoning: undefined })])
     expect(out[0].reasoning).toBeUndefined()
+  })
+})
+
+describe('reconcileRunningHistoryMessages', () => {
+  it('preserves the live tail after the last user when a running history snapshot is colder', () => {
+    const prev = [
+      msg({ role: 'user', text: 'build it', messageId: 'u1' }),
+      msg({
+        role: 'router',
+        text: '',
+        routerDecision: { source: 'llm_ensemble', model: 'z-ai/glm-5.2', tier: 'c1' },
+        ensemble: {
+          profile: 'llm_ensemble',
+          modelCount: 1,
+          totalCandidates: 1,
+          requestCount: 1,
+          fallbackUsed: false,
+          fallbackReason: '',
+          costUsd: 0,
+          savedUsd: 0,
+          savedPct: 0,
+          models: [{
+            role: 'proposer_1',
+            label: 'proposer_1',
+            provider: 'openrouter',
+            model: 'z-ai/glm-5.2',
+            modelShort: 'glm-5.2',
+            input: 0,
+            output: 0,
+            costUsd: 0,
+            status: 'running',
+          }],
+        },
+      }),
+      msg({ role: 'assistant', text: 'Writing a file', tool_calls: [{ id: 't1', name: 'write_file' }] as any }),
+    ]
+    const incoming = [msg({ role: 'user', text: 'build it', messageId: 'u1', restoredFromHistory: true })]
+
+    const out = reconcileRunningHistoryMessages(prev, incoming)
+
+    expect(out).toHaveLength(3)
+    expect(out[0].messageId).toBe('u1')
+    expect(out[1].role).toBe('router')
+    expect(out[1].ensemble?.models[0]?.model).toBe('z-ai/glm-5.2')
+    expect(out[2].role).toBe('assistant')
+    expect(out[2].tool_calls?.[0]?.name).toBe('write_file')
+  })
+
+  it('does not duplicate live rows that the server snapshot already contains by message id', () => {
+    const prev = [
+      msg({ role: 'user', text: 'build it', messageId: 'u1' }),
+      msg({ role: 'assistant', text: 'partial', messageId: 'a1', routerSettled: true }),
+    ]
+    const incoming = [
+      msg({ role: 'user', text: 'build it', messageId: 'u1', restoredFromHistory: true }),
+      msg({ role: 'assistant', text: 'partial', messageId: 'a1', restoredFromHistory: true }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(prev, incoming)
+
+    expect(out.map(message => message.messageId)).toEqual(['u1', 'a1'])
+    expect(out[1].routerSettled).toBe(true)
   })
 })

@@ -37,12 +37,14 @@ from opensquilla.engine.types import (
     ArtifactEvent,
     CompactionEvent,
     DoneEvent,
+    EnsembleProgressEvent,
     ErrorEvent,
     TextDeltaEvent,
     ToolResultEvent,
     ToolUseStartEvent,
     WarningEvent,
 )
+from opensquilla.provider.types import EnsembleProgressEvent as ProviderEnsembleProgressEvent
 
 # ---------------------------------------------------------------------------
 # Recording fakes
@@ -281,6 +283,44 @@ async def test_stream_consumer_forwards_pending_input_provider_to_agent_run() ->
     await _drain(stage, _make_input(pending_input_provider=pending))
 
     assert recordings["agent_run"].received[0]["pending_input_provider"] is pending
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_normalizes_provider_ensemble_progress_events() -> None:
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                ProviderEnsembleProgressEvent(
+                    event_type="proposer_start",
+                    proposer_index=1,
+                    proposer_label="proposer_2",
+                    proposer_model="z-ai/glm-5.2",
+                    proposer_provider="openrouter",
+                    sample_index=0,
+                    elapsed_ms=12,
+                    input_tokens=3,
+                    output_tokens=4,
+                    cost_usd=0.005,
+                    error="",
+                ),
+            ],
+        )
+    )
+
+    events = await _drain(stage, _make_input())
+
+    assert isinstance(events[0], EnsembleProgressEvent)
+    assert events[0].event_type == "proposer_start"
+    assert events[0].proposer_index == 1
+    assert events[0].proposer_label == "proposer_2"
+    assert events[0].proposer_model == "z-ai/glm-5.2"
+    assert events[0].proposer_provider == "openrouter"
+    assert events[0].sample_index == 0
+    assert events[0].elapsed_ms == 12
+    assert events[0].input_tokens == 3
+    assert events[0].output_tokens == 4
+    assert events[0].cost_usd == 0.005
+    assert events[0].error == ""
 
 
 # ---------------------------------------------------------------------------

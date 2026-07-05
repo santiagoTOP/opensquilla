@@ -1096,6 +1096,10 @@ const chatShareExport = useChatShareExport({
   title: shareTitle,
 })
 
+const preserveHistoryLiveTail = computed(() =>
+  isStreaming.value || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status),
+)
+
 const chatHistory = useChatHistory({
   rpc,
   sessionKey,
@@ -1103,6 +1107,7 @@ const chatHistory = useChatHistory({
   threadRef,
   lastHeaderRole,
   lastHeaderDay,
+  preserveLiveTail: preserveHistoryLiveTail,
   stripTimePrefix,
   scrollToBottom,
 })

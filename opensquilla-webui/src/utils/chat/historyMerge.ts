@@ -43,3 +43,64 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
     return prior ? mergeLiveOnlyFields(prior, server) : server
   })
 }
+
+function fallbackMessageKey(msg: ChatMessage): string {
+  return `${msg.role}:${msg.ts || ''}:${msg.text || ''}`
+}
+
+function lastUserIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') return i
+  }
+  return -1
+}
+
+function insertionIndexForLiveTail(
+  merged: ChatMessage[],
+  previousLastUser: ChatMessage,
+): number {
+  if (previousLastUser.messageId) {
+    const byId = merged.findIndex(msg => msg.messageId === previousLastUser.messageId)
+    if (byId >= 0) return byId
+  }
+  const previousKey = fallbackMessageKey(previousLastUser)
+  const byFallback = merged.findIndex(msg => fallbackMessageKey(msg) === previousKey)
+  if (byFallback >= 0) return byFallback
+  return lastUserIndex(merged)
+}
+
+// Running/live history sync is intentionally less server-authoritative than the
+// settled reconcile above: a cold transcript snapshot may not yet contain the
+// in-flight router strip, tool row, or partial assistant row that replay already
+// rebuilt locally. Preserve the local tail after the last user until terminal
+// sync makes the transcript authoritative again.
+export function reconcileRunningHistoryMessages(
+  prev: ChatMessage[],
+  incoming: ChatMessage[],
+): ChatMessage[] {
+  if (prev.length === 0) return incoming
+  if (incoming.length === 0) return prev
+
+  const previousLastUserIndex = lastUserIndex(prev)
+  if (previousLastUserIndex < 0) return reconcileHistoryMessages(prev, incoming)
+
+  const liveTail = prev.slice(previousLastUserIndex + 1)
+  if (liveTail.length === 0) return reconcileHistoryMessages(prev, incoming)
+
+  const merged = reconcileHistoryMessages(prev, incoming)
+  const existingIds = new Set(merged.map(msg => msg.messageId).filter(Boolean))
+  const existingFallbackKeys = new Set(merged.map(fallbackMessageKey))
+  const tailToPreserve = liveTail.filter(msg => {
+    if (msg.messageId) return !existingIds.has(msg.messageId)
+    return !existingFallbackKeys.has(fallbackMessageKey(msg))
+  })
+  if (tailToPreserve.length === 0) return merged
+
+  const insertAfter = insertionIndexForLiveTail(merged, prev[previousLastUserIndex])
+  if (insertAfter < 0) return [...merged, ...tailToPreserve]
+  return [
+    ...merged.slice(0, insertAfter + 1),
+    ...tailToPreserve,
+    ...merged.slice(insertAfter + 1),
+  ]
+}
