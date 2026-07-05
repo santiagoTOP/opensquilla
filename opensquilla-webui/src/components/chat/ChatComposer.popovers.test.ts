@@ -30,6 +30,7 @@ async function mountComposer() {
     codingModeSettingsBusy: false,
     voiceBusy: false,
     voiceRecording: false,
+    voiceReady: true,
   })
   app.use(i18n)
   app.mount(el)

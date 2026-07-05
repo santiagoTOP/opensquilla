@@ -6,6 +6,7 @@ import { useToasts } from '@/composables/useToasts'
 interface TranscriptionResponse {
   text?: string
   error?: string
+  code?: string
 }
 
 function authToken(): string {
@@ -94,11 +95,24 @@ export function useVoiceInput() {
         credentials: 'same-origin',
       })
       const data = (await response.json().catch(() => ({}))) as TranscriptionResponse
-      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
+      if (!response.ok) {
+        // A 503/UNAVAILABLE means voice transcription isn't configured on the
+        // backend (audio disabled or no ElevenLabs key). The mic button is
+        // normally gated on readiness, so this is a race/stale-status backstop:
+        // surface a visible, actionable toast instead of failing silently.
+        const unavailable = response.status === 503 || data.code === 'UNAVAILABLE'
+        console.warn('Voice transcription failed:', data.error || `HTTP ${response.status}`)
+        pushToast(
+          i18n.global.t(unavailable ? 'chat.toast.voiceUnavailable' : 'chat.toast.voiceTranscribeFailed'),
+          { tone: 'danger' },
+        )
+        return
+      }
       const text = String(data.text || '').trim()
       if (text) onText(text)
     } catch (err) {
       console.warn('Voice transcription failed:', err instanceof Error ? err.message : String(err))
+      pushToast(i18n.global.t('chat.toast.voiceTranscribeFailed'), { tone: 'danger' })
     } finally {
       voiceBusy.value = false
     }

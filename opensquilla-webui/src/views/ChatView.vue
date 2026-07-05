@@ -451,6 +451,7 @@
       :coding-mode-settings-busy="codingModeSettingsBusy"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
+      :voice-ready="voiceReady"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -464,6 +465,7 @@
       @set-visual-effects-enabled="setComposerVisualEffectsEnabled"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @voice-input="onVoiceInput"
+      @voice-setup="onVoiceSetup"
       @export-markdown="exportMarkdown"
       @send="onSend"
       @stop="onStop"
@@ -514,6 +516,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } f
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
+import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
@@ -1119,6 +1122,14 @@ const {
   cleanup: cleanupVoiceInput,
 } = voiceInput
 
+// Gate the composer mic button on real transcription readiness. onboarding.status
+// resolves whether audio is enabled AND an ElevenLabs key is present server-side
+// (including env-var keys the browser can't see), so audioConfigured is a true
+// "voice will work" signal — this keeps the button from being clicked into a
+// guaranteed failure. It's the same snapshot the empty-state chips read.
+const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>('onboarding.status')
+const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
+
 const chatMessageActions = useChatMessageActions({
   messages,
   inputText,
@@ -1560,6 +1571,13 @@ function appendComposerText(text: string) {
 
 function onVoiceInput() {
   void toggleVoiceInput(appendComposerText)
+}
+
+// When voice isn't configured the mic button routes here instead of recording:
+// tell the user what's missing and take them straight to the audio settings.
+function onVoiceSetup() {
+  pushToast(t('chat.toast.voiceSetupNeeded'), { tone: 'info' })
+  router.push('/settings/capabilities').catch(() => {})
 }
 
 function normalizeRunStatus(status: string): ChatRunStatusState {

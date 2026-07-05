@@ -93,7 +93,7 @@ const chips = computed(() => {
 .empty-state__greeting {
   margin: var(--sp-2) 0 0;
   font-family: var(--font-display);
-  font-size: var(--fs-xl);
+  font-size: clamp(1.75rem, 1rem + 1.8vw, 2.25rem);
   font-weight: 600;
   letter-spacing: var(--track-display);
   color: var(--text);

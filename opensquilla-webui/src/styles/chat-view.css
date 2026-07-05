@@ -20,9 +20,11 @@
 }
 
 .chat--new-landing {
-  justify-content: flex-start;
+  justify-content: center;
   gap: 1.125rem;
-  padding: clamp(5.25rem, 17vh, 9.5rem) 0 2rem;
+  /* Bottom > top: nudges the centred group slightly above true-centre
+     (optical centre), which reads as more intentional than dead-centre. */
+  padding: 2rem 0 6rem;
 }
 
 .chat-header {

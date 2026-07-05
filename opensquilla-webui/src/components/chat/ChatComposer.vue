@@ -116,11 +116,11 @@
             </div>
             <button
               class="btn btn--icon btn--ghost"
-              :class="{ 'is-active': voiceRecording }"
-              :title="t('chat.recordVoice')"
-              :aria-label="t('chat.recordVoice')"
+              :class="{ 'is-active': voiceRecording, 'chat-mic--needs-setup': !voiceReady }"
+              :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+              :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
               :disabled="voiceBusy"
-              @click="emit('voiceInput')"
+              @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
             >
               <Icon name="microphone" :size="17" />
             </button>
@@ -211,6 +211,7 @@ defineProps<{
   codingModeSettingsBusy: boolean
   voiceBusy: boolean
   voiceRecording: boolean
+  voiceReady: boolean
 }>()
 
 const emit = defineEmits<{
@@ -228,6 +229,7 @@ const emit = defineEmits<{
   setVisualEffectsEnabled: [enabled: boolean]
   setCodingModeEnabled: [enabled: boolean]
   voiceInput: []
+  voiceSetup: []
   exportMarkdown: []
   stop: []
 }>()
@@ -506,7 +508,7 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer--new-landing .chat-input-panel {
-  min-height: 148px;
+  min-height: 168px;
   border-color: var(--border);
   border-radius: var(--radius-modal);
   box-shadow: var(--shadow-lg);
@@ -598,8 +600,9 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer--new-landing .chat-textarea {
-  min-height: 86px;
-  padding: 1.125rem 1.25rem 0.5rem;
+  min-height: 108px;
+  padding: 1.25rem 1.5rem 0.5rem;
+  font-size: 1rem;
 }
 
 .chat-textarea:focus {
@@ -622,13 +625,22 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-plus-btn {
-  border: 1px solid var(--border);
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 .btn--ghost.is-active {
   background: color-mix(in srgb, var(--ok) 12%, var(--bg-surface));
   color: var(--ok);
+}
+
+/* Voice not configured: keep the button clickable (it routes to setup) but
+   dim it so it still reads as "not active"; brighten on hover to invite it. */
+.chat-mic--needs-setup {
+  opacity: var(--state-disabled-opacity);
+}
+
+.chat-mic--needs-setup:hover {
+  opacity: 1;
 }
 
 .chat-model-routing-btn {
