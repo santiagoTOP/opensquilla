@@ -248,7 +248,7 @@ def _active_llm_credential_reveal_payload(ctx: RpcContext, provider_id: str) -> 
         str(getattr(llm, "api_key_env", "") or "").strip()
         or str(getattr(spec, "env_key", "") or "").strip()
     )
-    runtime_secret_paths = getattr(cfg, "_runtime_secret_paths", set())
+    runtime_secret_paths: set[str] = getattr(cfg, "_runtime_secret_paths", set())
     explicit_key = (
         ""
         if "llm.api_key" in runtime_secret_paths

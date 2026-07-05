@@ -274,7 +274,7 @@ def _mask_credential(value: str) -> str:
 
 def _saved_llm_api_key(cfg: GatewayConfig) -> str:
     llm = getattr(cfg, "llm", None)
-    runtime_secret_paths = getattr(cfg, "_runtime_secret_paths", set())
+    runtime_secret_paths: set[str] = getattr(cfg, "_runtime_secret_paths", set())
     if "llm.api_key" in runtime_secret_paths:
         return ""
     return str(getattr(llm, "api_key", "") or "")

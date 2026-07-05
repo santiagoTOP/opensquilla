@@ -639,7 +639,7 @@ def upsert_llm_ensemble(
     new_cfg = _clone(config)
     new_cfg.llm_ensemble = new_ensemble
 
-    payload = {
+    payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
         "selection_mode": new_ensemble.selection_mode,
         "model_options": list(new_ensemble.model_options),
