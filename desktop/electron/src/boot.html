@@ -123,6 +123,13 @@
       width: 38%;
     }
 
+    /* On a startup failure the splash is paused, not working — freeze the
+       indeterminate sweep so it doesn't contradict the "Startup paused" state. */
+    body.errored .status-line::before {
+      animation: none;
+      opacity: 0.2;
+    }
+
     .status-copy {
       align-items: baseline;
       display: flex;
@@ -430,6 +437,9 @@
       // local default phase string only when no label was provided.
       phase.textContent = payload && payload.label ? String(payload.label) : msg.phaseDefault;
       errorPanel.classList.remove('visible');
+      // Leaving the error state: resume the sweep and the elapsed timer.
+      document.body.classList.remove('errored');
+      if (!timerInterval) timerInterval = setInterval(updateTimer, 100);
       setStepState(stepMap[phaseId] || 'profile', phaseId === 'ready');
     }
 
@@ -438,6 +448,14 @@
       phase.textContent = msg.startupPaused;
       errorMessage.textContent = message;
       errorPanel.classList.add('visible');
+      // Stop signalling progress: freeze the elapsed timer, pause the sweep (via
+      // the .errored class), and drop the active step highlight so a failed phase
+      // is not shown as still running.
+      document.body.classList.add('errored');
+      if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+      for (const step of Object.values(steps)) {
+        if (step) step.classList.remove('active');
+      }
     }
 
     async function resetSetup() {
@@ -457,9 +475,10 @@
       }
     }
 
-    setInterval(() => {
+    function updateTimer() {
       timer.textContent = `${((performance.now() - started) / 1000).toFixed(1).padStart(4, '0')}s`;
-    }, 100);
+    }
+    let timerInterval = setInterval(updateTimer, 100);
 
     const api = window.opensquillaDesktop;
     if (api) {

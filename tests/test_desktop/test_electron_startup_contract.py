@@ -84,8 +84,14 @@ def test_desktop_activation_retry_and_second_instance_share_resume_helper() -> N
         "})\n}",
     )
 
-    assert "!gatewayStartPromise && !ready && gatewayProcess && gatewayState.owned" in retry
+    # Retry backs both the boot-error button and the Control UI "Restart runtime"
+    # action, so it forces a real restart: an in-flight start is joined (clearing
+    # the stale error), otherwise an owned gateway is torn down and awaited before
+    # respawn rather than reused, so a healthy-but-misbehaving runtime can restart.
+    assert "if (gatewayStartPromise)" in retry
     assert "stopGateway()" in retry
+    assert "await waitForGatewayProcessExit(previousChild)" in retry
+    assert "clearReusableGatewayState()" in retry
     assert "void openOrResumeDesktopApp()" in retry
 
 
@@ -863,7 +869,7 @@ def test_desktop_credential_save_preserves_config_privacy_without_payload_settin
         in save
     )
     assert "if (!existsSync(path)) return null" in read_config
-    assert "return parseDesktopNetworkObservabilityPrivacyConfig(raw)" in read_config
+    assert "parseDesktopNetworkObservabilityPrivacyConfig(raw)" in read_config
     assert "return true" in read_config
 
 
@@ -1059,7 +1065,10 @@ def test_desktop_cleanup_does_not_claim_os_app_uninstall() -> None:
     assert "OPENSQUILLA_INSTALL_METHOD: 'desktop'" in cleanup
     assert "OPENSQUILLA_STATE_DIR: desktopHome()" in cleanup
     assert "remove the installed .app / NSIS application" in cleanup
-    assert "installed app itself will remain" in cleanup
+    # The purge confirmation is localized via desktopT; the "app remains"
+    # guarantee now lives in the (localized) message catalog rather than inline.
+    assert "desktopT('uninstall.confirmDetail')" in cleanup
+    assert "installed app itself will remain" in main_ts
     assert "does not remove the installed app bundle itself" in panel_vue
 
     en_runtime = en_locale["setup"]["runtime"]
@@ -1107,3 +1116,46 @@ def test_desktop_windows_quit_drains_gateway_before_exit() -> None:
     assert "app.exit(0)" in before_quit
     # The drain runs once, then the re-issued quit falls through.
     assert "windowsQuitDrainDone" in before_quit
+
+
+def test_desktop_macos_prerelease_update_resolver_wires_generic_feed() -> None:
+    # Issue #485: PEP440 rc git tags (v0.5.0rc2) are not npm-semver, so
+    # electron-updater's GitHub provider skips them and a packaged prerelease
+    # discovers no updates. A resolver selects the candidate release and points a
+    # generic feed at its latest-mac.yml; stable tags keep the default provider.
+    main_ts = _read("desktop/electron/src/main.ts")
+    resolver = _read("desktop/electron/src/update-feed-resolver.ts")
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    check = _section(
+        main_ts,
+        "async function checkForUpdates",
+        "function gatewayProcessForUpdateInstall",
+    )
+
+    assert "export function parseOpenSquillaReleaseTag" in resolver
+    assert "export function selectMacPrereleaseCandidate" in resolver
+    assert "latest-mac.yml" in resolver
+    # Only same-base upgrades; a different base is not crossed automatically.
+    assert "parsed.base !== current.base" in resolver
+
+    assert "async function configureDesktopUpdateFeed()" in main_ts
+    assert "if (process.platform !== 'darwin' || !app.isPackaged) return 'default'" in main_ts
+    assert "provider: 'generic', url: candidate.feedUrl, channel: 'latest'" in main_ts
+    # Numeric rc order can disagree with electron-updater's string-based semver
+    # gate (0.5.0-rc10 sorts below rc9), so the resolved-candidate path allows the
+    # "downgrade"; the default path forbids it so stable users never regress.
+    resolver_feed = _section(
+        main_ts,
+        "async function configureDesktopUpdateFeed()",
+        "async function checkForUpdates",
+    )
+    assert "autoUpdater.allowDowngrade = false" in resolver_feed
+    assert "autoUpdater.allowDowngrade = true" in resolver_feed
+    # checkForUpdates consults the resolver and reports up-to-date without a
+    # spurious GitHub-provider error when no newer same-base release exists.
+    assert "const feed = await configureDesktopUpdateFeed()" in check
+    assert "if (feed === 'up-to-date')" in check
+
+    assert package_json["scripts"]["test:update-resolver"] == (
+        "npm run build && node scripts/test-update-resolver.mjs"
+    )
