@@ -84,6 +84,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "search"),
     ("gateway", "session"),
     ("gateway", "skills"),
+    # Gateway's post-dream hook drives the opt-in router self-learning
+    # orchestrator (offline retrain; default-off, fail-open).
+    ("gateway", "squilla_router"),
     ("gateway", "tools"),
     ("identity", "safety"),
     ("identity", "session"),
@@ -126,6 +129,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("scheduler", "session"),
     ("scheduler", "skills"),
     ("scheduler", "tools"),
+    # Self-learning's opt-in audit sidecar reuses the decision-log redactor;
+    # observability is a leaf package, so this closes no cycle.
+    ("squilla_router", "observability"),
     ("session", "compat"),
     ("session", "engine"),
     ("session", "gateway"),
