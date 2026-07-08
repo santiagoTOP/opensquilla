@@ -5,40 +5,49 @@
         <span class="control-panel__eyebrow">{{ t('usageLogs.logs.eyebrow') }}</span>
         <h1 class="control-stage__title">{{ t('usageLogs.logs.title') }}</h1>
         <p class="control-stage__subtitle">{{ t('usageLogs.logs.subtitle') }}</p>
+        <p v-if="status" class="lg-status-line">
+          <span
+            class="lg-status-line__seg"
+            :class="{ 'lg-status-line__seg--warn': !fileLogEnabled }"
+            :title="fileLogTitleText"
+            :aria-label="`${fileLogLabel}. ${fileLogTitleText}`"
+          >{{ fileLogLabel }}</span>
+          <span class="lg-status-line__sep" aria-hidden="true">·</span>
+          <span
+            class="lg-status-line__seg"
+            :class="{ 'lg-status-line__seg--warn': rawLogEnabled }"
+            :title="rawTitleText"
+            :aria-label="`${rawLabel}. ${rawTitleText}`"
+          >{{ rawLabel }}</span>
+        </p>
       </div>
       <div class="control-stage__actions">
-        <div class="lg-status-pills">
-          <span
-            v-if="!status"
-            class="control-pill control-pill--warn"
-            :aria-label="t('usageLogs.logs.statusUnavailableAria')"
-            :title="t('usageLogs.logs.statusUnavailableTitle')"
-          >{{ t('usageLogs.logs.statusUnavailable') }}</span>
-          <template v-else>
-            <span
-              :class="['control-pill', fileLogEnabled ? '' : 'control-pill--warn']"
-              :aria-label="fileLogEnabled
-                ? t('usageLogs.logs.fileLogAriaOn', { path: filePath })
-                : t('usageLogs.logs.fileLogAriaOff', { path: filePath })"
-              :title="t('usageLogs.logs.fileLogTitle', { path: filePath })"
-            >{{ fileLogEnabled ? t('usageLogs.logs.fileLogOn') : t('usageLogs.logs.fileLogOff') }}</span>
-            <span
-              :class="['control-pill', rawLogEnabled ? '' : 'control-pill--warn']"
-              :aria-label="rawLogEnabled
-                ? t('usageLogs.logs.rawAriaOn', { source: rawSource, path: rawPath })
-                : t('usageLogs.logs.rawAriaOff', { source: rawSource, path: rawPath })"
-              :title="t('usageLogs.logs.rawTitle', { source: rawSource, path: rawPath })"
-            >{{ rawLogEnabled ? t('usageLogs.logs.rawOn') : t('usageLogs.logs.rawOff') }}</span>
-            <span
-              class="control-pill control-pill--warn"
-              :aria-label="`${diagnosticsLabel}. ${diagnosticsCopy}`"
-              :title="diagnosticsCopy"
-            >{{ diagnosticsLabel }}</span>
-          </template>
-        </div>
-        <button class="btn btn--ghost" :title="t('usageLogs.logs.exportTitle')" @click="exportLogs">
+        <span
+          v-if="!status"
+          class="control-pill control-pill--warn"
+          :aria-label="t('usageLogs.logs.statusUnavailableAria')"
+          :title="t('usageLogs.logs.statusUnavailableTitle')"
+        >{{ t('usageLogs.logs.statusUnavailable') }}</span>
+        <span
+          v-else-if="rawLogEnabled"
+          class="control-pill control-pill--warn"
+          role="status"
+          :aria-label="`${t('usageLogs.logs.rawRecordingPill')}. ${rawTitleText}`"
+          :title="rawTitleText"
+        ><span class="dot" aria-hidden="true"></span>{{ t('usageLogs.logs.rawRecordingPill') }}</span>
+        <span
+          v-else-if="!fileLogEnabled"
+          class="control-pill control-pill--warn"
+          :aria-label="`${t('usageLogs.logs.fileLogOff')}. ${fileLogTitleText}`"
+          :title="fileLogTitleText"
+        >{{ t('usageLogs.logs.fileLogOff') }}</span>
+        <button
+          class="btn btn--ghost"
+          :title="t('usageLogs.logs.bundleButtonTitle')"
+          @click="bundleDialogOpen = true"
+        >
           <Icon name="download" :size="16" />
-          <span>{{ t('usageLogs.usage.export') }}</span>
+          <span>{{ t('usageLogs.logs.bundleButton') }}</span>
         </button>
       </div>
     </header>
@@ -181,6 +190,12 @@
       </aside>
     </div>
     </Transition>
+
+    <DiagnosticsBundleDialog
+      :open="bundleDialogOpen"
+      @close="bundleDialogOpen = false"
+      @confirm="downloadBundle"
+    />
   </div>
 </template>
 
@@ -189,9 +204,11 @@ import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watc
 import { useI18n } from 'vue-i18n'
 import { useRpcStore } from '@/stores/rpc'
 import { useFixedWindow } from '@/composables/useFixedWindow'
-import { downloadText } from '@/utils/browser'
+import { useToasts } from '@/composables/useToasts'
+import { downloadBlob, filenameFromContentDisposition } from '@/utils/browser'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
+import DiagnosticsBundleDialog from '@/components/DiagnosticsBundleDialog.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { nodeStepsFromHistoryMessage } from '@/components/run/runTrace'
@@ -263,6 +280,9 @@ const WINDOW_MIN_WIDTH = '(min-width: 481px)'
 
 const { t } = useI18n()
 const rpc = useRpcStore()
+const { pushToast } = useToasts()
+const bundleDialogOpen = ref(false)
+const bundleInFlight = ref(false)
 const allLines = ref<LogLine[]>([])
 const cursor = ref(0)
 const searchText = ref('')
@@ -340,20 +360,19 @@ const rawLogEnabled = computed(() => status.value?.raw_turn_call_log?.enabled ??
 const rawSource = computed(() => status.value?.raw_turn_call_log?.source || 'off')
 const rawPath = computed(() => status.value?.raw_turn_call_log?.directory?.path || '~/.opensquilla/logs')
 
-const diagnosticsCopy = computed(() => {
-  const detail = status.value?.diagnostics_enabled?.detail
-  if (detail === 'raw') {
-    return t('usageLogs.logs.diagnosticsCopyRaw', { source: rawSource.value })
-  }
-  return t('usageLogs.logs.diagnosticsCopyStandard')
-})
+const fileLogLabel = computed(() =>
+  fileLogEnabled.value ? t('usageLogs.logs.fileLogOn') : t('usageLogs.logs.fileLogOff'))
 
-const diagnosticsLabel = computed(() => {
-  const detail = status.value?.diagnostics_enabled?.detail
-  if (detail === 'raw') return t('usageLogs.logs.diagnosticsRaw')
-  if (status.value?.diagnostics_enabled?.effective) return t('usageLogs.logs.diagnosticsStandard')
-  return t('usageLogs.logs.diagnosticsOff')
-})
+const fileLogTitleText = computed(() =>
+  fileLogEnabled.value
+    ? t('usageLogs.logs.fileLogTitle', { path: filePath.value })
+    : t('usageLogs.logs.fileLogOffTitle', { path: filePath.value }))
+
+const rawLabel = computed(() =>
+  rawLogEnabled.value ? t('usageLogs.logs.rawOn') : t('usageLogs.logs.rawOff'))
+
+const rawTitleText = computed(() =>
+  t('usageLogs.logs.rawTitle', { source: rawSource.value, path: rawPath.value }))
 
 // A run-bearing line carries structured tool_calls in its raw JSON payload; the
 // drawer renders those as a trace, falling back to the raw text otherwise.
@@ -537,12 +556,39 @@ function toggleLevel(level: string) {
   activeLevels.value = next
 }
 
-function exportLogs() {
-  const text = filteredLines.value.map(line => {
-    const ts = line.ts ? String(line.ts).slice(0, 23) + ' ' : ''
-    return `${ts}[${line.level}] ${line.message}`
-  }).join('\n')
-  downloadText('opensquilla-logs.txt', 'text/plain', text)
+async function downloadBundle(options: { includeContent: boolean }) {
+  bundleDialogOpen.value = false
+  if (bundleInFlight.value) return
+  bundleInFlight.value = true
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    // Same-key Bearer auth as the approvals REST calls; sessionStorage access
+    // can throw in hardened/embedded contexts, so it is guarded.
+    let token = ''
+    try { token = sessionStorage.getItem('opensquilla.wsToken') || '' } catch {}
+    if (token) headers['Authorization'] = `Bearer ${token}`
+    const response = await fetch('/api/v1/diagnostics/bundle', {
+      method: 'POST',
+      headers,
+      credentials: 'same-origin',
+      // The gateway strict-checks `include_content is True`, so this must be a
+      // real JSON boolean — never a string.
+      body: JSON.stringify({ include_content: options.includeContent }),
+    })
+    if (!response.ok) {
+      pushToast(t('usageLogs.logs.bundleFailed'), { tone: 'danger' })
+      return
+    }
+    const blob = await response.blob()
+    const disposition = response.headers.get('content-disposition')
+    const filename = filenameFromContentDisposition(disposition) || 'opensquilla-bundle.zip'
+    downloadBlob(blob, filename)
+    pushToast(t('usageLogs.logs.bundleReady'), { tone: 'ok' })
+  } catch {
+    pushToast(t('usageLogs.logs.bundleFailed'), { tone: 'danger' })
+  } finally {
+    bundleInFlight.value = false
+  }
 }
 
 function openDetail(line: LogLine) {
@@ -646,12 +692,39 @@ function escRegex(s: string): string {
 </script>
 
 <style scoped>
-/* Header uses the shared .control-stage primitive; only the status-pill cluster
-   is Logs-specific. */
-.lg-status-pills {
+/* Header uses the shared .control-stage primitive; only the quiet status line
+   (and the single abnormal-state warn pill in the actions) is Logs-specific. */
+.lg-status-line {
+  align-items: center;
+  color: var(--text-muted);
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  font-size: var(--fs-xs);
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0 0;
+}
+
+.lg-status-line__seg {
+  cursor: help;
+}
+
+.lg-status-line__seg--warn {
+  color: var(--warn);
+}
+
+.lg-status-line__sep {
+  color: var(--text-dim);
+}
+
+/* Recording indicator inside the raw-capture warn pill; inherits the pill's
+   warn text color. */
+.control-pill .dot {
+  background: currentColor;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  height: 6px;
+  width: 6px;
 }
 
 .stat-row {

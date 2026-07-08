@@ -7,8 +7,9 @@ import inspect
 import logging
 import os
 import secrets
+import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -55,7 +56,11 @@ from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.permissions import configured_default_elevated
-from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
+from opensquilla.session.terminal_reply import (
+    append_error_ref,
+    build_terminal_reply,
+    sanitize_agent_error,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -118,6 +123,7 @@ _AUTO_PROPOSE_TOOL_ALLOWLIST = frozenset(
     }
 )
 _DEBUG_FILE_HANDLER_ATTR = "_opensquilla_debug_file_handler"
+_CONSOLE_HANDLER_ATTR = "_opensquilla_console_log_handler"
 _ENABLED_VALUES = {"1", "true", "yes", "on"}
 _DISABLED_VALUES = {"0", "false", "no", "off"}
 _LOG_LEVELS = {
@@ -549,6 +555,7 @@ class ServiceContainer:
     memory_repair_service: Any = None
     meta_run_writer: Any = None
     router_decision_writer: Any = None
+    turn_error_writer: Any = None
     router_calibration_service: Any = None
     task_runtime: Any = None
     heartbeat_loop: Any = None
@@ -664,6 +671,11 @@ class ServiceContainer:
                 pass
             try:
                 self.router_decision_writer.close()
+            except Exception:
+                pass
+        if self.turn_error_writer is not None:
+            try:
+                self.turn_error_writer.close()
             except Exception:
                 pass
         try:
@@ -1251,6 +1263,11 @@ async def _emit_task_runtime_stream_events(
                 terminal_payload["error_class"] = safe_error_code
                 terminal_payload["error_message"] = safe_error_message
             terminal_message = build_terminal_reply(terminal_payload)
+            # Additive ref suffix joining the reply to its durable turn_errors
+            # row; absent when no record was written (error_id empty).
+            event_error_id = event_dict.get("error_id")
+            if isinstance(event_error_id, str) and event_error_id:
+                terminal_message = append_error_ref(terminal_message, event_error_id)
             event_dict["message"] = terminal_message
             event_dict["terminal_message"] = terminal_message
             event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
@@ -1301,20 +1318,92 @@ def _remove_debug_file_handlers(root: logging.Logger) -> None:
                 opensquilla_logger.setLevel(previous_level)
 
 
+def _render_structlog_event_for_stdlib(
+    logger: Any, method_name: str, event_dict: MutableMapping[str, Any]
+) -> tuple[tuple[str], dict[str, Any]]:
+    """Final structlog processor: render ``event key=value ...`` for stdlib.
+
+    Returns ``(args, kwargs)`` so ``exc_info``/``stack_info`` pass through to
+    ``logging`` natively and the Formatter renders tracebacks into every
+    attached handler (file and console).
+    """
+    kwargs: dict[str, Any] = {}
+    exc_info = event_dict.pop("exc_info", None)
+    if exc_info:
+        kwargs["exc_info"] = exc_info
+    stack_info = event_dict.pop("stack_info", None)
+    if stack_info:
+        kwargs["stack_info"] = stack_info
+    event = str(event_dict.pop("event", ""))
+    parts = [event] + [f"{key}={event_dict[key]!r}" for key in event_dict]
+    return (" ".join(part for part in parts if part),), kwargs
+
+
+def _bridge_structlog_to_stdlib() -> None:
+    """Route structlog events through stdlib logging so they reach debug.log.
+
+    Level filtering is delegated to stdlib (the ``opensquilla`` logger level is
+    managed by ``_setup_file_logging``); the ``is_configured`` guard leaves any
+    explicit prior configuration (e.g. the interactive TUI's) untouched.
+    """
+    if structlog.is_configured():
+        return
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.StackInfoRenderer(),
+            structlog.dev.set_exc_info,
+            _render_structlog_event_for_stdlib,
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.NOTSET),
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+
+
+def _remove_console_handlers(root: logging.Logger) -> None:
+    for handler in list(root.handlers):
+        if getattr(handler, _CONSOLE_HANDLER_ATTR, False):
+            root.removeHandler(handler)
+            handler.close()
+
+
 def _setup_file_logging(config: GatewayConfig | None = None) -> None:
     """Configure structlog + stdlib logging to write to a debug.log file."""
     config = config or GatewayConfig()
     root = logging.getLogger()
     _remove_debug_file_handlers(root)
+    _remove_console_handlers(root)
+
+    # Bridge structlog through stdlib and keep console output for foreground
+    # runs. Wrapped so a logging misconfiguration can never block gateway boot.
+    bridge_error: Exception | None = None
+    log_level = _resolve_log_level(config)
+    try:
+        _bridge_structlog_to_stdlib()
+        console_handler = logging.StreamHandler(sys.stdout)
+        setattr(console_handler, _CONSOLE_HANDLER_ATTR, True)
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        root.addHandler(console_handler)
+    except Exception as exc:  # noqa: BLE001 - logging must never block boot
+        bridge_error = exc
+        logging.getLogger(__name__).warning("structlog bridge disabled: %s", exc)
 
     enabled = _env_bool("OPENSQUILLA_LOG_FILE_ENABLED")
     if enabled is None:
         enabled = config.log_file_enabled
+    opensquilla_logger = logging.getLogger("opensquilla")
     if not enabled:
+        # No file handler will manage the level, but bridged console output
+        # still depends on it: left NOTSET, the "opensquilla" logger is
+        # effectively WARNING and INFO/DEBUG never reach the console handler.
+        opensquilla_logger.setLevel(log_level)
         return
 
     log_dir = Path(os.environ.get("OPENSQUILLA_LOG_DIR", str(default_opensquilla_home() / "logs")))
-    log_level = _resolve_log_level(config)
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "debug.log"
@@ -1326,9 +1415,9 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
         )
     except OSError as exc:
         logging.getLogger(__name__).warning("file logging disabled: %s", exc)
+        opensquilla_logger.setLevel(log_level)
         return
     setattr(file_handler, _DEBUG_FILE_HANDLER_ATTR, True)
-    opensquilla_logger = logging.getLogger("opensquilla")
     setattr(file_handler, "_opensquilla_previous_logger_level", opensquilla_logger.level)
     file_handler.setLevel(log_level)
     file_handler.setFormatter(
@@ -1337,6 +1426,10 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
 
     root.addHandler(file_handler)
     opensquilla_logger.setLevel(log_level)
+    if bridge_error is not None:
+        # The first warning fired before the file handler existed, so it only
+        # reached the console; re-emit it so debug.log records it too.
+        logging.getLogger(__name__).warning("structlog bridge disabled: %s", bridge_error)
 
 
 @dataclass
@@ -2393,6 +2486,32 @@ async def build_services(
             pass
         router_decision_writer = None
 
+    # ── Turn error records (V019 turn_errors) ──────────────────────────
+    # Same yoyo-only-table pattern as router_decision_writer: the writer
+    # exists only when the session DB is real (not :memory:).
+    turn_error_writer = None
+    try:
+        errors_storage = get_session_storage(session_manager)
+        errors_db_path = (
+            getattr(errors_storage, "_db_path", None)
+            if errors_storage is not None
+            else None
+        )
+        if errors_db_path and errors_db_path != ":memory:":
+            from opensquilla.persistence.turn_error_writer import (
+                open_turn_error_writer,
+            )
+
+            turn_error_writer = open_turn_error_writer(errors_db_path)
+    except Exception as e:  # noqa: BLE001 - error records must not block boot.
+        log.warning("build_services.turn_error_writer_failed", error=str(e))
+        try:
+            if turn_error_writer is not None:
+                turn_error_writer.close()
+        except Exception:
+            pass
+        turn_error_writer = None
+
     # ── Router calibration (opt-in 24h in-process job) ──────────────
     # Only when squilla_router.calibration_enabled is true AND a real decision
     # writer exists. Default-off: no service is constructed, so gateway boot is
@@ -2436,6 +2555,7 @@ async def build_services(
         memory_repair_service=memory_repair_service,
         meta_run_writer=meta_run_writer,
         router_decision_writer=router_decision_writer,
+        turn_error_writer=turn_error_writer,
         router_calibration_service=router_calibration_service,
         deferred_warmups=deferred_warmups,
     )
@@ -2492,6 +2612,7 @@ def build_turn_runner_from_services(
         turn_hooks=getattr(svc, "turn_hooks", None),
         compaction_hooks=getattr(svc, "compaction_hooks", None),
         meta_run_writer=getattr(svc, "meta_run_writer", None),
+        turn_error_writer=getattr(svc, "turn_error_writer", None),
     )
 
 
