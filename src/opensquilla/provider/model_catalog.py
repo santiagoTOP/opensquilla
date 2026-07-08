@@ -30,11 +30,12 @@ SAFE_OPENROUTER_DEFAULT_MAX_TOKENS = 8192
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 # Layer attribution for the ``*_with_source`` resolver variants. "override"
-# is the caller-supplied explicit value (config), "catalog" is any model-
-# metadata layer (live catalog, models.dev snapshot, packaged static
+# is an explicit operator value (caller-supplied for max_tokens, the
+# ``[models.*]`` user-override layer for context windows), "catalog" is any
+# model-metadata layer (live catalog, models.dev snapshot, packaged static
 # fallback), "default" is a hardcoded engine default.
 MaxTokensSource = Literal["override", "catalog", "default"]
-ContextWindowSource = Literal["catalog", "default"]
+ContextWindowSource = Literal["override", "catalog", "default"]
 
 # Local runtimes (Ollama, …) have unqualified model ids that miss the catalog
 # and the packaged corrections, so the 200k cloud default would make the turn
@@ -593,20 +594,40 @@ class ModelCatalog:
         return effective, source
 
     def resolve_context_window(self, model_id: str, provider: str = "") -> int:
-        """Resolve context window: catalog > models.dev > corrections budgets > local/default."""
+        """Resolve context window: user override > catalog > models.dev > corrections > default."""
         return self.resolve_context_window_with_source(model_id, provider)[0]
+
+    def user_context_window_override(self, model_id: str, provider: str = "") -> int | None:
+        """Positive ``[models.*]`` context_window override for the model, else None.
+
+        Zero/negative override values are not usable as a budgeting window,
+        so they report None (the layered chain resolves as if unset).
+        """
+        fields = self._user_override_fields(
+            (model_id or "").strip(), (provider or "").strip().lower()
+        )
+        value = fields.get("context_window")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
 
     def resolve_context_window_with_source(
         self, model_id: str, provider: str = ""
     ) -> tuple[int, ContextWindowSource]:
         """Resolve the context window and name the layer that decided it.
 
-        ``catalog`` = live provider catalog, models.dev snapshot, or the
-        packaged corrections budget rows; ``default`` = the local-runtime or
-        cloud default window. :meth:`resolve_context_window` delegates here
-        (single implementation), so value and attribution can never drift
-        apart.
+        ``override`` = a positive ``[models.*]`` user-override value
+        (``set_user_overrides``); ``catalog`` = live provider catalog,
+        models.dev snapshot, or the packaged corrections budget rows;
+        ``default`` = the local-runtime or cloud default window.
+        :meth:`resolve_context_window` delegates here (single
+        implementation), so value and attribution can never drift apart.
+        The remaining chain deliberately keeps its own layer order rather
+        than delegating to :meth:`resolve_entry` (parity tests pin it).
         """
+        override = self.user_context_window_override(model_id, provider)
+        if override is not None:
+            return override, "override"
         info = self._models.get(model_id)
         if info and info.context_window > 0:
             return info.context_window, "catalog"
@@ -619,6 +640,40 @@ class ModelCatalog:
         if provider and provider.strip().lower() in LOCAL_RUNTIME_PROVIDERS:
             return _LOCAL_CONTEXT_WINDOW, "default"
         return DEFAULT_CONTEXT_WINDOW, "default"
+
+
+def resolve_effective_context_window(
+    catalog: Any, model_id: str, provider: str = "", global_override: int = 0
+) -> tuple[int, str]:
+    """Resolve the effective context window with the full layered precedence.
+
+    Single implementation of the rule "per-model ``[models.*]`` override >
+    global ``llm.context_window_tokens`` (``global_override``) > catalog >
+    default". Sources returned: ``"override"`` | ``"config"`` | ``"catalog"``
+    | ``"default"``.
+
+    ``catalog`` is duck-typed: override detection and catalog/default
+    attribution use ``resolve_context_window_with_source`` when present
+    (never reporting ``"override"`` without it, so the global config value
+    still applies), while the catalog-layer value itself comes from the
+    plain ``resolve_context_window`` — the canonical value API, which
+    catalog-shaped stand-ins may implement alone. Junk/non-positive
+    ``global_override`` values count as unset.
+    """
+    with_source = getattr(catalog, "resolve_context_window_with_source", None)
+    source = "catalog"
+    if callable(with_source):
+        window, raw_source = with_source(model_id, provider=provider)
+        source = str(raw_source)
+        if source == "override":
+            return int(window), "override"
+    try:
+        global_window = int(global_override)
+    except (TypeError, ValueError):
+        global_window = 0
+    if global_window > 0:
+        return global_window, "config"
+    return int(catalog.resolve_context_window(model_id, provider=provider)), source
 
 
 # ---------------------------------------------------------------------------

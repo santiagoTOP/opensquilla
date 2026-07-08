@@ -151,6 +151,29 @@ def test_discover_empty_catalog_stays_ok_with_no_live_source(monkeypatch: Any) -
     assert result.models == []
 
 
+def test_discover_row_context_window_prefers_user_override(monkeypatch: Any) -> None:
+    """A per-model ``[models.*]`` context_window override beats the live listing.
+
+    Discovery rows must show the window budgeting will actually use, so the
+    operator-declared value wins even when the provider reports its own.
+    """
+    from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({"openai/test-model-a": {"context_window": 32_000}})
+    set_shared_catalog(catalog)
+    try:
+        _patch_response(monkeypatch, _models_response)
+        result = _discover(provider_id="openai", api_key="sk-test")
+    finally:
+        set_shared_catalog(None)
+
+    assert result.ok is True
+    (row,) = result.models
+    # The live listing said 64_000; the user override is authoritative.
+    assert row["contextWindow"] == 32_000
+
+
 async def test_discover_rpc_reuses_stored_credentials_when_blank(
     tmp_path, monkeypatch: Any
 ) -> None:

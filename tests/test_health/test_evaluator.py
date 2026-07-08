@@ -239,6 +239,105 @@ def test_provider_evaluator_reports_ready_active_provider() -> None:
     assert findings[0].severity == "ok"
 
 
+def _healthy_active_row(**extra: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "providerId": "openrouter",
+        "active": True,
+        "configured": True,
+        "buildable": True,
+        "apiKeyConfigured": True,
+        "baseUrlConfigured": True,
+        "model": "openai/gpt-5.1",
+    }
+    row.update(extra)
+    return row
+
+
+def test_provider_evaluator_warns_on_url_shaped_api_key() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [_healthy_active_row(apiKeyShape="looks_like_url")],
+        }
+    )
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.id == "provider.active.api_key_shape"
+    assert finding.severity == "warn"
+    assert _impact(finding) == "degrades"
+    assert finding.evidence == {"providerId": "openrouter", "shape": "looks_like_url"}
+    assert "verbatim as the request credential" in finding.detail
+    assert "401" in finding.detail
+    assert (
+        "opensquilla providers configure openrouter --api-key YOUR_API_KEY"
+        in [step.command for step in finding.fix_steps]
+    )
+    assert any(
+        step.detail and "Settings" in step.detail and "Chat Model" in step.detail
+        for step in finding.fix_steps
+    )
+
+
+def test_provider_evaluator_warns_on_env_name_shaped_api_key() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [_healthy_active_row(apiKeyShape="looks_like_env_name")],
+        }
+    )
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.id == "provider.active.api_key_shape"
+    assert finding.severity == "warn"
+    assert finding.evidence == {
+        "providerId": "openrouter",
+        "shape": "looks_like_env_name",
+    }
+    assert "environment variable NAME" in finding.detail
+
+
+def test_provider_evaluator_ok_api_key_shape_stays_ready() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [_healthy_active_row(apiKeyShape="ok")],
+        }
+    )
+
+    assert len(findings) == 1
+    assert findings[0].id == "provider.active.ready"
+    assert findings[0].severity == "ok"
+
+
+def test_provider_evaluator_missing_api_key_shape_stays_ready() -> None:
+    """Old payloads / offline doctor rows without apiKeyShape behave as today."""
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [_healthy_active_row()],
+        }
+    )
+
+    assert len(findings) == 1
+    assert findings[0].id == "provider.active.ready"
+    assert findings[0].severity == "ok"
+
+
+def test_provider_evaluator_shape_warning_never_carries_key_material() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [_healthy_active_row(apiKeyShape="looks_like_url")],
+        }
+    )
+
+    rendered = repr(findings[0].to_dict())
+    assert "https://" not in rendered
+    assert "OPENROUTER_API_KEY=" not in rendered
+
+
 def test_provider_evaluator_does_not_report_unidentified_active_row_as_ready() -> None:
     findings = evaluate_provider(
         {

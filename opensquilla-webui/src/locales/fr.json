@@ -225,6 +225,13 @@
       "advanced": "Options avancées du fournisseur",
       "timeoutLabel": "Délai d'expiration de la requête (secondes)",
       "timeoutDesc": "Durée d'attente d'une réponse de modèle avant expiration — augmentez-la pour les modèles locaux lents (Ollama, vLLM, LM Studio).",
+      "contextWindowLabel": "Remplacement de la fenêtre de contexte (tokens)",
+      "contextWindowDesc": "Plafonne le budget d'assemblage du prompt pour ce modèle. Laissez vide pour utiliser la fenêtre détectée automatiquement.",
+      "contextWindowAuto": "auto",
+      "contextWindowUnknown": "inconnu",
+      "contextWindowNone": "aucun",
+      "contextWindowReadout": "auto-détecté {auto} · remplacement {override} · effectif {effective}",
+      "contextWindowLocalWarning": "La fenêtre de contexte effective est de {tokens} tokens. Les runtimes locaux utilisent souvent une petite fenêtre par défaut — augmentez le remplacement si votre modèle en prend en charge davantage.",
       "envMissing": "{envKey} n'est pas visible par ce processus de passerelle. Définissez-la avant de démarrer ou de redémarrer la passerelle, ou collez plutôt une clé API.",
       "envKeyFallback": "la variable d'environnement de clé API sélectionnée",
       "copyKeyCommand": "Copier la commande de définition de la clé du fournisseur",
@@ -255,6 +262,8 @@
       "keyRejected": "✗ Clé refusée — {reason}",
       "notReachable": "✗ Connexion impossible — {reason}",
       "discoverFailed": "Impossible de lister les modèles — saisissez un id de modèle.",
+      "verdictModels": "{count} modèles · p. ex. {samples}",
+      "verdictSampleJoiner": ", ",
       "failureAuth": "Le fournisseur a refusé cette clé d'API.",
       "failureCredits": "Ce compte n'a plus de crédits.",
       "failureRateLimited": "Le fournisseur limite les requêtes — réessayez dans un instant.",
@@ -790,6 +799,7 @@
       "abortFailed": "Échec de l'abandon."
     },
     "overview": {
+      "title": "Vue d'ensemble",
       "subtitle": "État en direct, sessions récentes et flux d'événements.",
       "openChat": "Ouvrir le chat",
       "totalTokens": "Total des jetons",
@@ -816,6 +826,7 @@
       "loadingHealth": "Chargement du rapport de santé",
       "noFindings": "Aucun constat retourné.",
       "recoveryRestart": "La récupération nécessite un redémarrage",
+      "openSettings": "Ouvrir les paramètres",
       "findingFallback": "Constat {n}",
       "copyCommand": "Copier la commande",
       "step": "Étape",
@@ -905,7 +916,12 @@
       },
       "checkedAgo": "Vérifié {time}",
       "rerunChecks": "Relancer les vérifications",
-      "environment": "Environnement"
+      "copyDiagnostics": "Copier le JSON de diagnostic",
+      "copiedDiagnostics": "JSON de diagnostic copié",
+      "diagnoseWithAgent": "Diagnostiquer avec l'agent",
+      "diagnosePrompt": "Veuillez diagnostiquer cette configuration OpenSquilla à l'aide du rapport doctor ci-dessous ; proposez la cause racine et des étapes de correction minimales ; n'exécutez pas de commandes destructrices.",
+      "environment": "Environnement",
+      "latency": "Latence"
     }
   },
   "console": {
@@ -1936,6 +1952,12 @@
       "preparingOutput": "Préparation de la sortie",
       "stillWaiting": "Toujours en attente du modèle",
       "stillWorking": "Toujours en cours — dernier signal il y a {seconds} s"
+    },
+    "stall": {
+      "title": "La réponse est peut-être bloquée",
+      "detail": "Aucune nouvelle sortie depuis {seconds} s — le modèle est peut-être bloqué.",
+      "keepWaiting": "Continuer d'attendre",
+      "interrupt": "Interrompre le tour"
     },
     "msgMeta": {
       "ensembleModels": "Ensemble · {count} modèles",

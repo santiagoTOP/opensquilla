@@ -145,6 +145,31 @@ def test_rpc_usage_context_window_uses_injected_catalog() -> None:
     assert sentinel.context_window_calls == [("model-under-test", "openrouter")]
 
 
+def test_rpc_usage_context_window_model_override_beats_config() -> None:
+    # A [models.*] per-model override on the injected catalog outranks the
+    # global config window and reports the additive "model_override" label.
+    from opensquilla.gateway.rpc.registry import RpcContext
+    from opensquilla.gateway.rpc_usage import _resolve_context_window
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({"openrouter/model-under-test": {"context_window": 131_072}})
+    set_shared_catalog(catalog)
+
+    ctx = RpcContext(
+        conn_id="test",
+        config=SimpleNamespace(
+            llm=SimpleNamespace(provider="openrouter", context_window_tokens=999_000)
+        ),
+    )
+    window, source = _resolve_context_window("model-under-test", ctx)
+
+    assert (window, source) == (131_072, "model_override")
+
+    # Without an override the global config window still wins over the catalog.
+    window, source = _resolve_context_window("other-model", ctx)
+    assert (window, source) == (999_000, "config")
+
+
 def test_ensemble_member_max_tokens_uses_injected_catalog() -> None:
     from opensquilla.provider.ensemble import EnsembleMemberConfig, _member_max_tokens
     from opensquilla.provider.selector import ProviderConfig

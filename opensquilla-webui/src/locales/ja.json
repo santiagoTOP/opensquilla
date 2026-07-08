@@ -225,6 +225,13 @@
       "advanced": "プロバイダーの詳細オプション",
       "timeoutLabel": "リクエストのタイムアウト（秒）",
       "timeoutDesc": "1 回のモデル応答がタイムアウトするまでの待機時間です。低速なローカルモデル（Ollama、vLLM、LM Studio）では値を大きくしてください。",
+      "contextWindowLabel": "コンテキストウィンドウの上書き（token 数）",
+      "contextWindowDesc": "このモデルのプロンプト組み立て予算に上限を設けます。空欄の場合は自動検出されたウィンドウを使用します。",
+      "contextWindowAuto": "自動",
+      "contextWindowUnknown": "不明",
+      "contextWindowNone": "なし",
+      "contextWindowReadout": "自動検出 {auto} · 上書き {override} · 有効 {effective}",
+      "contextWindowLocalWarning": "有効なコンテキストウィンドウは {tokens} token です。ローカルランタイムの既定ウィンドウは小さいことが多いため、モデルがより大きなウィンドウに対応している場合は上書き値を引き上げてください。",
       "envMissing": "{envKey} はこのゲートウェイプロセスから参照できません。ゲートウェイの起動または再起動前に設定するか、代わりに API キーを貼り付けてください。",
       "envKeyFallback": "選択した API キーの環境変数",
       "copyKeyCommand": "プロバイダーキー設定コマンドをコピー",
@@ -255,6 +262,8 @@
       "keyRejected": "✗ キーが拒否されました — {reason}",
       "notReachable": "✗ 接続できませんでした — {reason}",
       "discoverFailed": "モデル一覧を取得できませんでした — モデル ID を入力してください。",
+      "verdictModels": "{count} 件のモデル · 例: {samples}",
+      "verdictSampleJoiner": "、",
       "failureAuth": "プロバイダーがこの API キーを拒否しました。",
       "failureCredits": "このアカウントにはクレジットが残っていません。",
       "failureRateLimited": "プロバイダーがリクエストを制限しています — 少し待って再試行してください。",
@@ -790,6 +799,7 @@
       "abortFailed": "中止に失敗しました。"
     },
     "overview": {
+      "title": "概要",
       "subtitle": "ライブの状態、最近のセッション、イベントストリームを表示します。",
       "openChat": "チャットを開く",
       "totalTokens": "合計トークン数",
@@ -816,6 +826,7 @@
       "loadingHealth": "ヘルスレポートを読み込み中",
       "noFindings": "検出結果はありません。",
       "recoveryRestart": "リカバリには再起動が必要です",
+      "openSettings": "設定を開く",
       "findingFallback": "検出結果 {n}",
       "copyCommand": "コマンドをコピー",
       "step": "ステップ",
@@ -905,7 +916,12 @@
       },
       "checkedAgo": "{time}に確認",
       "rerunChecks": "再チェック",
-      "environment": "環境"
+      "copyDiagnostics": "診断 JSON をコピー",
+      "copiedDiagnostics": "診断 JSON をコピーしました",
+      "diagnoseWithAgent": "エージェントで診断",
+      "diagnosePrompt": "以下の doctor レポートをもとに、この OpenSquilla 設定の問題を調査してください。根本原因と最小限の修正手順を提案し、破壊的なコマンドは実行しないでください。",
+      "environment": "環境",
+      "latency": "レイテンシ"
     }
   },
   "console": {
@@ -1936,6 +1952,12 @@
       "preparingOutput": "出力を準備中",
       "stillWaiting": "まだモデルを待機中",
       "stillWorking": "まだ処理中 — 最後の信号は {seconds} 秒前"
+    },
+    "stall": {
+      "title": "応答が停滞している可能性があります",
+      "detail": "{seconds} 秒間、新しい出力がありません — モデルが停止している可能性があります。",
+      "keepWaiting": "このまま待つ",
+      "interrupt": "ターンを中断"
     },
     "msgMeta": {
       "ensembleModels": "アンサンブル · {count} モデル",

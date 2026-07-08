@@ -225,6 +225,13 @@
       "advanced": "Erweiterte Anbieteroptionen",
       "timeoutLabel": "Anfrage-Timeout (Sekunden)",
       "timeoutDesc": "Wie lange auf eine einzelne Modellantwort gewartet wird, bevor ein Timeout eintritt — erhöhen Sie diesen Wert für langsame lokale Modelle (Ollama, vLLM, LM Studio).",
+      "contextWindowLabel": "Kontextfenster-Überschreibung (Tokens)",
+      "contextWindowDesc": "Begrenzt das Prompt-Assembly-Budget für dieses Modell. Leer lassen, um das automatisch erkannte Fenster zu verwenden.",
+      "contextWindowAuto": "auto",
+      "contextWindowUnknown": "unbekannt",
+      "contextWindowNone": "keine",
+      "contextWindowReadout": "automatisch erkannt {auto} · Überschreibung {override} · effektiv {effective}",
+      "contextWindowLocalWarning": "Das effektive Kontextfenster beträgt {tokens} Tokens. Lokale Runtimes verwenden standardmäßig oft ein kleines Fenster — erhöhen Sie die Überschreibung, falls Ihr Modell mehr unterstützt.",
       "envMissing": "{envKey} ist für diesen Gateway-Prozess nicht sichtbar. Setzen Sie ihn vor dem Starten oder Neustarten des Gateways oder fügen Sie stattdessen einen API-Schlüssel ein.",
       "envKeyFallback": "die ausgewählte Umgebungsvariable für den API-Schlüssel",
       "copyKeyCommand": "Befehl zum Setzen des Anbieterschlüssels kopieren",
@@ -255,6 +262,8 @@
       "keyRejected": "✗ Schlüssel abgelehnt — {reason}",
       "notReachable": "✗ Verbindung fehlgeschlagen — {reason}",
       "discoverFailed": "Modelle konnten nicht aufgelistet werden — Modell-ID eintippen.",
+      "verdictModels": "{count} Modelle · z. B. {samples}",
+      "verdictSampleJoiner": ", ",
       "failureAuth": "Der Anbieter hat diesen API-Schlüssel abgelehnt.",
       "failureCredits": "Dieses Konto hat kein Guthaben mehr.",
       "failureRateLimited": "Der Anbieter drosselt Anfragen gerade — gleich noch einmal versuchen.",
@@ -790,6 +799,7 @@
       "abortFailed": "Abbruch fehlgeschlagen."
     },
     "overview": {
+      "title": "Übersicht",
       "subtitle": "Live-Status, aktuelle Sitzungen und der Ereignisstrom.",
       "openChat": "Chat öffnen",
       "totalTokens": "Tokens gesamt",
@@ -816,6 +826,7 @@
       "loadingHealth": "Zustandsbericht wird geladen",
       "noFindings": "Keine Befunde zurückgegeben.",
       "recoveryRestart": "Wiederherstellung erfordert Neustart",
+      "openSettings": "Einstellungen öffnen",
       "findingFallback": "Befund {n}",
       "copyCommand": "Befehl kopieren",
       "step": "Schritt",
@@ -905,7 +916,12 @@
       },
       "checkedAgo": "Geprüft {time}",
       "rerunChecks": "Prüfungen erneut ausführen",
-      "environment": "Umgebung"
+      "copyDiagnostics": "Diagnose-JSON kopieren",
+      "copiedDiagnostics": "Diagnose-JSON kopiert",
+      "diagnoseWithAgent": "Mit dem Agenten diagnostizieren",
+      "diagnosePrompt": "Bitte analysieren Sie diese OpenSquilla-Konfiguration anhand des folgenden doctor-Berichts; nennen Sie die Grundursache und minimale Korrekturschritte; führen Sie keine destruktiven Befehle aus.",
+      "environment": "Umgebung",
+      "latency": "Latenz"
     }
   },
   "console": {
@@ -1936,6 +1952,12 @@
       "preparingOutput": "Ausgabe wird vorbereitet",
       "stillWaiting": "Warte weiterhin auf Modell",
       "stillWorking": "Noch in Arbeit — letztes Signal vor {seconds} s"
+    },
+    "stall": {
+      "title": "Antwort möglicherweise ins Stocken geraten",
+      "detail": "Seit {seconds} s keine neue Ausgabe — das Modell hängt möglicherweise.",
+      "keepWaiting": "Weiter warten",
+      "interrupt": "Durchlauf unterbrechen"
     },
     "msgMeta": {
       "ensembleModels": "Ensemble · {count} Modelle",

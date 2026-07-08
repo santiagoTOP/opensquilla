@@ -121,6 +121,28 @@ def test_model_catalog_adapter_override_beats_catalog_resolution() -> None:
     assert resolved.context_window == 202_752
 
 
+def test_model_catalog_adapter_per_model_override_beats_global_config() -> None:
+    from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({"openrouter/glm-5.1": {"context_window": 131_072}})
+    llm = SimpleNamespace(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        max_tokens=32768,
+        context_window_tokens=1_000_000,
+        temperature=None,
+        top_p=None,
+    )
+    adapter = _TurnRunnerModelCatalogAdapter(_catalog_runner(llm=llm, model_catalog=catalog))
+
+    # The [models.*] per-model window beats the global llm.context_window_tokens
+    # override; the global still applies to models without a per-model row.
+    assert adapter.lookup("glm-5.1").context_window == 131_072
+    assert adapter.lookup("some-other-model").context_window == 1_000_000
+
+
 def test_model_catalog_adapter_ignores_junk_context_window_values() -> None:
     from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
 

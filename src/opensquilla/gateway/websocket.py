@@ -543,6 +543,7 @@ async def handle_ws_connection(
     heartbeat_loop: Any = None,
     agent_registry: Any = None,
     diagnostics_state: Any = None,
+    provider_stats: Any = None,
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
@@ -701,6 +702,7 @@ async def handle_ws_connection(
             memory_managers,
             memory_stores,
             memory_retrievers,
+            provider_stats=provider_stats,
         )
     except WebSocketDisconnect:
         pass
@@ -758,6 +760,7 @@ async def _message_loop(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+    provider_stats: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -821,6 +824,7 @@ async def _message_loop(
                 heartbeat_loop=heartbeat_loop,
                 agent_registry=agent_registry,
                 diagnostics_state=diagnostics_state,
+                provider_stats=provider_stats,
                 memory_managers=memory_managers or {},
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},

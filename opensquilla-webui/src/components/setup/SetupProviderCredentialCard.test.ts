@@ -36,8 +36,46 @@ async function mountCard(props: Record<string, unknown> = {}, listeners: Record<
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
+  // The verdict keys land in the locale JSONs via the i18n merge step; inject
+  // them here so assertions exercise interpolation instead of raw key names.
+  i18n.global.mergeLocaleMessage('en', {
+    setup: { provider: { verdictModels: '{count} models · e.g. {samples}', verdictSampleJoiner: ', ' } },
+  })
+  i18n.global.mergeLocaleMessage('zh-Hans', {
+    setup: { provider: { verdictModels: '{count} 个模型 · 例如 {samples}', verdictSampleJoiner: '、' } },
+  })
   document.body.innerHTML = ''
 })
+
+function discoveredModel(id: string) {
+  return {
+    id,
+    name: id,
+    contextWindow: 128000,
+    maxOutputTokens: 8192,
+    capabilities: ['chat'],
+    pricing: null,
+    capabilitySource: 'provider',
+  }
+}
+
+function verifiedConnection(overrides: Record<string, unknown> = {}) {
+  return {
+    phase: 'verified',
+    failureKind: '',
+    detail: '',
+    latencyMs: 412,
+    models: [
+      discoveredModel('test-vendor/alpha'),
+      discoveredModel('test-vendor/beta'),
+      discoveredModel('test-vendor/gamma'),
+      discoveredModel('test-vendor/delta'),
+    ],
+    modelSource: 'live',
+    discoverError: '',
+    ...overrides,
+  }
+}
 
 describe('SetupProviderCredentialCard', () => {
   it('keeps credential controls in tablet layout until phone widths', () => {
@@ -140,6 +178,92 @@ describe('SetupProviderCredentialCard', () => {
     await nextTick()
 
     expect(onUpdateField).toHaveBeenCalledWith('api_key_env', 'ALT_DEEPSEEK_KEY')
+
+    app.unmount()
+  })
+})
+
+describe('SetupProviderCredentialCard — connection verdict line', () => {
+  it('shows latency, live model count, and up to 3 sample ids when verified', async () => {
+    const { app, el } = await mountCard({ connection: verifiedConnection() })
+
+    const verdict = el.querySelector('.setup-connection__verdict')
+    expect(verdict).toBeTruthy()
+    expect(verdict?.getAttribute('aria-live')).toBe('polite')
+    expect(verdict?.textContent).toContain('412ms')
+    expect(verdict?.textContent).toContain('4 models')
+    expect(verdict?.textContent).toContain('e.g. test-vendor/alpha, test-vendor/beta, test-vendor/gamma')
+    expect(verdict?.textContent).not.toContain('test-vendor/delta')
+
+    app.unmount()
+  })
+
+  it('joins sample ids with 、 for Chinese locales', async () => {
+    i18n.global.locale.value = 'zh-Hans'
+    const { app, el } = await mountCard({ connection: verifiedConnection() })
+
+    expect(el.querySelector('.setup-connection__verdict')?.textContent)
+      .toContain('test-vendor/alpha、test-vendor/beta、test-vendor/gamma')
+
+    app.unmount()
+  })
+
+  it('omits the model summary when discovery returned nothing live', async () => {
+    const { app, el } = await mountCard({
+      connection: verifiedConnection({ models: [], modelSource: 'none' }),
+    })
+
+    const verdict = el.querySelector('.setup-connection__verdict')
+    expect(verdict?.textContent).toContain('412ms')
+    expect(verdict?.textContent).not.toContain('models')
+
+    app.unmount()
+  })
+
+  it('keeps the verdict line empty when latency is unknown and nothing was discovered', async () => {
+    const { app, el } = await mountCard({
+      connection: verifiedConnection({ latencyMs: null, models: [], modelSource: 'none' }),
+    })
+
+    expect(el.querySelector('.setup-connection__verdict')?.textContent?.trim()).toBe('')
+    expect(el.querySelector('.setup-connection__latency')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('appends a muted latency span to failure pills when a round trip completed', async () => {
+    const { app, el } = await mountCard({
+      connection: {
+        phase: 'key_invalid',
+        failureKind: 'auth_invalid',
+        detail: 'HTTP 401',
+        latencyMs: 87,
+        models: [],
+        modelSource: 'none',
+        discoverError: '',
+      },
+    })
+
+    const actions = el.querySelector('.setup-connection__actions')
+    expect(actions?.querySelector('.setup-connection__latency')?.textContent).toContain('87ms')
+
+    app.unmount()
+  })
+
+  it('does not append latency to failure pills when no round trip completed', async () => {
+    const { app, el } = await mountCard({
+      connection: {
+        phase: 'unreachable',
+        failureKind: 'transport_transient',
+        detail: 'timeout',
+        latencyMs: null,
+        models: [],
+        modelSource: 'none',
+        discoverError: '',
+      },
+    })
+
+    expect(el.querySelector('.setup-connection__actions .setup-connection__latency')).toBeNull()
 
     app.unmount()
   })

@@ -10,6 +10,7 @@ function connection(overrides: Partial<ConnectionState> = {}): ConnectionState {
     phase: 'unverified',
     failureKind: '',
     detail: '',
+    latencyMs: null,
     models: [],
     modelSource: 'none',
     discoverError: '',
@@ -65,6 +66,9 @@ function panel(overrides: Record<string, unknown> = {}) {
     providerEnvKey: '',
     providerEnvCommand: '',
     llmTimeoutSeconds: 120,
+    contextWindowTokens: '',
+    contextWindowGlobal: null,
+    providerIsLocal: false,
     connection: connection(),
     providerFieldValue: () => '',
     ...overrides,
@@ -99,6 +103,21 @@ function testButton(el: HTMLElement): HTMLButtonElement | null {
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
+  // The context-window keys land in the locale JSONs via the i18n merge step;
+  // inject them here so assertions exercise interpolation, not raw key names.
+  i18n.global.mergeLocaleMessage('en', {
+    setup: {
+      provider: {
+        contextWindowLabel: 'Context window override (tokens)',
+        contextWindowDesc: 'desc',
+        contextWindowAuto: 'auto',
+        contextWindowUnknown: 'unknown',
+        contextWindowNone: 'none',
+        contextWindowReadout: 'auto-detected {auto} · override {override} · effective {effective}',
+        contextWindowLocalWarning: 'Effective context window is {tokens} tokens.',
+      },
+    },
+  })
   document.body.innerHTML = ''
 })
 
@@ -194,6 +213,144 @@ describe('SetupProviderPanel — model field', () => {
     expect(el.querySelector('[data-name="api_key"]')).toBeNull()
     expect(el.querySelector('[data-name="api_key_env"]')).toBeNull()
     expect(el.textContent).toContain('OpenAI credential')
+
+    app.unmount()
+  })
+})
+
+describe('SetupProviderPanel — context-window override', () => {
+  function contextInput(el: HTMLElement): HTMLInputElement | null {
+    return el.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]')
+  }
+
+  function readout(el: HTMLElement): string {
+    return el.querySelector('.setup-context-window__readout')?.textContent || ''
+  }
+
+  const modelValue = (value: string) =>
+    (field: { name: string }) => (field.name === 'model' ? value : '')
+
+  it('shows the auto-detected window for the current model with no override', async () => {
+    const { app, el } = await mountPanel({
+      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
+    })
+
+    const input = contextInput(el)
+    expect(input).toBeTruthy()
+    expect(input?.disabled).toBe(false)
+    expect(input?.placeholder).toBe('auto')
+    expect(el.querySelector('.setup-context-window__readout')?.getAttribute('aria-live')).toBe('polite')
+    expect(readout(el)).toContain('auto-detected 262144')
+    expect(readout(el)).toContain('override none')
+    expect(readout(el)).toContain('effective 262144')
+    expect(el.querySelector('.setup-warning')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('reports unknown when the model has no discovery row', async () => {
+    const { app, el } = await mountPanel({
+      providerFieldValue: modelValue('unlisted-model'),
+    })
+
+    expect(readout(el)).toContain('auto-detected unknown')
+    expect(readout(el)).toContain('effective unknown')
+
+    app.unmount()
+  })
+
+  it('an override beats auto-detection and warns for small local windows', async () => {
+    const { app, el } = await mountPanel({
+      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      contextWindowTokens: '4096',
+      providerIsLocal: true,
+    })
+
+    expect(readout(el)).toContain('override 4096')
+    expect(readout(el)).toContain('effective 4096')
+    expect(el.querySelector('.setup-warning')?.textContent).toContain('4096 tokens')
+
+    app.unmount()
+  })
+
+  it('does not warn for the same small window on a hosted provider', async () => {
+    const { app, el } = await mountPanel({
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      contextWindowTokens: '4096',
+      providerIsLocal: false,
+    })
+
+    expect(el.querySelector('.setup-warning')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('falls back to the global llm.context_window_tokens layer when no override is set', async () => {
+    const { app, el } = await mountPanel({
+      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      contextWindowTokens: '',
+      contextWindowGlobal: 100000,
+    })
+
+    // No per-model override → effective takes the global config layer, not auto.
+    expect(readout(el)).toContain('override none')
+    expect(readout(el)).toContain('auto-detected 262144')
+    expect(readout(el)).toContain('effective 100000')
+
+    app.unmount()
+  })
+
+  it('a per-model override beats the global config layer', async () => {
+    const { app, el } = await mountPanel({
+      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      contextWindowTokens: '4096',
+      contextWindowGlobal: 100000,
+    })
+
+    expect(readout(el)).toContain('override 4096')
+    expect(readout(el)).toContain('effective 4096')
+
+    app.unmount()
+  })
+
+  it('warns for a small global window on a local provider with no override', async () => {
+    const { app, el } = await mountPanel({
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      contextWindowTokens: '',
+      contextWindowGlobal: 8192,
+      providerIsLocal: true,
+    })
+
+    expect(el.querySelector('.setup-warning')?.textContent).toContain('8192 tokens')
+
+    app.unmount()
+  })
+
+  it('disables the input while the model field is empty', async () => {
+    const { app, el } = await mountPanel()
+
+    expect(contextInput(el)?.disabled).toBe(true)
+
+    app.unmount()
+  })
+
+  it('emits updateContextWindow with the raw input string', async () => {
+    const onUpdateContextWindow = vi.fn()
+    const { app, el } = await mountPanel(
+      { providerFieldValue: modelValue('test-vendor/alpha') },
+      { onUpdateContextWindow },
+    )
+
+    const input = contextInput(el)!
+    input.value = '16384'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(onUpdateContextWindow).toHaveBeenCalledWith('16384')
 
     app.unmount()
   })

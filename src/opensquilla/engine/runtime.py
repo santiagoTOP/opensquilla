@@ -190,6 +190,7 @@ from opensquilla.provider import (
     classify_provider_error,
     decide_recovery_action,
 )
+from opensquilla.provider.model_catalog import resolve_effective_context_window
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
@@ -2232,6 +2233,7 @@ class TurnRunner:
         compaction_hooks: Sequence[CompactionHook] | None = None,
         meta_run_writer: MetaRunWriter | None = None,
         turn_error_writer: Any | None = None,
+        provider_call_observer: Callable[..., None] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -2248,6 +2250,10 @@ class TurnRunner:
         self._diagnostics_state = diagnostics_state
         self._meta_run_writer = meta_run_writer
         self._turn_error_writer = turn_error_writer
+        # Optional gateway-injected provider-call observer (latency/health
+        # sampling). Threaded onto AgentConfig via AgentBootstrapStage; None
+        # keeps the engine gateway-agnostic.
+        self._provider_call_observer = provider_call_observer
         self._router_control_hold_store = RouterControlHoldStore()
         # TurnHook surface. The default trace hook reproduces the inline trace
         # event behavior while keeping the event sink replaceable at construction.
@@ -2315,6 +2321,7 @@ class TurnRunner:
             agent_config_builder=_TurnRunnerAgentConfigBuilderAdapter(self),
             memory_snapshot=_TurnRunnerMemorySnapshotAdapter(self),
             agent_factory=_TurnRunnerAgentFactoryAdapter(self),
+            provider_call_observer=self._provider_call_observer,
         )
         # TurnRunner stage decomposition CompactionAndHistoryStage instance. Holds no
         # per-turn state. Active unconditionally as of.
@@ -3085,12 +3092,17 @@ class TurnRunner:
             if model:
                 compaction_model = model
                 if self._model_catalog is not None:
-                    compaction_context_window_tokens = (
-                        self._model_catalog.resolve_context_window(
-                            model,
-                            provider=active_provider_id,
-                        )
+                    # Same precedence as the harness catalog adapter: a
+                    # per-model [models.*] override beats the global
+                    # llm.context_window_tokens value, which beats the catalog.
+                    llm_cfg = getattr(self._config, "llm", None) if self._config else None
+                    window, _window_source = resolve_effective_context_window(
+                        self._model_catalog,
+                        model,
+                        provider=active_provider_id,
+                        global_override=getattr(llm_cfg, "context_window_tokens", 0) or 0,
                     )
+                    compaction_context_window_tokens = window
             ch_outcome = await self._compaction_and_history_stage.run(
                 CompactionAndHistoryStageInput(
                     agent=agent,

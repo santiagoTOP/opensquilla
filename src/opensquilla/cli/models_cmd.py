@@ -167,6 +167,7 @@ def _probe_row(
     kind: str = "",
     detail: str = "",
     code: str = "",
+    latency_ms: int = 0,
 ) -> dict[str, Any]:
     """One probe result row. ``detail`` is always redacted before it lands
     here so neither the table nor ``--json`` can echo credential material."""
@@ -179,6 +180,7 @@ def _probe_row(
         "code": code,
         "method": method,
         "source": target.source,
+        "latency_ms": latency_ms,
     }
 
 
@@ -202,6 +204,7 @@ async def _probe_one(target: _ProbeTarget, timeout: float) -> dict[str, Any]:
                 kind=result.failure_kind,
                 detail=result.message,
                 code=result.code,
+                latency_ms=result.latency_ms,
             )
         listing = await discover_provider_models(
             provider_id=target.provider_id,

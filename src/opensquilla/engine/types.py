@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
@@ -602,6 +603,11 @@ class AgentConfig:
     tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
     tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
     tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
+    # Optional gateway-injected observer invoked once per provider call with
+    # keyword args (provider_id, model, ttft_ms, duration_ms, ok,
+    # failure_kind). The agent loop swallows observer errors so the engine
+    # stays gateway-agnostic and a broken observer can never affect a turn.
+    provider_call_observer: Callable[..., None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

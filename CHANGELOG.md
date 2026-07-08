@@ -17,6 +17,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`attachments.workspace_attachment_disk_budget_bytes`, default 1 GiB) that
   degrades new materializations to an unavailable marker without evicting
   existing files.
+- Provider connection tests now report latency: `onboarding.provider.probe`
+  returns an additive `latencyMs` field (0 on pre-network failures), the CLI
+  `models probe --json` rows carry `latency_ms`, and the Web UI setup panel
+  renders a verdict line — connected state with round-trip latency, live
+  model count, and sample model ids; failure pills include the latency so a
+  fast 401 rejection reads differently from a slow timeout.
+- `[models.<provider_id>."<model_id>"].context_window` now governs context
+  budgeting as documented: the catalog resolver consults the per-model
+  override first (new `override` source), the turn budget ladder, compaction
+  window, usage pressure (`windowSource: "model_override"`), and router
+  capability facts all honor it, and the per-model value beats the global
+  `llm.context_window_tokens`. The Web UI setup panel gains a context-window
+  override field with an auto-detected/override/effective readout and a
+  small-window warning for local runtimes.
+- Doctor now lints API-key shape: a key that looks like a URL or an
+  environment-variable name yields a `provider.active.api_key_shape` warning
+  (shape only — key material never leaves the gateway) with recovery steps.
+  `providers.status` rows carry the additive `apiKeyShape` field.
+- The console Overview can copy the full doctor report as sanitized JSON
+  (home paths normalized) and hand it to a new agent chat ("Diagnose with
+  agent", hidden when the provider itself blocks readiness); findings for
+  provider/channel/router surfaces deep-link into the matching settings
+  section, and `/settings/provider#provider-<id>` preselects that provider.
+- Passive provider latency stats: the agent loop records time-to-first-token
+  and call duration per provider call into an in-memory rolling window;
+  `providers.status` rows expose an additive `latency` snapshot
+  (`p50TtftMs`/`p95TtftMs`/`samples`, gated below minimum sample counts) and
+  the Overview shows a latency readout for the active provider.
+- The chat view warns when a streaming turn produces no content events for
+  90 seconds (server heartbeats alone no longer look like progress): a
+  dismissible notice offers keep-waiting or interrupt, and stays quiet while
+  a tool is executing or an approval is pending.
 
 - Added Tencent TokenHub providers for the Hunyuan hy3 family:
   `tencent_tokenhub` (OpenAI-compatible mainland endpoint,

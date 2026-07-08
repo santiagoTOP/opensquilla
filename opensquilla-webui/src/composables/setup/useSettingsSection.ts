@@ -23,6 +23,24 @@ export function isKnownSectionParam(param: unknown): boolean {
   return sectionIdFor(param) !== null
 }
 
+/**
+ * Parse a `#provider-<id>` deep-link hash into the provider id it names.
+ * Returns '' for anything else ('' hash, other anchors, bare '#provider-').
+ */
+export function parseProviderHash(hash: unknown): string {
+  if (typeof hash !== 'string') return ''
+  const raw = hash.startsWith('#') ? hash.slice(1) : hash
+  const prefix = 'provider-'
+  if (!raw.startsWith(prefix)) return ''
+  const id = raw.slice(prefix.length).trim()
+  if (!id) return ''
+  try {
+    return decodeURIComponent(id)
+  } catch {
+    return id
+  }
+}
+
 export function useSettingsSection(initialSection: string) {
   const section = ref(initialSection)
 

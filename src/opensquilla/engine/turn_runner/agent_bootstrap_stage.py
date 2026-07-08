@@ -29,6 +29,8 @@ from opensquilla.engine.runtime_recovery import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from opensquilla.engine.agent import Agent, ToolHandler
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.engine.types import AgentConfig, ThinkingLevel
@@ -559,12 +561,16 @@ class AgentBootstrapStage:
         agent_config_builder: AgentConfigBuilderPort,
         memory_snapshot: MemorySnapshotPort,
         agent_factory: AgentFactoryPort,
+        provider_call_observer: Callable[..., None] | None = None,
     ) -> None:
         self._timeout_budget = timeout_budget
         self._model_catalog = model_catalog
         self._agent_config_builder = agent_config_builder
         self._memory_snapshot = memory_snapshot
         self._agent_factory = agent_factory
+        # Optional gateway diagnostics seam threaded onto every AgentConfig;
+        # None keeps the engine fully gateway-agnostic.
+        self._provider_call_observer = provider_call_observer
 
     async def run(
         self,
@@ -768,6 +774,7 @@ class AgentBootstrapStage:
             ),
             reasoning_prefill_recovery_mode=_reasoning_prefill_recovery_mode_from_env(),
             runtime_events_path=(os.environ.get("OPENSQUILLA_RUNTIME_EVENTS_PATH") or None),
+            provider_call_observer=self._provider_call_observer,
             metadata=agent_metadata,
         )
 

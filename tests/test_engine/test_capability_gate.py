@@ -400,6 +400,18 @@ def test_facts_synthesized_entry_gives_no_signal(facts_catalog: ModelCatalog) ->
     assert facts["c1"] == TierCapability(supports_vision=None, context_window=None)
 
 
+def test_facts_user_override_window_counts_as_definite(facts_catalog: ModelCatalog) -> None:
+    # An operator-declared [models.*] context_window is knowledge, not an
+    # estimate: the gate may act on it exactly like a catalog-sourced window.
+    facts_catalog.set_user_overrides(
+        {"mainprov/dummy-pinned-window-1": {"context_window": 64_000}}
+    )
+    facts = _tier_capability_facts(
+        {"c1": {"model": "dummy-pinned-window-1"}}, ["c1"], "mainprov"
+    )
+    assert facts["c1"].context_window == 64_000
+
+
 def test_facts_anthropic_flag_gated_caps_stay_unknown(facts_catalog: ModelCatalog) -> None:
     # The user-override layer claims vision for this model. Under a normal
     # provider that is a definite signal; under anthropic the capabilities

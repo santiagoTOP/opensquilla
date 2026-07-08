@@ -322,6 +322,17 @@
           </div>
         </div>
 
+        <!-- Soft stall banner: content events went silent past the watchdog
+             threshold while nothing legitimate (tool run, approval) explains
+             it. "Keep waiting" dismisses and re-arms; "Interrupt" stops the
+             turn through the same path as the composer stop button. -->
+        <ChatStallNotice
+          v-if="stallActive"
+          :seconds="stallSeconds"
+          @wait="stallWatchdog.dismiss()"
+          @interrupt="onStop"
+        />
+
         <!-- Thinking indicator -->
         <div v-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
           <div class="msg-ai-main">
@@ -524,6 +535,7 @@ import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ChatHistoryScopeRow from '@/components/chat/ChatHistoryScopeRow.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
+import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
@@ -561,6 +573,7 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend } from '@/composables/chat/useChatSend'
+import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { useAgentOptions } from '@/composables/useAgentOptions'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
@@ -584,11 +597,13 @@ import type {
 } from '@/types/chat'
 import type {
   ArtifactPayload,
+  SessionEventPayload,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { InterruptViewState } from '@/types/parts'
 import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import { isCurrentSessionPayload as payloadIsCurrentSession } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
@@ -1405,7 +1420,28 @@ const liveInterruptParts = computed(() =>
       ),
 )
 
-const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, rpcEventHandlers.handlers)
+// Soft content-silence watchdog: raises a dismissible stall banner when the
+// live turn stops producing content events (heartbeats keep the hard idle
+// timeout fed, so a wedged provider would otherwise spin silently for 210s).
+const stallWatchdog = useChatStallWatchdog({ isStreaming })
+const { stallActive, stallSeconds } = stallWatchdog
+
+const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
+  ...rpcEventHandlers.handlers,
+  // The wildcard handler is the one funnel that sees every gateway event with
+  // its name; feed the active session's events to the watchdog before the
+  // regular handler consumes them (same session filter as existing handlers).
+  onAny: (rawEvent, rawPayload) => {
+    const payloadObj = (rawPayload && typeof rawPayload === 'object' ? rawPayload : {}) as SessionEventPayload
+    if (payloadIsCurrentSession(payloadObj, sessionKey.value)) {
+      stallWatchdog.noteEvent(rawEvent, payloadObj)
+    }
+    rpcEventHandlers.handlers.onAny(rawEvent, rawPayload)
+  },
+})
+
+// Session switches drop the previous session's stall tracking entirely.
+watch(sessionKey, () => stallWatchdog.reset())
 
 // MetaSkill run UI: preflight checkpoint + run-progress ribbon, driven by the
 // four session.event.meta_* frames (delivered via the '*' wildcard, so this

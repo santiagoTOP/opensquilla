@@ -7,7 +7,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.provider.model_catalog import shared_catalog
+from opensquilla.provider.model_catalog import (
+    resolve_effective_context_window,
+    shared_catalog,
+)
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.tokenizer import estimate_tokens
 
@@ -58,22 +61,39 @@ def _transcript_entry_tokens(entry: Any) -> int:
     return total
 
 
+# Shared-resolver sources -> this RPC's wire labels; "catalog"/"default"
+# keep the per-catalog labels below (unchanged wire behavior).
+_WINDOW_SOURCE_LABELS = {"override": "model_override", "config": "config"}
+
+
 def _resolve_context_window(model: str | None, ctx: RpcContext) -> tuple[int | None, str]:
     config = ctx.config
+    provider = str(getattr(getattr(config, "llm", None), "provider", "") or "")
+    runtime_catalog = getattr(getattr(ctx, "turn_runner", None), "_model_catalog", None)
+    global_window = None
     for owner in (config, getattr(config, "llm", None)):
-        window = _positive_int(getattr(owner, "context_window_tokens", None))
-        if window is not None:
-            return window, "config"
+        global_window = _positive_int(getattr(owner, "context_window_tokens", None))
+        if global_window is not None:
+            break
     if model:
-        provider = str(getattr(getattr(config, "llm", None), "provider", "") or "")
-        catalog = getattr(getattr(ctx, "turn_runner", None), "_model_catalog", None)
-        if catalog is not None and hasattr(catalog, "resolve_context_window"):
-            window = _positive_int(catalog.resolve_context_window(model, provider))
-            if window is not None:
-                return window, "runtime_model_catalog"
-        window = _positive_int(shared_catalog().resolve_context_window(model, provider))
-        if window is not None:
-            return window, "static_model_catalog"
+        # One shared-resolver call per catalog, runtime first: the resolver
+        # owns the "[models.*] override > global config window > catalog >
+        # default" precedence (same rule as the engine budgeting path).
+        for catalog, catalog_label in (
+            (runtime_catalog, "runtime_model_catalog"),
+            (shared_catalog(), "static_model_catalog"),
+        ):
+            if catalog is None or not hasattr(catalog, "resolve_context_window"):
+                continue
+            window, source = resolve_effective_context_window(
+                catalog, model, provider=provider, global_override=global_window or 0
+            )
+            resolved = _positive_int(window)
+            if resolved is None:
+                continue
+            return resolved, _WINDOW_SOURCE_LABELS.get(source, catalog_label)
+    if global_window is not None:
+        return global_window, "config"
     return None, "unavailable"
 
 

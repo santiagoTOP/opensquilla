@@ -1278,6 +1278,153 @@ async def test_providers_status_honors_configured_active_api_key_env(monkeypatch
     assert "custom-env-key" not in repr(res.payload)
 
 
+@pytest.mark.asyncio
+async def test_providers_status_reports_ok_api_key_shape_and_null_latency(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "sk-or-v1-abcdef",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1", "providers.status", {"provider": "openrouter"}, _ctx(config=cfg)
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["apiKeyShape"] == "ok"
+    # No ProviderStatsStore on the context -> latency is present but null.
+    assert "latency" in row
+    assert row["latency"] is None
+    assert "sk-or-v1-abcdef" not in repr(res.payload)
+
+
+@pytest.mark.asyncio
+async def test_providers_status_flags_url_shaped_api_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "https://example.invalid/pasted-endpoint",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1", "providers.status", {"provider": "openrouter"}, _ctx(config=cfg)
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["apiKeyShape"] == "looks_like_url"
+    assert "https://example.invalid/pasted-endpoint" not in repr(res.payload)
+
+
+@pytest.mark.asyncio
+async def test_providers_status_flags_env_name_shaped_api_key(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter", "model": "openrouter/model"}
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1", "providers.status", {"provider": "openrouter"}, _ctx(config=cfg)
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["apiKeyShape"] == "looks_like_env_name"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_flags_shell_paste_dollar_env_name(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "$DEEPSEEK_API_KEY",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1", "providers.status", {"provider": "openrouter"}, _ctx(config=cfg)
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["apiKeyShape"] == "looks_like_env_name"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_generic_all_caps_key_is_ok(monkeypatch):
+    # Legitimate all-uppercase key material must not trip the env-name lint.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "AB12CD34EF56GH78")
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter", "model": "openrouter/model"}
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1", "providers.status", {"provider": "openrouter"}, _ctx(config=cfg)
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["apiKeyConfigured"] is True
+    assert row["apiKeyShape"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_absent_key_reports_ok_shape(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "openrouter/model"})
+
+    res = await get_dispatcher().dispatch(
+        "r1", "providers.status", {"provider": "openrouter"}, _ctx(config=cfg)
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["apiKeyConfigured"] is False
+    assert row["apiKeyShape"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_surfaces_latency_snapshot_from_store(monkeypatch):
+    from opensquilla.gateway.provider_stats import ProviderStatsStore
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    store = ProviderStatsStore()
+    for _ in range(5):
+        store.record(
+            provider_id="openrouter",
+            model="openrouter/model",
+            ttft_ms=150,
+            duration_ms=900,
+            ok=True,
+        )
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "openrouter/model"})
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "providers.status",
+        {"provider": "openrouter"},
+        _ctx(config=cfg, provider_stats=store),
+    )
+
+    assert res.error is None, res.error
+    row = res.payload["providers"][0]
+    assert row["latency"] == {
+        "p50TtftMs": 150,
+        "p95TtftMs": None,
+        "samples": 5,
+        "windowMinutes": 60,
+    }
+
+
 class FakeSearchProvider:
     name = "fake_search_ok"
 

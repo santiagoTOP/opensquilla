@@ -25,9 +25,29 @@
             {{ t('sessions.overview.rerunChecks') }}
           </button>
         </span>
+        <button
+          v-if="diagnoseVisible"
+          class="btn btn--primary btn--sm"
+          type="button"
+          :title="t('sessions.overview.diagnoseWithAgent')"
+          @click="diagnoseWithAgent"
+        >
+          <Icon name="chat" :size="14" />
+          <span>{{ t('sessions.overview.diagnoseWithAgent') }}</span>
+        </button>
         <button class="btn btn--ghost" :title="t('sessions.refresh')" :disabled="refreshing" @click="refresh">
           <Icon name="refresh" :size="16" />
           <span>{{ refreshing ? t('sessions.refreshing') : t('sessions.refresh') }}</span>
+        </button>
+        <button
+          class="btn btn--ghost"
+          type="button"
+          :title="t('sessions.overview.copyDiagnostics')"
+          :disabled="healthLoading || !healthReport"
+          @click="copyDiagnostics"
+        >
+          <Icon :name="copiedCommandKey === DIAGNOSTICS_COPY_KEY ? 'check' : 'copy'" :size="16" />
+          <span>{{ t('sessions.overview.copyDiagnostics') }}</span>
         </button>
         <button class="btn btn--primary" :title="t('sessions.overview.openChat')" @click="router.push('/chat')">
           <Icon name="chat" :size="16" />
@@ -79,6 +99,10 @@
           <Icon :name="copiedCommandKey === item.key ? 'check' : 'copy'" :size="13" />
         </button>
       </span>
+      <span v-if="latencyLine" class="ov-readout__kv ov-readout__latency" aria-live="polite">
+        <b>{{ t('sessions.overview.latency') }}</b>
+        <code>{{ latencyLine }}</code>
+      </span>
       <span class="ov-readout__version">v{{ statusData?.version || '—' }} · {{ uptime }}</span>
     </section>
 
@@ -123,6 +147,14 @@
                   {{ findingBadgeText(finding) }}
                 </span>
                 <span v-if="finding.restartRequired" class="health-chip">{{ t('sessions.overview.recoveryRestart') }}</span>
+                <button
+                  v-if="settingsLinkForFinding(finding)"
+                  type="button"
+                  class="health-settings-link"
+                  @click="openFindingSettings(finding)"
+                >
+                  {{ t('sessions.overview.openSettings') }}
+                </button>
               </div>
               <div class="health-finding__title">
                 {{ finding.title || finding.id || t('sessions.overview.findingFallback', { n: fIdx + 1 }) }}
@@ -275,6 +307,13 @@ import { useRpcStore } from '@/stores/rpc'
 import { useRequest } from '@/composables/useRequest'
 import { useToasts } from '@/composables/useToasts'
 import { copyTextWithFallback } from '@/utils/browser'
+import {
+  formatLatencyLine,
+  normalizeHomePaths,
+  providerBlocksAgent,
+  settingsLinkForFinding,
+  xmlEscape,
+} from '@/utils/overviewDiagnostics'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 
@@ -341,6 +380,23 @@ interface UsageData {
 
 interface SessionsListData {
   sessions?: Session[]
+}
+
+// providers.status row — only the fields the overview reads. `latency` is a
+// newer optional TTFT summary; older gateways omit it entirely.
+interface ProviderStatusRow {
+  providerId?: string
+  active?: boolean
+  latency?: {
+    p50TtftMs?: number | null
+    p95TtftMs?: number | null
+    samples?: number | null
+    windowMinutes?: number | null
+  } | null
+}
+
+interface ProvidersStatusData {
+  providers?: ProviderStatusRow[]
 }
 
 interface LogEvent {
@@ -430,6 +486,9 @@ const healthError = ref<Error | null>(null)
 // ISO timestamp of the last completed doctor.status, for the freshness line.
 const healthCheckedAt = ref<string | undefined>(undefined)
 const copiedCommandKey = ref('')
+// Best-effort providers.status rows, fetched on mount and manual Refresh for
+// the active-provider latency line; failures leave the list empty and silent.
+const providerRows = ref<ProviderStatusRow[]>([])
 
 const eventLog = ref<LogEvent[]>([])
 
@@ -505,13 +564,9 @@ const impactChips = computed(() => [
 // Environment footer readout: gateway URL, config path (abbreviated + copyable),
 // agent, provider — quiet utility detail, not hero content.
 function abbreviatePath(path: string): string {
-  let p = path
-  const home = '/Users/'
-  if (p.startsWith(home)) {
-    const rest = p.slice(home.length)
-    const slash = rest.indexOf('/')
-    if (slash !== -1) p = '~' + rest.slice(slash)
-  }
+  // Collapse macOS and Linux home prefixes to `~/` (same rule the diagnostics
+  // copies use), then squeeze anything still too long.
+  let p = normalizeHomePaths(path)
   if (p.length > 42) {
     const tail = p.slice(-30)
     const head = p.slice(0, 10)
@@ -532,6 +587,21 @@ const readoutItems = computed<ReadoutItem[]>(() => {
   if (healthReport.value?.agentId) items.push({ key: 'agent', label: t('sessions.overview.ctxAgent'), display: healthReport.value.agentId, full: healthReport.value.agentId, copy: false })
   if (provider.value && provider.value !== '—') items.push({ key: 'provider', label: t('sessions.overview.provider'), display: provider.value, full: provider.value, copy: false })
   return items
+})
+
+// Compact TTFT line for the active provider only; null hides the readout row
+// (backends without latency stats, no active row, or low-sample null fields).
+const latencyLine = computed<string | null>(() => {
+  const row = providerRows.value.find(r => r?.active === true)
+  return row ? formatLatencyLine(row.latency) : null
+})
+
+// "Diagnose with agent" needs a live report and a usable provider: when a
+// provider finding blocks readiness the agent turn itself could not run, so
+// the hand-off is hidden instead of dead-ending in chat.
+const diagnoseVisible = computed<boolean>(() => {
+  if (healthLoading.value || !healthReport.value) return false
+  return !providerBlocksAgent(healthReport.value.findings)
 })
 
 const groupedFindings = computed<FindingGroup[]>(() => {
@@ -576,6 +646,10 @@ onMounted(() => {
   // than the 30s status polls, so they only rerun on manual Refresh).
   // useRequest handles initial load for status/usage/sessions on mount.
   loadHealth()
+  // Latency rides alongside the doctor report but never gates it. Like the
+  // deep checks, providers.status is expensive (a client per registered spec),
+  // so it loads on mount and manual Refresh only — never from the 30s poll.
+  void loadProviderStatus()
 })
 
 // Timers and the event subscription live on activate/deactivate so a kept-alive
@@ -628,6 +702,8 @@ const refreshing = ref(false)
 async function refresh() {
   if (refreshing.value) return
   refreshing.value = true
+  // Fire-and-forget: latency is optional telemetry and never gates the refresh.
+  void loadProviderStatus()
   try {
     await Promise.all([refreshStatus(), refreshUsage(), refreshSessions(), loadHealth()])
   } finally {
@@ -657,6 +733,16 @@ async function loadHealth() {
   }
 }
 
+async function loadProviderStatus() {
+  try {
+    await rpc.waitForConnection()
+    const data = await rpc.call<ProvidersStatusData>('providers.status', {})
+    providerRows.value = Array.isArray(data?.providers) ? data.providers : []
+  } catch {
+    // Latency is optional telemetry; the overview must render without it.
+  }
+}
+
 function clearCopiedCommandTimer() {
   if (copiedCommandResetId) {
     clearTimeout(copiedCommandResetId)
@@ -668,23 +754,85 @@ function healthStepCopyKey(finding: Finding, findingIndex: number, stepIndex: nu
   return `${findingGroupKind(finding)}:${finding.id || finding.title || findingIndex}:${stepIndex}`
 }
 
+// Shared check-icon swap (1600ms) for the command and diagnostics copies.
+function markCopied(key: string) {
+  copiedCommandKey.value = key
+  clearCopiedCommandTimer()
+  copiedCommandResetId = setTimeout(() => {
+    copiedCommandKey.value = ''
+    copiedCommandResetId = null
+  }, 1600)
+}
+
 async function copyCommand(command: string, key: string) {
   if (!command) return
   try {
     await copyTextWithFallback(command)
-    copiedCommandKey.value = key
+    markCopied(key)
     pushToast(t('setup.toast.copiedCommand'), { tone: 'ok' })
-    clearCopiedCommandTimer()
-    copiedCommandResetId = setTimeout(() => {
-      copiedCommandKey.value = ''
-      copiedCommandResetId = null
-    }, 1600)
   } catch (err) {
     clearCopiedCommandTimer()
     copiedCommandKey.value = ''
     const error = err instanceof Error ? err.message : String(err)
     pushToast(t('setup.toast.copyFailed', { error }), { tone: 'danger' })
   }
+}
+
+const DIAGNOSTICS_COPY_KEY = 'diagnostics-json'
+
+// Full doctor report as pretty JSON for bug reports, with the gateway URL and
+// a copy timestamp attached and local home directories collapsed to `~/`.
+async function copyDiagnostics() {
+  // No live report (doctor failed or still loading) means nothing worth
+  // pasting into a bug report; the button is disabled in that state too.
+  if (!healthReport.value) return
+  const report = {
+    ...healthReport.value,
+    gatewayUrl: healthReport.value.gatewayUrl || gatewayContextUrl(),
+    copiedAt: new Date().toISOString(),
+  }
+  try {
+    await copyTextWithFallback(normalizeHomePaths(JSON.stringify(report, null, 2)))
+    markCopied(DIAGNOSTICS_COPY_KEY)
+    pushToast(t('sessions.overview.copiedDiagnostics'), { tone: 'ok' })
+  } catch (err) {
+    clearCopiedCommandTimer()
+    copiedCommandKey.value = ''
+    const error = err instanceof Error ? err.message : String(err)
+    pushToast(t('setup.toast.copyFailed', { error }), { tone: 'danger' })
+  }
+}
+
+// Hand the trimmed doctor report to a fresh main-agent chat. The report is
+// data, not instructions: it is XML-escaped inside an <untrusted> envelope so
+// finding text cannot inject directives into the prompt.
+function diagnoseWithAgent() {
+  const report = healthReport.value
+  if (!report) return
+  const minReport = {
+    status: report.status,
+    ready: report.ready,
+    summary: report.summary,
+    counts: report.counts,
+    impactCounts: report.impactCounts,
+    findings: report.findings,
+  }
+  const payload = xmlEscape(normalizeHomePaths(JSON.stringify(minReport)))
+  const text = `${t('sessions.overview.diagnosePrompt')}\n`
+    + `<untrusted source="doctor:report">${payload}</untrusted>`
+  router.push({
+    path: '/chat/new',
+    query: { agent: 'main' },
+    // autosend fires the prefill in one step so the diagnosis actually starts
+    // instead of dropping the operator at the composer.
+    state: { prefill: text, autosend: true },
+  }).catch(() => {})
+}
+
+function openFindingSettings(finding: Finding) {
+  const link = settingsLinkForFinding(finding)
+  if (!link) return
+  router.push(link.hash ? { path: link.path, hash: link.hash } : { path: link.path }).catch(() => {})
 }
 
 function openSession(key: string) {
@@ -1064,6 +1212,11 @@ function gatewayContextUrl(): string {
   display: flex;
   gap: var(--sp-3);
   margin-left: auto;
+}
+/* Compact button modifier (status-line diagnose + connection panel link). */
+.btn--sm {
+  font-size: var(--fs-xs);
+  padding: 5px 10px;
 }
 .ov-freshness { color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
 .ov-rerun {
@@ -1655,6 +1808,25 @@ function gatewayContextUrl(): string {
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
   color: var(--danger);
+}
+
+/* Deep link from a finding to its settings section: quiet accent text button
+   that inherits the meta row's small uppercase scale. */
+.health-settings-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: 0.08em;
+  padding: 2px 0;
+  transition: color var(--dur-fast) var(--ease-standard);
+}
+.health-settings-link:hover { color: var(--accent-hover); }
+.health-settings-link:focus-visible {
+  border-radius: var(--radius-sm);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .health-finding__title {

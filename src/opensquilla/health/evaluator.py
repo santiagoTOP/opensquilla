@@ -283,16 +283,62 @@ def evaluate_provider(payload: dict[str, Any]) -> list[HealthFinding]:
             )
         )
     else:
-        findings.append(
-            HealthFinding(
-                id="provider.active.ready",
-                severity="ok",
-                surface="provider",
-                title="Active provider ready",
-                detail=f"{provider_id} is configured and buildable.",
-                evidence={"providerId": provider_id, "model": active_row.get("model")},
+        # Rows from older gateways / offline doctor payloads carry no
+        # apiKeyShape; default to "ok" so they behave exactly as before.
+        api_key_shape = active_row.get("apiKeyShape", "ok")
+        if api_key_shape not in ("ok", "", None):
+            shape = str(api_key_shape)
+            if shape == "looks_like_url":
+                problem = (
+                    "the configured API key looks like a URL. The key is sent "
+                    "verbatim as the request credential, so the upstream "
+                    "provider rejects it with 401."
+                )
+            elif shape == "looks_like_env_name":
+                problem = (
+                    "the configured API key looks like an environment variable "
+                    "NAME, not its value. Requests authenticate with the "
+                    "literal name and are rejected."
+                )
+            else:
+                problem = f"the configured API key has a suspicious shape ({shape})."
+            findings.append(
+                HealthFinding(
+                    id="provider.active.api_key_shape",
+                    severity="warn",
+                    surface="provider",
+                    title="Active provider API key looks misconfigured",
+                    detail=f"{provider_id} is configured and buildable, but {problem}",
+                    evidence={"providerId": provider_id, "shape": shape},
+                    fix_steps=[
+                        FixStep(
+                            label="Reconfigure provider key",
+                            command=(
+                                "opensquilla providers configure "
+                                f"{provider_id} --api-key {_API_KEY_PLACEHOLDER}"
+                            ),
+                        ),
+                        FixStep(
+                            label="Update the key in the console",
+                            detail=(
+                                "Open Settings → Chat Model and paste the "
+                                "provider's real API key value."
+                            ),
+                        ),
+                    ],
+                )
             )
-        )
+        else:
+            findings.append(
+                HealthFinding(
+                    id="provider.active.ready",
+                    severity="ok",
+                    surface="provider",
+                    title="Active provider ready",
+                    detail=f"{provider_id} is configured and buildable.",
+                    evidence={"providerId": provider_id, "model": active_row.get("model")},
+                )
+            )
     return findings
 
 

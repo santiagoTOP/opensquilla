@@ -15,7 +15,10 @@ import pytest
 
 from opensquilla.provider import model_catalog as model_catalog_module
 from opensquilla.provider.catalog_types import ModelCatalogEntry
-from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.model_catalog import (
+    ModelCatalog,
+    resolve_effective_context_window,
+)
 
 
 def _install_corrections(monkeypatch: pytest.MonkeyPatch, toml_text: str) -> None:
@@ -471,6 +474,76 @@ def test_explicit_false_and_zero_overrides_win() -> None:
     # Presence in a layer = knowledge: False/0 beat the live layer's values.
     assert entry.supports_reasoning is False
     assert entry.max_output_tokens == 0
+
+
+def test_context_window_override_governs_legacy_resolver_with_source() -> None:
+    # The [models.*] user-override layer is the top layer of the legacy
+    # resolve_context_window chain too, attributed as "override"; models
+    # without an override keep resolving through live/snapshot/corrections
+    # exactly as the parity net below pins.
+    catalog = _populated_catalog()
+    catalog.set_user_overrides({"openrouter/vendor/model-x": {"context_window": 111}})
+
+    assert catalog.resolve_context_window_with_source(
+        "vendor/model-x", "openrouter"
+    ) == (111, "override")
+    assert catalog.resolve_context_window("vendor/model-x", "openrouter") == 111
+    assert catalog.user_context_window_override("vendor/model-x", "openrouter") == 111
+    # Other models are untouched by the installed override.
+    assert catalog.resolve_context_window_with_source("gpt-5.5", "openai") == (
+        1_050_000,
+        "catalog",
+    )
+    assert catalog.user_context_window_override("gpt-5.5", "openai") is None
+
+
+def test_context_window_override_zero_is_not_a_budgeting_window() -> None:
+    # A 0 override wins per-field in resolve_entry (presence = knowledge) but
+    # cannot serve as a budgeting window, so the legacy chain resolves past it.
+    catalog = _populated_catalog()
+    catalog.set_user_overrides({"openrouter/vendor/model-x": {"context_window": 0}})
+
+    assert catalog.user_context_window_override("vendor/model-x", "openrouter") is None
+    assert catalog.resolve_context_window_with_source("vendor/model-x", "openrouter") == (
+        200_000,
+        "catalog",
+    )
+
+
+def test_resolve_effective_context_window_layers() -> None:
+    # Shared implementation of "[models.*] override > global config window >
+    # catalog > default" used by the engine budgeting and RPC paths.
+    catalog = _populated_catalog()
+    catalog.set_user_overrides({"openrouter/vendor/model-x": {"context_window": 111}})
+
+    assert resolve_effective_context_window(
+        catalog, "vendor/model-x", provider="openrouter", global_override=999_000
+    ) == (111, "override")
+    assert resolve_effective_context_window(
+        catalog, "gpt-5.5", provider="openai", global_override=999_000
+    ) == (999_000, "config")
+    assert resolve_effective_context_window(catalog, "gpt-5.5", provider="openai") == (
+        1_050_000,
+        "catalog",
+    )
+    # Junk/non-positive global values count as unset.
+    assert resolve_effective_context_window(
+        catalog, "gpt-5.5", provider="openai", global_override=-5
+    ) == (1_050_000, "catalog")
+
+
+def test_resolve_effective_context_window_duck_types_plain_catalogs() -> None:
+    class _PlainCatalog:
+        def resolve_context_window(self, model_id: str, provider: str = "") -> int:
+            return 42_000
+
+    # Without *_with_source the value is attributed "catalog" — never
+    # "override" — so the global config value still applies over it.
+    assert resolve_effective_context_window(_PlainCatalog(), "m") == (42_000, "catalog")
+    assert resolve_effective_context_window(_PlainCatalog(), "m", global_override=50_000) == (
+        50_000,
+        "config",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -604,6 +604,7 @@ class ServiceContainer:
     router_decision_writer: Any = None
     turn_error_writer: Any = None
     router_calibration_service: Any = None
+    provider_stats: Any = None  # ProviderStatsStore | None (rolling call latency samples)
     task_runtime: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
@@ -2602,6 +2603,11 @@ async def build_services(
         log.warning("build_services.router_calibration_service_failed", error=str(e))
         router_calibration_service = None
 
+    # ── Provider call stats (rolling latency/health samples) ────────
+    from opensquilla.gateway.provider_stats import ProviderStatsStore
+
+    provider_stats = ProviderStatsStore()
+
     svc = ServiceContainer(
         config=config,
         provider_selector=provider_selector,
@@ -2624,11 +2630,43 @@ async def build_services(
         router_decision_writer=router_decision_writer,
         turn_error_writer=turn_error_writer,
         router_calibration_service=router_calibration_service,
+        provider_stats=provider_stats,
         deferred_warmups=deferred_warmups,
     )
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
     return svc
+
+
+def build_provider_call_observer(provider_stats: Any) -> Callable[..., None] | None:
+    """Adapt a ``ProviderStatsStore`` to the engine's provider-call observer seam.
+
+    Returns ``None`` when no store is available so the TurnRunner/Agent path
+    stays observer-free. Module-level so boot-wiring tests can drive the
+    adapter with a fake store without booting a gateway.
+    """
+    if provider_stats is None:
+        return None
+
+    def _observe_provider_call(
+        *,
+        provider_id: str,
+        model: str,
+        ttft_ms: int | None,
+        duration_ms: int,
+        ok: bool,
+        failure_kind: str = "",
+    ) -> None:
+        provider_stats.record(
+            provider_id=provider_id,
+            model=model,
+            ttft_ms=ttft_ms,
+            duration_ms=duration_ms,
+            ok=ok,
+            failure_kind=failure_kind,
+        )
+
+    return _observe_provider_call
 
 
 def build_turn_runner_from_services(
@@ -2680,6 +2718,9 @@ def build_turn_runner_from_services(
         compaction_hooks=getattr(svc, "compaction_hooks", None),
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         turn_error_writer=getattr(svc, "turn_error_writer", None),
+        provider_call_observer=build_provider_call_observer(
+            getattr(svc, "provider_stats", None)
+        ),
     )
 
 
@@ -3518,6 +3559,7 @@ async def start_gateway_server(
         heartbeat_loop=heartbeat_loop,
         agent_registry=svc.agent_registry,
         diagnostics_state=diagnostics_state,
+        provider_stats=getattr(svc, "provider_stats", None),
         memory_managers=svc.memory_managers,
         memory_stores=svc.memory_stores,
         memory_retrievers=svc.memory_retrievers,

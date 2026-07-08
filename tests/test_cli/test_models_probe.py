@@ -150,6 +150,7 @@ def test_probe_json_shape(tmp_path: Path, monkeypatch) -> None:
                     failure_kind="rate_limited",
                     message="injected rate limit",
                     code="429",
+                    latency_ms=123,
                 )
             },
             [],
@@ -170,6 +171,7 @@ def test_probe_json_shape(tmp_path: Path, monkeypatch) -> None:
     assert row["code"] == "429"
     assert row["method"] == "chat"
     assert row["source"] == "llm"
+    assert row["latency_ms"] == 123
 
 
 def test_probe_unknown_provider_filter_exits_two(tmp_path: Path) -> None:
@@ -268,6 +270,7 @@ def test_probe_profile_without_tier_model_uses_models_list(
     assert by_provider["openai"]["method"] == "chat"
     assert by_provider["anthropic"]["method"] == "models_list"
     assert by_provider["anthropic"]["source"] == "llm_profiles"
+    assert by_provider["anthropic"]["latency_ms"] == 0
     assert [call["provider_id"] for call in probe_calls] == ["openai"]
     assert [call["provider_id"] for call in discover_calls] == ["anthropic"]
 

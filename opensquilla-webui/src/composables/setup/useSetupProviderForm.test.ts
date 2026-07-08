@@ -251,7 +251,7 @@ describe('useSetupProviderForm — provider credential state', () => {
 // Connection state machine — probe + model discovery
 // ---------------------------------------------------------------------------
 
-const PROBE_OK = { ok: true, providerId: 'openai', model: 'test-model', failureKind: '', message: '', code: '' }
+const PROBE_OK = { ok: true, providerId: 'openai', model: 'test-model', failureKind: '', message: '', code: '', latencyMs: 412 }
 
 const DISCOVER_ROW = {
   id: 'test-vendor/test-model',
@@ -293,6 +293,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     await pending
 
     expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.latencyMs).toBe(412)
     expect(f.connection.value.modelSource).toBe('live')
     expect(f.connection.value.models).toHaveLength(1)
     expect(f.connection.value.models[0].id).toBe('test-vendor/test-model')
@@ -321,7 +322,7 @@ describe('useSetupProviderForm — connection state machine', () => {
   })
 
   it('classifies auth_invalid as key_invalid', async () => {
-    mockRpc({ probe: { ok: false, failureKind: 'auth_invalid', message: 'No API key available.' } })
+    mockRpc({ probe: { ok: false, failureKind: 'auth_invalid', message: 'No API key available.', latencyMs: 87 } })
     const f = useSetupProviderForm()
     f.selectProvider('openai')
     await f.probeConnection()
@@ -329,6 +330,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.phase).toBe('key_invalid')
     expect(f.connection.value.failureKind).toBe('auth_invalid')
     expect(f.connection.value.detail).toBe('No API key available.')
+    expect(f.connection.value.latencyMs).toBe(87) // failures keep their round-trip time too
     expect(callMock).toHaveBeenCalledTimes(1) // no discover after a failed probe
   })
 
@@ -342,6 +344,28 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.failureKind).toBe('transport_transient')
   })
 
+  it('normalizes a missing or bogus probe latencyMs to null', async () => {
+    mockRpc({ probe: { ok: true, latencyMs: -5 } })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    await f.probeConnection({ defaultModel: 'm' })
+
+    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.latencyMs).toBeNull()
+  })
+
+  it('treats latencyMs=0 as the never-reached-network sentinel, not a real round trip', async () => {
+    // The gateway sends latencyMs=0 when the call never hit the network (missing
+    // key / build failure); it must not render as a bogus "· 0ms" pill.
+    mockRpc({ probe: { ok: false, failureKind: 'auth_invalid', message: 'No API key available.', latencyMs: 0 } })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    await f.probeConnection()
+
+    expect(f.connection.value.phase).toBe('key_invalid')
+    expect(f.connection.value.latencyMs).toBeNull()
+  })
+
   it('maps a thrown RPC error to unreachable with the message as detail', async () => {
     callMock.mockRejectedValue(new Error('gateway offline'))
     const f = useSetupProviderForm()
@@ -350,6 +374,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
     expect(f.connection.value.phase).toBe('unreachable')
     expect(f.connection.value.detail).toBe('gateway offline')
+    expect(f.connection.value.latencyMs).toBeNull() // no round trip happened
   })
 
   it('a credential edit resets a verified connection to unverified and clears models', async () => {
@@ -359,10 +384,12 @@ describe('useSetupProviderForm — connection state machine', () => {
     f.updateField('api_key', 'sk-first')
     await f.probeConnection({ defaultModel: 'm' })
     expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.latencyMs).toBe(412)
 
     f.updateField('api_key', 'sk-second')
     expect(f.connection.value.phase).toBe('unverified')
     expect(f.connection.value.models).toEqual([])
+    expect(f.connection.value.latencyMs).toBeNull() // stale verdicts drop their latency too
   })
 
   it('a base_url edit resets, a model edit does not', async () => {

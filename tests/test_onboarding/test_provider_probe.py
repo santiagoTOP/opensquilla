@@ -11,7 +11,7 @@ import pytest
 
 from opensquilla.onboarding.probe import probe_llm_provider
 from opensquilla.provider.failures import ProviderFailureKind
-from opensquilla.provider.types import TextDeltaEvent
+from opensquilla.provider.types import DoneEvent, ErrorEvent, TextDeltaEvent
 
 
 def _sse_ok_body() -> bytes:
@@ -107,6 +107,8 @@ def test_probe_reports_missing_key_without_network(monkeypatch: Any) -> None:
     assert result.ok is False
     assert result.failure_kind == ProviderFailureKind.AUTH_INVALID.value
     assert "OPENAI_API_KEY" in result.message
+    # The probe never reached the network, so no round-trip time is reported.
+    assert result.latency_ms == 0
 
 
 def test_probe_rejects_unknown_provider_as_validation_error() -> None:
@@ -197,3 +199,52 @@ def test_probe_redacts_key_material_echoed_by_auth_errors(monkeypatch: Any) -> N
     assert result.failure_kind == ProviderFailureKind.AUTH_INVALID.value
     assert leaked not in result.message
     assert "***" in result.message
+
+
+def _delayed_provider(events: list[Any], delay_s: float = 0.02) -> Any:
+    """Fake provider whose stream sleeps once, so latency is provably > 0.
+
+    ``asyncio.sleep`` never returns early, which makes the millisecond floor
+    deterministic even on a loaded CI box.
+    """
+
+    class _DelayedProvider:
+        provider_name = "openai"
+
+        def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            async def _gen() -> Any:
+                await asyncio.sleep(delay_s)
+                for event in events:
+                    yield event
+
+            return _gen()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    return _DelayedProvider()
+
+
+def test_probe_reports_latency_on_ok_path(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.build_provider",
+        lambda *args, **kwargs: _delayed_provider([DoneEvent()], delay_s=0.02),
+    )
+    result = _probe(provider_id="openai", model="gpt-4o", api_key="sk-test")
+    assert result.ok is True
+    assert isinstance(result.latency_ms, int)
+    assert result.latency_ms >= 20
+
+
+def test_probe_reports_latency_on_classified_error_path(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.build_provider",
+        lambda *args, **kwargs: _delayed_provider(
+            [ErrorEvent(message="Incorrect API key provided", code="401")], delay_s=0.02
+        ),
+    )
+    result = _probe(provider_id="openai", model="gpt-4o", api_key="sk-bad")
+    assert result.ok is False
+    assert result.failure_kind == ProviderFailureKind.AUTH_INVALID.value
+    assert isinstance(result.latency_ms, int)
+    assert result.latency_ms >= 20

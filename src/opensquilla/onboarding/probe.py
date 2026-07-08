@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -47,6 +48,9 @@ class ProviderProbeResult:
     failure_kind: str = ""
     message: str = ""
     code: str = ""
+    # Wall time of the network round-trip; 0 when the probe never reached the
+    # network (missing key, build failure).
+    latency_ms: int = 0
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -56,6 +60,7 @@ class ProviderProbeResult:
             "failureKind": self.failure_kind,
             "message": self.message,
             "code": self.code,
+            "latencyMs": self.latency_ms,
         }
 
 
@@ -123,6 +128,7 @@ async def probe_llm_provider(
 
     cfg = ChatConfig(max_tokens=1, timeout=timeout, thinking=False)
     messages = [Message(role="user", content="ping")]
+    start = time.monotonic()
     try:
         async for event in provider.chat(messages, config=cfg):
             if isinstance(event, ErrorEvent):
@@ -142,9 +148,15 @@ async def probe_llm_provider(
                     # signed URLs) — never repeat them verbatim.
                     message=redact_error_text(event.message),
                     code=str(event.code),
+                    latency_ms=int((time.monotonic() - start) * 1000),
                 )
             if isinstance(event, DoneEvent):
-                return ProviderProbeResult(ok=True, provider_id=provider_id, model=model)
+                return ProviderProbeResult(
+                    ok=True,
+                    provider_id=provider_id,
+                    model=model,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                )
     except Exception as exc:  # noqa: BLE001 - a probe never raises transport noise
         log.warning(
             "onboarding.provider_probe_failed",
@@ -157,6 +169,7 @@ async def probe_llm_provider(
             model=model,
             failure_kind=ProviderFailureKind.TRANSPORT_TRANSIENT.value,
             message=redact_error_text(str(exc)),
+            latency_ms=int((time.monotonic() - start) * 1000),
         )
 
     return ProviderProbeResult(
@@ -165,6 +178,7 @@ async def probe_llm_provider(
         model=model,
         failure_kind=ProviderFailureKind.MALFORMED_RESPONSE.value,
         message="Provider stream ended without a completion event.",
+        latency_ms=int((time.monotonic() - start) * 1000),
     )
 
 
@@ -205,13 +219,22 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
 
     The provider's own listing wins per field where it genuinely knows a
     value (``> 0`` limits, positive prices); ``shared_catalog().resolve_entry``
-    fills the rest. ``capabilitySource`` names the catalog layer that resolved
+    fills the rest. A per-model ``[models.*]`` context_window override beats
+    even the live listing, so discovery rows match what budgeting will
+    actually use. ``capabilitySource`` names the catalog layer that resolved
     the entry, so clients can tell curated metadata from synthesized floors.
     """
     from opensquilla.provider.model_catalog import shared_catalog
 
-    entry = shared_catalog().resolve_entry(info.model_id, provider=provider_id)
-    context_window = info.context_window if info.context_window > 0 else entry.context_window
+    catalog = shared_catalog()
+    entry = catalog.resolve_entry(info.model_id, provider=provider_id)
+    override_window = catalog.user_context_window_override(info.model_id, provider=provider_id)
+    if override_window is not None:
+        context_window = override_window
+    elif info.context_window > 0:
+        context_window = info.context_window
+    else:
+        context_window = entry.context_window
     max_output = (
         info.max_output_tokens if info.max_output_tokens > 0 else entry.max_output_tokens
     )

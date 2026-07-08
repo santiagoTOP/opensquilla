@@ -720,8 +720,9 @@ def _tier_capability_facts(
       early return, none of which is a definite non-vision signal.
     - ``context_window`` is known only when
       ``resolve_context_window_with_source`` attributes the value to the
-      catalog (live/snapshot/corrections); engine defaults are estimates,
-      not knowledge.
+      catalog (live/snapshot/corrections) or to a per-model ``[models.*]``
+      override (operator-declared knowledge); engine defaults are
+      estimates, not knowledge.
     """
     catalog = shared_catalog()
     empty_capabilities = ModelCapabilities()
@@ -739,7 +740,10 @@ def _tier_capability_facts(
             if capabilities != empty_capabilities:
                 supports_vision = capabilities.supports_vision
         window, window_source = catalog.resolve_context_window_with_source(tier.model, provider)
-        context_window = window if window_source == "catalog" and window > 0 else None
+        # Operator-declared [models.*] windows count as definite facts for the
+        # capability gate, same as catalog knowledge; only engine defaults
+        # remain estimates.
+        context_window = window if window_source in ("catalog", "override") and window > 0 else None
         facts[name] = TierCapability(
             supports_vision=supports_vision,
             context_window=context_window,

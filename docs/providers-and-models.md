@@ -205,6 +205,29 @@ For provider metadata that does not require the gateway, use:
 opensquilla providers list
 ```
 
+### Context-Window Resolution Order
+
+Context budgeting, compaction thresholds, usage pressure reporting, and the
+router's capability facts all resolve a model's context window through the
+same layers, first match wins:
+
+1. **Per-model override** — `[models.<provider_id>."<model_id>"]`
+   `context_window` in your config. Set this for models the catalog does not
+   know (direct DashScope/TokenHub ids, self-hosted vLLM declaring its real
+   window) or to correct a wrong catalog value. Reported as source
+   `override` (`config` in `config.effective`, `model_override` in usage
+   context status).
+2. **Global override** — `llm.context_window_tokens` (0 = auto). A blunt
+   instrument that applies to whatever model is active; the per-model
+   override always beats it.
+3. **Model catalog** — live OpenRouter data, the vendored models.dev
+   snapshot, then packaged corrections.
+4. **Default** — a conservative 8,192 for local runtimes (match your actual
+   `num_ctx`/server window with an override), 200,000 otherwise.
+
+The Web UI exposes the per-model override under Settings → Chat Model →
+Advanced, with an auto-detected / override / effective readout.
+
 ## Direct Model vs Router
 
 Direct model mode:

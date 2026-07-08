@@ -68,6 +68,7 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TurnErrorPersistPort,
     TurnMemoryCapturePort,
 )
+from opensquilla.provider.model_catalog import resolve_effective_context_window
 from opensquilla.session.compaction_lifecycle import normalize_flush_triggers_strict
 
 if TYPE_CHECKING:
@@ -437,18 +438,21 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             max_tokens = runner._model_catalog.resolve_max_tokens(
                 model_id, user_override=user_max_tokens, provider=provider_name
             )
-            context_window = runner._model_catalog.resolve_context_window(
-                model_id, provider=provider_name
+            # Per-model [models.*] context_window overrides beat the global
+            # llm.context_window_tokens value; the global still beats the catalog.
+            context_window, _context_window_source = resolve_effective_context_window(
+                runner._model_catalog,
+                model_id,
+                provider=provider_name,
+                global_override=user_context_window,
             )
             capabilities = runner._model_catalog.get_capabilities(
                 model_id, provider_name=provider_name, base_url=base_url
             )
         else:
             max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
-            context_window = 200_000
+            context_window = user_context_window if user_context_window > 0 else 200_000
             capabilities = None
-        if user_context_window > 0:
-            context_window = user_context_window
         return _ResolvedCatalog(
             max_tokens=max_tokens,
             context_window=context_window,

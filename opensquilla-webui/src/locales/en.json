@@ -225,6 +225,13 @@
       "advanced": "Advanced provider options",
       "timeoutLabel": "Request timeout (seconds)",
       "timeoutDesc": "How long to wait for a single model response before timing out — raise this for slow local models (Ollama, vLLM, LM Studio).",
+      "contextWindowLabel": "Context window override (tokens)",
+      "contextWindowDesc": "Cap the prompt-assembly budget for this model. Leave blank to use the auto-detected window.",
+      "contextWindowAuto": "auto",
+      "contextWindowUnknown": "unknown",
+      "contextWindowNone": "none",
+      "contextWindowReadout": "auto-detected {auto} · override {override} · effective {effective}",
+      "contextWindowLocalWarning": "Effective context window is {tokens} tokens. Local runtimes often default to a small window — raise the override if your model supports more.",
       "envMissing": "{envKey} is not visible to this gateway process. Set it before starting or restarting the gateway, or paste an API key instead.",
       "envKeyFallback": "the selected API key environment variable",
       "copyKeyCommand": "Copy set provider key command",
@@ -255,6 +262,8 @@
       "keyRejected": "✗ Key rejected — {reason}",
       "notReachable": "✗ Couldn't connect — {reason}",
       "discoverFailed": "Couldn't list models — type a model id.",
+      "verdictModels": "{count} models · e.g. {samples}",
+      "verdictSampleJoiner": ", ",
       "failureAuth": "The provider rejected this API key.",
       "failureCredits": "This account has no credits left.",
       "failureRateLimited": "The provider is rate-limiting requests — try again in a moment.",
@@ -790,6 +799,7 @@
       "abortFailed": "Abort failed."
     },
     "overview": {
+      "title": "Overview",
       "subtitle": "Live status, recent sessions, and the event stream.",
       "openChat": "Open chat",
       "totalTokens": "Total tokens",
@@ -816,6 +826,7 @@
       "loadingHealth": "Loading health report",
       "noFindings": "No findings returned.",
       "recoveryRestart": "Recovery requires restart",
+      "openSettings": "Open settings",
       "findingFallback": "Finding {n}",
       "copyCommand": "Copy command",
       "step": "Step",
@@ -905,7 +916,12 @@
       },
       "checkedAgo": "Checked {time}",
       "rerunChecks": "Re-run checks",
-      "environment": "Environment"
+      "copyDiagnostics": "Copy diagnostics JSON",
+      "copiedDiagnostics": "Diagnostics JSON copied",
+      "diagnoseWithAgent": "Diagnose with agent",
+      "diagnosePrompt": "Please troubleshoot this OpenSquilla configuration using the doctor report below; propose the root cause and minimal fix steps; do not run destructive commands.",
+      "environment": "Environment",
+      "latency": "Latency"
     }
   },
   "console": {
@@ -1936,6 +1952,12 @@
       "preparingOutput": "Preparing output",
       "stillWaiting": "Still waiting for model",
       "stillWorking": "Still working — last signal {seconds}s ago"
+    },
+    "stall": {
+      "title": "Response may be stalled",
+      "detail": "No new output for {seconds}s — the model may be stuck.",
+      "keepWaiting": "Keep waiting",
+      "interrupt": "Interrupt turn"
     },
     "msgMeta": {
       "ensembleModels": "Ensemble · {count} models",

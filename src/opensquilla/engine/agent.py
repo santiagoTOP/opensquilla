@@ -1673,6 +1673,37 @@ class Agent:
         if self._turn_call_logger is not None:
             self._turn_call_logger.write(kind, payload)
 
+    def _notify_provider_call_observer(
+        self,
+        *,
+        ttft_ms: int | None,
+        duration_ms: int,
+        ok: bool,
+        failure_kind: str = "",
+    ) -> None:
+        """Report one finished provider call to the optional observer.
+
+        The observer is gateway-injected diagnostics plumbing; its failures
+        are logged at debug level and must never affect the turn.
+        """
+        observer = getattr(self.config, "provider_call_observer", None)
+        if observer is None:
+            return
+        provider_id = self.config.provider_id or str(
+            getattr(self.provider, "provider_name", "") or ""
+        )
+        try:
+            observer(
+                provider_id=provider_id,
+                model=self.config.model_id or "",
+                ttft_ms=ttft_ms,
+                duration_ms=duration_ms,
+                ok=ok,
+                failure_kind=failure_kind,
+            )
+        except Exception as exc:  # noqa: BLE001 - observer must never affect the turn
+            logger.debug("provider_call_observer_failed", error=str(exc))
+
     def _write_context_stage(
         self,
         stage: str,
@@ -4431,6 +4462,22 @@ class Agent:
 
                     _got_done_event = False
                     attempt_user_visible_emitted = False
+                    # Time-to-first-event for this provider call, stamped once
+                    # at the first streamed event (diagnostics only).
+                    first_event_at: float | None = None
+
+                    def _notify_call_outcome(*, ok: bool, failure_kind: str = "") -> None:
+                        self._notify_provider_call_observer(
+                            ttft_ms=(
+                                int((first_event_at - call_started_at) * 1000)
+                                if first_event_at is not None
+                                else None
+                            ),
+                            duration_ms=int((time.monotonic() - call_started_at) * 1000),
+                            ok=ok,
+                            failure_kind=failure_kind,
+                        )
+
                     try:
                         if self._failure_injector is None:
                             raw_stream = self.provider.chat(
@@ -4453,6 +4500,8 @@ class Agent:
                             loop=_loop,
                             total_deadline=_total_deadline,
                         ):
+                            if first_event_at is None:
+                                first_event_at = time.monotonic()
                             if isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
@@ -4731,6 +4780,7 @@ class Agent:
                                     error=raw_ev.error,
                                 )
                     except _IterationStreamTimeoutError:
+                        _notify_call_outcome(ok=False, failure_kind="iteration_timeout")
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
                                 reason=(
@@ -4751,8 +4801,27 @@ class Agent:
                         )
                         yield terminal_error
                         break
+                    except TimeoutError:
+                        # Total-deadline timeout raised by the stream wrapper:
+                        # record the failed call, then propagate unchanged.
+                        _notify_call_outcome(ok=False, failure_kind="total_timeout")
+                        raise
+                    except Exception:
+                        # A provider stream that raises (instead of yielding a
+                        # ProviderErrorEvent) must still enter the stats before
+                        # the exception propagates unchanged.
+                        _notify_call_outcome(ok=False, failure_kind="raised")
+                        raise
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
+                    _notify_call_outcome(
+                        ok=provider_error_for_log is None,
+                        failure_kind=(
+                            str(provider_error_for_log.code or "provider_error")
+                            if provider_error_for_log is not None
+                            else ""
+                        ),
+                    )
                     response_payload = {
                         "call_id": call_id,
                         "iteration": iterations,

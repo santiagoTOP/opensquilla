@@ -163,6 +163,7 @@
               @provider-change="onProviderChange"
               @update-provider-field="updateProviderField"
               @update-llm-timeout="updateLlmTimeout"
+              @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
               @apply-preset="applyProviderPreset"
               @copy="copyCommand"
@@ -277,7 +278,7 @@ import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.v
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
-import { sectionFromRouteParam } from '@/composables/setup/useSettingsSection'
+import { parseProviderHash, sectionFromRouteParam } from '@/composables/setup/useSettingsSection'
 import { useConfirm } from '@/composables/useConfirm'
 import { usePlatform } from '@/platform'
 import '@/styles/settings-forms.css'
@@ -337,6 +338,7 @@ const {
   selectChannelType,
   updateProviderField,
   updateLlmTimeout,
+  updateContextWindow,
   probeProviderConnection,
   updateTierField,
   updateChannelField,
@@ -416,6 +418,9 @@ function sectionLabel(id: string): string {
 
 // Reflect the active section in the URL with replace (not push) so the browser
 // Back button exits Settings in one step rather than walking section history.
+// Only replace when the section actually changes — an unconditional replace on
+// first mount would strip an incoming `#provider-<id>` deep-link hash before
+// applyProviderHash could act on it.
 function selectSection(id: string) {
   userNavigated = true
   setSection(id)
@@ -437,6 +442,39 @@ function applyRouteSection() {
   // /settings/runtime deep link on web) has no rail entry or panel branch; fall
   // back to the default so the dialog never renders an empty body.
   setSection(visibleSections.value.some(s => s.id === resolved) ? resolved : 'provider')
+}
+
+// `#provider-<id>` deep links land on the Provider section with that provider
+// preselected and focus on its first unfilled field. Applied once per hash
+// value so a later manual provider change is never stomped by a stale hash.
+let appliedProviderHash = ''
+
+function applyProviderHash() {
+  const providerId = parseProviderHash(route.hash)
+  if (!providerId || !loaded.value || section.value !== 'provider') return
+  if (appliedProviderHash === route.hash) return
+  const panel = providerPanel.value
+  if (!panel.runtimeProviders.some((p: { providerId: string }) => p.providerId === providerId)) return
+  appliedProviderHash = route.hash
+  if (panel.providerSelected !== providerId) {
+    // Same path as picking the provider in the <select>: select + reset fields.
+    selectProvider(providerId)
+    onProviderChange()
+  }
+  void nextTick(() => focusFirstEmptyProviderInput())
+}
+
+// Focus the first empty required input in the freshly-preselected panel;
+// rendered inputs don't always carry `required`, so fall back to first-empty.
+function focusFirstEmptyProviderInput() {
+  const panel = panelRef.value
+  if (!panel) return
+  const inputs = Array.from(panel.querySelectorAll<HTMLInputElement>(
+    'input.control-input:not([disabled]):not([readonly]), textarea.control-input:not([disabled])',
+  ))
+  const target = inputs.find(input => input.required && !input.value.trim())
+    ?? inputs.find(input => !input.value.trim())
+  target?.focus()
 }
 
 function copyDisplayPath() {
@@ -544,17 +582,23 @@ function onViewportChange(event: MediaQueryListEvent) {
 // loads; the loaded watcher below completes that case.
 watch(routeParam, () => applyRouteSection())
 
+// A provider deep-link hash can arrive (or change) after mount.
+watch(() => route.hash, () => applyProviderHash())
+
 // Whenever the active section changes (rail click, deep link, Back), bring its
 // tab into view on the horizontally-scrolling mobile rail.
 watch(section, () => {
   scrollActiveTabIntoView()
   resetActivePanelScroll()
+  applyProviderHash()
 })
 
 // The auto deep link lands on its readiness-derived section once config is
 // known, unless the user already navigated during the load.
 watch(loaded, (isLoaded) => {
   if (isLoaded && wantsAutoSection.value && !userNavigated) selectInitialSection('auto')
+  // Catalog data is required to validate a provider hash, so (re)try now.
+  if (isLoaded) applyProviderHash()
 })
 
 onMounted(() => {
@@ -565,6 +609,7 @@ onMounted(() => {
   returnTo = typeof from === 'string' && !from.startsWith('/settings') ? from : null
   invokerEl = document.activeElement instanceof HTMLElement ? document.activeElement : null
   applyRouteSection()
+  applyProviderHash()
   scrollActiveTabIntoView()
   document.addEventListener('keydown', onDocumentKeydown)
   mq = window.matchMedia('(max-width: 768px)')

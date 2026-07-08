@@ -131,6 +131,33 @@ def test_catalog_source_labels_per_layer() -> None:
     assert catalog.resolve_context_window_with_source(UNKNOWN_MODEL)[1] == "default"
     # Local runtimes report their own default window — still a default layer.
     assert catalog.resolve_context_window_with_source(UNKNOWN_MODEL, "ollama")[1] == "default"
+    # A positive [models.*] override is its own top layer.
+    catalog.set_user_overrides({CATALOG_MODEL: {"context_window": 55_000}})
+    assert catalog.resolve_context_window_with_source(CATALOG_MODEL) == (55_000, "override")
+
+
+def test_context_window_model_override_reports_config() -> None:
+    # The [models.*] per-model override is operator config; the provenance
+    # vocabulary maps the catalog's "override" label to "config".
+    cfg = _config(llm=LlmProviderConfig(model=CATALOG_MODEL))
+    catalog = _catalog_with_model()
+    catalog.set_user_overrides({CATALOG_MODEL: {"context_window": 55_000}})
+    fields = resolve_effective_llm(cfg, catalog)
+    assert fields["llm.context_window"] == ResolvedField(55_000, "config")
+
+
+def test_context_window_global_config_beats_catalog_reports_config() -> None:
+    cfg = _config(llm=LlmProviderConfig(model=CATALOG_MODEL, context_window_tokens=99_000))
+    fields = resolve_effective_llm(cfg, _catalog_with_model())
+    assert fields["llm.context_window"] == ResolvedField(99_000, "config")
+
+
+def test_context_window_model_override_beats_global_config() -> None:
+    cfg = _config(llm=LlmProviderConfig(model=CATALOG_MODEL, context_window_tokens=99_000))
+    catalog = _catalog_with_model()
+    catalog.set_user_overrides({CATALOG_MODEL: {"context_window": 55_000}})
+    fields = resolve_effective_llm(cfg, catalog)
+    assert fields["llm.context_window"] == ResolvedField(55_000, "config")
 
 
 # --- squilla_router.tiers.* (preset vs config) -------------------------------

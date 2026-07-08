@@ -107,6 +107,28 @@ const connectionPill = computed(() => {
   }
   return null
 })
+
+// Verdict line under the pill: latency, and (when discovery returned live
+// models) the model count plus up to 3 sample ids.
+const latencyText = computed(() => {
+  const ms = props.panel.connection.latencyMs
+  return typeof ms === 'number' && Number.isFinite(ms) ? `${Math.round(ms)}ms` : ''
+})
+
+// Latency shown next to a failure pill (verified latency lives in the verdict line).
+const failureLatencyText = computed(() => {
+  const phase = props.panel.connection.phase
+  return phase === 'key_invalid' || phase === 'unreachable' ? latencyText.value : ''
+})
+
+const verdictModelsText = computed(() => {
+  const connection = props.panel.connection
+  if (connection.phase !== 'verified' || connection.modelSource !== 'live') return ''
+  if (connection.models.length === 0) return ''
+  const joiner = t('setup.provider.verdictSampleJoiner')
+  const samples = connection.models.slice(0, 3).map(model => model.id).join(joiner)
+  return t('setup.provider.verdictModels', { count: connection.models.length, samples })
+})
 </script>
 
 <template>
@@ -206,6 +228,13 @@ const connectionPill = computed(() => {
             :class="connectionPill.tone"
             :title="connectionPill.title || undefined"
           >{{ connectionPill.text }}</strong>
+          <span v-if="failureLatencyText" class="setup-connection__latency">· {{ failureLatencyText }}</span>
+        </div>
+        <div class="setup-connection__verdict" aria-live="polite">
+          <template v-if="panel.connection.phase === 'verified'">
+            <span v-if="latencyText" class="setup-connection__latency">· {{ latencyText }}</span>
+            <span v-if="verdictModelsText" class="setup-connection__verdict-models">· {{ verdictModelsText }}</span>
+          </template>
         </div>
         <span
           v-if="panel.connection.phase === 'verified' && panel.connection.discoverError"
@@ -366,6 +395,30 @@ const connectionPill = computed(() => {
 
 @keyframes setup-connection-spin {
   to { transform: rotate(360deg); }
+}
+
+/* Verdict line under the pill: latency + discovered-model summary. The latency
+   figure is tabular mono so successive probes don't jitter the layout. */
+.setup-connection__verdict {
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  gap: var(--sp-1);
+  justify-content: flex-end;
+}
+
+.setup-connection__latency {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.setup-connection__verdict-models {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .setup-provider-credential__error {
