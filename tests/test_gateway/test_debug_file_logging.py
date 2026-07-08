@@ -8,6 +8,7 @@ import structlog
 
 from opensquilla.gateway.boot import _setup_file_logging
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.observability.cli_logging import configure_cli_structlog
 
 
 def _remove_debug_handlers() -> None:
@@ -186,6 +187,62 @@ def test_structlog_bridge_respects_log_level(tmp_path, monkeypatch) -> None:
         _remove_debug_handlers()
         _remove_console_handlers()
         structlog.configure(**old_config)
+        opensquilla_logger.setLevel(original_level)
+
+
+def test_bridge_overrides_cli_structlog_default(tmp_path, monkeypatch) -> None:
+    """`gateway run` enters via the CLI callback, which installs the CLI
+    structlog default before boot; the bridge must treat that default as
+    overridable so structlog events still reach debug.log."""
+    _remove_debug_handlers()
+    _remove_console_handlers()
+    old_config = structlog.get_config()
+    was_configured = structlog.is_configured()
+    opensquilla_logger = logging.getLogger("opensquilla")
+    original_level = opensquilla_logger.level
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_LOG_LEVEL", "DEBUG")
+    try:
+        configure_cli_structlog()
+        _setup_file_logging(GatewayConfig())
+        structlog.get_logger("opensquilla.test_bridge").info("bridge_over_cli_default_event")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        text = (tmp_path / "debug.log").read_text(encoding="utf-8")
+        assert "bridge_over_cli_default_event" in text
+    finally:
+        _remove_debug_handlers()
+        _remove_console_handlers()
+        if was_configured:
+            structlog.configure(**old_config)
+        else:
+            structlog.reset_defaults()
+        opensquilla_logger.setLevel(original_level)
+
+
+def test_bridge_respects_non_cli_explicit_configuration(tmp_path, monkeypatch) -> None:
+    """An explicit non-CLI-default configuration (e.g. the interactive TUI's)
+    must survive `_setup_file_logging` unchanged."""
+    _remove_debug_handlers()
+    _remove_console_handlers()
+    old_config = structlog.get_config()
+    was_configured = structlog.is_configured()
+    opensquilla_logger = logging.getLogger("opensquilla")
+    original_level = opensquilla_logger.level
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_LOG_LEVEL", "DEBUG")
+    try:
+        sentinel_factory = structlog.ReturnLoggerFactory()
+        structlog.configure(logger_factory=sentinel_factory)
+        _setup_file_logging(GatewayConfig())
+        assert structlog.get_config()["logger_factory"] is sentinel_factory
+    finally:
+        _remove_debug_handlers()
+        _remove_console_handlers()
+        if was_configured:
+            structlog.configure(**old_config)
+        else:
+            structlog.reset_defaults()
         opensquilla_logger.setLevel(original_level)
 
 

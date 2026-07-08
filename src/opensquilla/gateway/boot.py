@@ -1339,14 +1339,34 @@ def _render_structlog_event_for_stdlib(
     return (" ".join(part for part in parts if part),), kwargs
 
 
+def _structlog_explicitly_configured() -> bool:
+    """True when structlog carries an explicit configuration the bridge must respect.
+
+    The CLI entry callback installs a stderr/WARNING structlog default for
+    every command (``observability/cli_logging.py``) — including ``gateway
+    run``, which reaches this bridge afterwards. That default is overridable:
+    treating it as explicit would permanently disable the debug.log bridge for
+    foreground gateway runs. Any *other* configuration (e.g. the interactive
+    TUI's) is left untouched, matching the previous ``is_configured`` guard.
+    """
+    if not structlog.is_configured():
+        return False
+    try:
+        from opensquilla.observability.cli_logging import is_cli_default_active
+    except Exception:  # noqa: BLE001 - fall back to the historical guard
+        return True
+    return not is_cli_default_active()
+
+
 def _bridge_structlog_to_stdlib() -> None:
     """Route structlog events through stdlib logging so they reach debug.log.
 
     Level filtering is delegated to stdlib (the ``opensquilla`` logger level is
-    managed by ``_setup_file_logging``); the ``is_configured`` guard leaves any
-    explicit prior configuration (e.g. the interactive TUI's) untouched.
+    managed by ``_setup_file_logging``); the explicit-configuration guard
+    leaves any prior non-CLI-default configuration (e.g. the interactive
+    TUI's) untouched while overriding the CLI's stderr/WARNING default.
     """
-    if structlog.is_configured():
+    if _structlog_explicitly_configured():
         return
     structlog.configure(
         processors=[
