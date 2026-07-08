@@ -591,6 +591,25 @@ def test_ci_change_classifier_runs_windows_full_for_provider_onboarding_risk(
     )
 
 
+def test_ci_change_classifier_runs_windows_full_for_gateway_functional_e2e(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "tests/functional/test_gateway_non_image_attachment_materialization_e2e.py",
+            "tests/functional/test_gateway_attachment_history_e2e.py",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        test_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+    )
+
+
 def test_ci_change_classifier_tracks_desktop_changes(tmp_path: Path) -> None:
     outputs = _classify_changed_files(
         tmp_path,

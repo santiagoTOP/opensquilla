@@ -138,6 +138,10 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       mark_test_changed
       mark_platform_sensitive_changed
       ;;
+    tests/functional/test_gateway_*_e2e.py)
+      mark_test_changed
+      mark_platform_sensitive_changed
+      ;;
     tests/*)
       mark_test_changed
       ;;
