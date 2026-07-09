@@ -17,10 +17,12 @@ class FakeMCPClient(MCPClient):
         tools: list[MCPToolDef] | None = None,
         *,
         fail_list: bool = False,
+        call_result: MCPToolResult | None = None,
     ) -> None:
         super().__init__(config)
         self.tools = tools or []
         self.fail_list = fail_list
+        self.call_result = call_result
         self.connected = False
         self.closed = False
 
@@ -36,6 +38,8 @@ class FakeMCPClient(MCPClient):
         return self.tools
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
+        if self.call_result is not None:
+            return self.call_result
         return MCPToolResult(content=f"{name}:{arguments}")
 
 
@@ -96,3 +100,28 @@ async def test_failed_mcp_discovery_closes_client_without_leaking(
 
     assert client.closed is True
     assert discovery.active_clients_snapshot() == ()
+
+
+@pytest.mark.asyncio
+async def test_registered_handler_surfaces_client_error_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.mcp import discovery
+    from opensquilla.tool_boundary import ToolCall
+    from opensquilla.tools.dispatch import build_tool_handler
+
+    config = MCPServerConfig(name="docs", transport="stdio", command="mock-mcp")
+    client = FakeMCPClient(
+        config,
+        tools=[MCPToolDef(name="lookup", description="Lookup docs", input_schema={})],
+        call_result=MCPToolResult(content="invalid params", is_error=True),
+    )
+    monkeypatch.setattr(discovery, "create_client", lambda _config: client)
+
+    registry = ToolRegistry()
+    await discovery.discover_and_register(config, registry)
+    handler = build_tool_handler(registry)
+    result = await handler(ToolCall(tool_use_id="tu1", tool_name="mcp_lookup", arguments={}))
+
+    assert result.is_error is True
+    assert "invalid params" in result.content

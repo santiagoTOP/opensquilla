@@ -987,6 +987,21 @@ async def run_dag(
                     deps.discard(step_id)
                     if aliased_failed is not None:
                         deps.discard(aliased_failed)
+                # A step that SUCCEEDED never fires its ``on_failure``
+                # substitute, so that substitute stays parked in
+                # ``substitute_only`` forever. Any downstream step that
+                # declared ``depends_on`` against the substitute would then
+                # block permanently and be silently dropped while the run
+                # still reported ok. Resolve the un-fired substitute as
+                # skipped so those dependents unblock.
+                if step_id not in _recovered_failed_step_ids:
+                    completed_step = steps_by_id.get(step_id)
+                    substitute_id = getattr(completed_step, "on_failure", None)
+                    if substitute_id and substitute_id in substitute_only:
+                        substitute_only.discard(substitute_id)
+                        _skipped_step_ids.add(substitute_id)
+                        for deps in pending_deps.values():
+                            deps.discard(substitute_id)
                 _spawn_ready()
                 continue
             if isinstance(item, _FailoverTriggered):

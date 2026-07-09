@@ -69,17 +69,25 @@ def _render_skill_md(
     content: str,
     triggers: list[str] | None = None,
 ) -> str:
-    """Render a SKILL.md file from parts."""
+    """Render a SKILL.md file from parts.
+
+    Frontmatter is serialized with the YAML library rather than hand-formatted,
+    so punctuation the loader parses as YAML structure (``:``, ``#``, ``[``,
+    ``{``, leading quotes, ...) is quoted correctly and round-trips through
+    ``skills.loader._parse_frontmatter``. Hand-concatenating unquoted scalars
+    silently corrupted or destroyed skills whose description/trigger contained
+    such punctuation.
+    """
+    import yaml
+
     safe_desc = _sanitize_yaml_value(description)
-    lines = ["---", f"name: {name}", f"description: {safe_desc}"]
+    fm: dict[str, Any] = {"name": name, "description": safe_desc}
     if triggers:
-        lines.append("triggers:")
-        for t in triggers:
-            lines.append(f"  - {_sanitize_yaml_value(t)}")
-    lines.append("---")
-    lines.append("")
-    lines.append(content)
-    return "\n".join(lines)
+        fm["triggers"] = [_sanitize_yaml_value(t) for t in triggers]
+    frontmatter = yaml.safe_dump(
+        fm, sort_keys=False, allow_unicode=True, width=100000
+    ).strip()
+    return f"---\n{frontmatter}\n---\n\n{content}"
 
 
 def _cap_output(value: bytes | str, limit: int = _INSTALL_OUTPUT_LIMIT) -> str:

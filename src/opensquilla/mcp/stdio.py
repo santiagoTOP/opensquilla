@@ -7,13 +7,23 @@ import json
 import os
 from typing import Any, cast
 
+import structlog
+
 from opensquilla import __version__
 from opensquilla.mcp.client import MCPClient
 from opensquilla.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
 
+log = structlog.get_logger(__name__)
+
 
 class MCPStdioClient(MCPClient):
-    """MCP client using stdio transport (subprocess + Content-Length framing)."""
+    """MCP client using the stdio transport.
+
+    The MCP stdio transport (protocolVersion 2024-11-05) frames each JSON-RPC
+    message as one line of UTF-8, LF-terminated, with no embedded newlines and
+    no headers. (The earlier LSP-style ``Content-Length`` framing this client
+    used is a different protocol and no conformant MCP server answers it.)
+    """
 
     _CLOSE_TIMEOUT_SECONDS = 2.0
 
@@ -21,36 +31,17 @@ class MCPStdioClient(MCPClient):
         super().__init__(config)
         self._process: asyncio.subprocess.Process | None = None
         self._request_id = 0
+        self._request_lock = asyncio.Lock()
 
     @staticmethod
     def _encode_request(request: dict[str, Any]) -> bytes:
-        """Encode a JSON-RPC request with Content-Length framing."""
-        body = json.dumps(request)
-        header = f"Content-Length: {len(body)}\r\n\r\n"
-        return header.encode() + body.encode()
+        """Encode a JSON-RPC message as one LF-terminated line.
 
-    @staticmethod
-    def _decode_response(data: bytes) -> dict[str, Any]:
-        """Decode a Content-Length framed response."""
-        if b"\r\n\r\n" not in data:
-            raise ValueError("Missing header/body separator in response")
-
-        header_part, body = data.split(b"\r\n\r\n", 1)
-        headers = header_part.decode()
-
-        content_length: int | None = None
-        for line in headers.splitlines():
-            if line.lower().startswith("content-length:"):
-                content_length = int(line.split(":", 1)[1].strip())
-                break
-
-        if content_length is None:
-            raise ValueError("Missing Content-Length header")
-
-        if len(body) < content_length:
-            raise ValueError(f"Truncated body: expected {content_length} bytes, got {len(body)}")
-
-        return cast(dict[str, Any], json.loads(body[:content_length].decode()))
+        ``json.dumps`` with default separators never emits a literal newline, so
+        the message is guaranteed to occupy exactly one line as the transport
+        requires.
+        """
+        return (json.dumps(request) + "\n").encode()
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -108,21 +99,25 @@ class MCPStdioClient(MCPClient):
     async def _send_request(
         self, method: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Send a JSON-RPC request and read the response."""
+        """Send a JSON-RPC request and read the matching response."""
         assert self._process is not None
         assert self._process.stdin is not None
         assert self._process.stdout is not None
 
-        req_id = self._next_id()
-        request: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
-        if params is not None:
-            request["params"] = params
+        # One coroutine must own both the write and its matching read. Without
+        # this lock, concurrent callers can each consume and discard the other
+        # request's response while waiting for their own id.
+        async with self._request_lock:
+            req_id = self._next_id()
+            request: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+            if params is not None:
+                request["params"] = params
 
-        encoded = self._encode_request(request)
-        self._process.stdin.write(encoded)
-        await self._process.stdin.drain()
+            encoded = self._encode_request(request)
+            self._process.stdin.write(encoded)
+            await self._process.stdin.drain()
 
-        return await self._read_response()
+            return await self._read_response(req_id)
 
     async def _send_notification(self, method: str) -> None:
         """Send a JSON-RPC notification (no response expected)."""
@@ -134,31 +129,39 @@ class MCPStdioClient(MCPClient):
         self._process.stdin.write(encoded)
         await self._process.stdin.drain()
 
-    async def _read_response(self) -> dict[str, Any]:
-        """Read and decode a Content-Length framed response from stdout."""
+    async def _read_response(self, expected_id: int) -> dict[str, Any]:
+        """Read newline-delimited JSON-RPC messages until the response arrives.
+
+        Server-initiated notifications and requests (messages with no ``id``, or
+        with a ``method`` key) are skipped so they cannot be mistaken for the
+        response to ``expected_id``.
+        """
         assert self._process is not None
         assert self._process.stdout is not None
 
-        # Read header lines until blank line
-        header_lines: list[str] = []
         while True:
             line = await self._process.stdout.readline()
-            decoded = line.decode().rstrip("\r\n")
-            if decoded == "":
-                break
-            header_lines.append(decoded)
-
-        content_length: int | None = None
-        for h in header_lines:
-            if h.lower().startswith("content-length:"):
-                content_length = int(h.split(":", 1)[1].strip())
-                break
-
-        if content_length is None:
-            raise ValueError("Missing Content-Length header in response")
-
-        body = await self._process.stdout.read(content_length)
-        return cast(dict[str, Any], json.loads(body.decode()))
+            if not line:
+                raise ConnectionError("MCP stdio server closed the connection")
+            text = line.decode().strip()
+            if not text:
+                continue
+            try:
+                message = json.loads(text)
+            except json.JSONDecodeError:
+                log.debug("mcp.stdio.non_json_line", line=text[:200])
+                continue
+            if not isinstance(message, dict):
+                continue
+            # Skip server-initiated notifications/requests (no id, or a method).
+            if "method" in message and "id" not in message:
+                log.debug("mcp.stdio.notification", method=message.get("method"))
+                continue
+            if message.get("id") != expected_id:
+                # A response to a different id (or a server request). Ignore it
+                # rather than return it for the wrong call.
+                continue
+            return cast(dict[str, Any], message)
 
     async def list_tools(self) -> list[MCPToolDef]:
         """List tools from the MCP server."""
@@ -186,4 +189,6 @@ class MCPStdioClient(MCPClient):
         result = response.get("result", {})
         content_list = result.get("content", [])
         text = "\n".join(c.get("text", "") for c in content_list if c.get("type") == "text")
-        return MCPToolResult(content=text)
+        # The MCP result-level ``isError`` flag signals a tool-execution failure;
+        # propagate it so the agent sees the error instead of a plain result.
+        return MCPToolResult(content=text, is_error=bool(result.get("isError", False)))

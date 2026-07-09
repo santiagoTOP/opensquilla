@@ -321,3 +321,55 @@ async def test_no_failover_when_step_succeeds() -> None:
     assert final.step_outputs.get("A") == "A-output"
     # A_fallback must not appear in outputs (it was never spawned).
     assert "A_fallback" not in final.step_outputs
+
+
+@pytest.mark.asyncio
+async def test_step_depending_on_unfired_substitute_still_runs() -> None:
+    """If A succeeds, a step that depends_on A_fallback must not be dropped.
+
+    The never-fired substitute resolves as skipped so its dependents unblock
+    and run instead of being silently omitted from an ok result.
+    """
+
+    spec = _meta_spec(
+        [
+            {"id": "A", "skill": "skill_a", "on_failure": "A_fallback"},
+            {"id": "A_fallback", "skill": "skill_a_fb"},
+            {"id": "C", "skill": "skill_c", "depends_on": ["A_fallback"]},
+        ],
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+
+    async def runner(system_prompt: str, _u: str) -> AsyncIterator[AgentEvent]:
+        if "SKILL_A_FB" in system_prompt:
+            yield TextDeltaEvent(text="from-fallback")
+            yield DoneEvent(text="")
+            return
+        if "SKILL_A" in system_prompt:
+            yield TextDeltaEvent(text="A-output")
+            yield DoneEvent(text="")
+            return
+        if "SKILL_C" in system_prompt:
+            yield TextDeltaEvent(text="C-output")
+            yield DoneEvent(text="")
+            return
+        yield DoneEvent(text="")
+
+    orch = MetaOrchestrator(
+        agent_runner=runner,
+        skill_loader=_FakeLoader(
+            [_skill("skill_a"), _skill("skill_a_fb"), _skill("skill_c")],
+        ),
+    )
+
+    final: MetaResult | None = None
+    async for ev in orch.iter_events(MetaMatch(plan=plan, inputs={})):
+        if isinstance(ev, MetaResult):
+            final = ev
+
+    assert final is not None
+    assert final.ok is True
+    assert final.step_outputs.get("A") == "A-output"
+    assert final.step_outputs.get("C") == "C-output"
+    assert "A_fallback" not in final.step_outputs

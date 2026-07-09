@@ -1,11 +1,47 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
+from pathlib import Path
 
 import pytest
 
 from opensquilla.mcp.stdio import MCPStdioClient
 from opensquilla.mcp.types import MCPServerConfig
+
+_SDK_SERVER_SCRIPT = str(Path(__file__).parent / "fixtures" / "fastmcp_server.py")
+
+# A stdio MCP server (newline-delimited JSON-RPC) exposing one "search" tool
+# whose call response carries the MCP result-level ``isError`` flag.
+_ERROR_SERVER_SCRIPT = r"""
+import json, sys
+
+def send(payload):
+    sys.stdout.buffer.write((json.dumps(payload) + "\n").encode())
+    sys.stdout.buffer.flush()
+
+while True:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    msg = json.loads(line.decode())
+    msg_id = msg.get("id")
+    if msg_id is None:
+        continue  # notification
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"protocolVersion": "2024-11-05", "capabilities": {},
+                         "serverInfo": {"name": "fake", "version": "0.0.1"}}})
+    elif method == "tools/call":
+        send({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"isError": True,
+                         "content": [{"type": "text",
+                                      "text": "Error: upstream API rejected the query"}]}})
+    else:
+        send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+"""
 
 
 class _FakeProcess:
@@ -38,6 +74,70 @@ def _client_with_process(process: _FakeProcess) -> MCPStdioClient:
     return client
 
 
+class _RecordingStdin:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.changed = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+        self.changed.set()
+
+    async def drain(self) -> None:
+        return None
+
+    async def wait_for_count(self, count: int) -> None:
+        while len(self.writes) < count:
+            self.changed.clear()
+            await self.changed.wait()
+
+
+class _QueuedStdout:
+    def __init__(self) -> None:
+        self.lines: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def readline(self) -> bytes:
+        return await self.lines.get()
+
+    def respond(self, request_id: int) -> None:
+        self.lines.put_nowait(
+            (json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {}}) + "\n").encode()
+        )
+
+
+class _ConcurrentProcess:
+    def __init__(self) -> None:
+        self.stdin = _RecordingStdin()
+        self.stdout = _QueuedStdout()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_are_serialized_to_preserve_responses() -> None:
+    process = _ConcurrentProcess()
+    client = _client_with_process(process)  # type: ignore[arg-type]
+
+    first = asyncio.create_task(client._send_request("first"))
+    second: asyncio.Task[dict] | None = None
+    try:
+        await process.stdin.wait_for_count(1)
+        second = asyncio.create_task(client._send_request("second"))
+        await asyncio.sleep(0)
+
+        assert len(process.stdin.writes) == 1
+
+        process.stdout.respond(1)
+        await first
+        await process.stdin.wait_for_count(2)
+        process.stdout.respond(2)
+        await second
+    finally:
+        first.cancel()
+        if second is not None:
+            second.cancel()
+        pending = [first] if second is None else [first, second]
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_close_waits_for_terminated_stdio_process() -> None:
     process = _FakeProcess(exits_on_terminate=True)
@@ -62,3 +162,51 @@ async def test_close_kills_stdio_process_when_terminate_times_out(
     assert process.terminated is True
     assert process.killed is True
     assert process.wait_calls == 2
+
+
+def test_encode_request_is_newline_delimited_json() -> None:
+    encoded = MCPStdioClient._encode_request({"jsonrpc": "2.0", "id": 1, "method": "x"})
+
+    assert not encoded.startswith(b"Content-Length: ")
+    assert encoded.endswith(b"\n")
+    assert b"\n" not in encoded[:-1]
+
+
+@pytest.mark.asyncio
+async def test_connect_and_list_tools_against_sdk_stdio_server() -> None:
+    pytest.importorskip("mcp")
+    client = MCPStdioClient(
+        MCPServerConfig(
+            name="demo",
+            transport="stdio",
+            command=sys.executable,
+            args=[_SDK_SERVER_SCRIPT],
+        )
+    )
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30.0)
+        tools = await asyncio.wait_for(client.list_tools(), timeout=30.0)
+    finally:
+        await client.close()
+
+    assert [t.name for t in tools] == ["ping"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_honors_result_level_is_error_flag() -> None:
+    client = MCPStdioClient(
+        MCPServerConfig(
+            name="demo",
+            transport="stdio",
+            command=sys.executable,
+            args=["-c", _ERROR_SERVER_SCRIPT],
+        )
+    )
+    try:
+        await client.connect()
+        result = await client.call_tool("search", {"q": "x"})
+    finally:
+        await client.close()
+
+    assert "upstream API rejected" in result.content
+    assert result.is_error is True
