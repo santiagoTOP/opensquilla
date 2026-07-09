@@ -3639,6 +3639,12 @@ class TurnRunner:
         """Clone the selector and resolve provider (no shared state mutation)."""
         if self._provider_selector is None:
             return None, None
+        # A gateway can boot with a selector that has no usable primary yet
+        # (no API key configured); treat it like "no provider" so the turn
+        # fails with the same clean no_provider error instead of raising.
+        # getattr default True keeps duck-typed test selectors working.
+        if not getattr(self._provider_selector, "is_configured", True):
+            return None, None
         cloned = self._provider_selector.clone()
         return cloned.resolve(), cloned
 
