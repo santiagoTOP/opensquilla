@@ -1159,3 +1159,245 @@ def test_desktop_macos_prerelease_update_resolver_wires_generic_feed() -> None:
     assert package_json["scripts"]["test:update-resolver"] == (
         "npm run build && node scripts/test-update-resolver.mjs"
     )
+
+
+def test_gateway_spawn_state_dir_is_the_desktop_home_root() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function loadControlUi",
+    )
+
+    # OPENSQUILLA_STATE_DIR names the OpenSquilla HOME ROOT on the Python side
+    # (paths.default_opensquilla_home); runtime state lives in its state/
+    # subdir. The gateway child must receive desktopHome(), not the state
+    # subdir, or home-derived data (managed skills, workspace/MEMORY.md,
+    # session-archive, .env) nests one level too deep — the pre-0.5.x layout
+    # bug that relocateLegacyDesktopStateLayout() heals.
+    assert "OPENSQUILLA_STATE_DIR: desktopHome()," in start
+    assert "OPENSQUILLA_STATE_DIR: desktopStateDir()" not in main_ts
+    # The generated TOML keeps pinning the runtime state dir to <home>/state so
+    # database paths (sessions.db, scheduler.db, agents/) never move.
+    assert "state_dir = ${tomlString(desktopStateDir())}" in main_ts
+
+
+def test_legacy_desktop_layout_relocation_runs_before_gateway_spawn() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function loadControlUi",
+    )
+    relocation = _section(
+        main_ts,
+        "function relocateLegacyDesktopStateLayout",
+        "function bootPagePath",
+    )
+
+    # The one-time relocation must run inside startGateway before onboarding
+    # and before the child spawn, while no owned gateway is running.
+    relocate_index = start.index("relocateLegacyDesktopStateLayout()")
+    assert relocate_index < start.index("await runOnboarding()")
+    assert relocate_index < start.index("const child = spawn(")
+
+    # It moves exactly the home-derived legacy entries and flattens the nested
+    # state/state tree; the config-pinned databases are never in its move list.
+    for entry in (
+        "'skills'",
+        "'skills-taps.json'",
+        "'skills-lock.json'",
+        "'workspace'",
+        "'session-archive'",
+        "'router'",
+        "'.env'",
+    ):
+        assert entry in main_ts
+    assert "const nested = join(state, 'state')" in relocation
+    for forbidden in ("'sessions.db'", "'scheduler.db'", "'agents'"):
+        assert forbidden not in relocation
+
+    # Idempotency and failure semantics: marker short-circuits reruns, and a
+    # failed move defers (no marker) instead of stranding half the layout.
+    # rindex: the first marker write is the fresh-profile early stamp; the
+    # failure gate must precede the final (post-move) marker write.
+    assert "const DESKTOP_LAYOUT_MARKER = 'desktop-layout-v2.json'" in main_ts
+    assert "if (existsSync(markerPath)) return" in relocation
+    assert relocation.index("if (failed)") < relocation.rindex("writeFileSync(markerPath")
+    # Collisions are parked, never merged or overwritten.
+    assert ".pre-relocation" in relocation
+
+
+def test_onboarding_migration_ipc_is_guarded_and_prefills_from_imported_config() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preview = _section(
+        main_ts,
+        "ipcMain.handle('desktop:onboarding:migrate:preview'",
+        "ipcMain.handle('desktop:onboarding:migrate:apply'",
+    )
+    apply_handler = _section(
+        main_ts,
+        "ipcMain.handle('desktop:onboarding:migrate:apply'",
+        "// Set once the Windows graceful-drain",
+    )
+
+    # Same trust boundary as desktop:onboarding:save: the preload bridge is also
+    # attached to the Control UI window, so both handlers must refuse outside an
+    # awaiting onboarding flow, and must take source path/kind from the main
+    # process's own detection rather than the renderer payload.
+    for handler in (preview, apply_handler):
+        assert "if (!resolveOnboarding) return { ok: false" in handler
+        assert "onboardingMigrationCandidate" in handler
+        assert "'--source', candidate.path, '--kind', candidate.kind" in handler
+        assert "migrateSummaryJson([" in handler
+    assert "'--apply'" not in preview
+    assert "'--apply'," in apply_handler
+    assert "readMigratedProviderPrefill()" in apply_handler
+    assert "prefill" in apply_handler
+
+    # Detection happens on the no-credential path only, before the onboarding
+    # window is created, and the result is JSON-injected into the page.
+    onboarding = _section(main_ts, "async function runOnboarding", "async function pathExists")
+    assert "onboardingMigrationCandidate = detectLegacyImportCandidate()" in onboarding
+    assert onboarding.index("detectLegacyImportCandidate()") < onboarding.index(
+        "new BrowserWindow"
+    )
+    assert "onboardingHtml(onboardingMigrationCandidate)" in onboarding
+
+
+def test_run_migrate_cli_targets_desktop_home_via_bundled_cli() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    migrate = _section(
+        main_ts,
+        "async function runMigrateCli",
+        "async function migrateSummaryJson",
+    )
+
+    assert "'migrate', 'opensquilla'" in migrate
+    assert "runtime.args.slice(0, -2)" in migrate
+    # OPENSQUILLA_STATE_DIR names the OpenSquilla HOME ROOT (the migrator's
+    # import target) and must match the gateway spawn: desktopHome(), never the
+    # state subdir.
+    assert "OPENSQUILLA_STATE_DIR: desktopHome()," in migrate
+    assert "OPENSQUILLA_GATEWAY_CONFIG_PATH: desktopConfigPath()," in migrate
+    assert "OPENSQUILLA_INSTALL_METHOD: 'desktop'," in migrate
+    for env in ("PYTHONUNBUFFERED: '1'", "PYTHONUTF8: '1'", "PYTHONIOENCODING: 'utf-8:replace'"):
+        assert env in migrate
+
+    summary_json = _section(
+        main_ts,
+        "async function migrateSummaryJson",
+        "type DesktopMigrationPhase",
+    )
+    assert "[...extraArgs, '--json']" in summary_json
+
+
+def test_desktop_migration_run_quiesces_then_restarts_without_forcing_onboarding() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    summary = _section(
+        main_ts,
+        "ipcMain.handle('desktop:migration:summary'",
+        "ipcMain.handle('desktop:migration:run'",
+    )
+    run = _section(
+        main_ts,
+        "ipcMain.handle('desktop:migration:run'",
+        "ipcMain.handle('desktop:boot:state'",
+    )
+
+    # The dry-run summary is read-only and must not touch the running gateway.
+    assert "detectLegacyImportCandidate()" in summary
+    assert "{ ok: true, candidate: null, report: null }" in summary
+    assert "stopGateway" not in summary
+
+    # The apply path quiesces the owned gateway BEFORE the CLI runs, refuses an
+    # unmanaged gateway that still serves the profile, then restarts via the
+    # boot splash — without forcing onboarding on the next startup.
+    assert "stopGateway()" in run
+    assert "await waitForGatewayProcessExit(child)" in run
+    assert run.index("stopGateway()") < run.index("await runMigrateCli(")
+    assert "A gateway is still serving this profile" in run
+    assert run.index("A gateway is still serving this profile") < run.index(
+        "await runMigrateCli("
+    )
+    assert "'--apply'" in run
+    assert "'--overwrite'" in run
+    assert "'--json'" in run
+    assert "forceOnboardingOnNextStartup" not in run
+    assert "bootError = null" in run
+    assert "loadFile(bootPagePath())" in run
+    assert "void openOrResumeDesktopApp()" in run
+    # The restart happens after the CLI finished, regardless of the outcome.
+    assert run.index("await runMigrateCli(") < run.index("loadFile(bootPagePath())")
+
+
+def test_migration_locale_keys_exist_in_all_six_locale_blocks() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    desktop_catalog = _section(
+        main_ts,
+        "const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {",
+        "// Runtime string bag",
+    )
+    script_catalog = _section(
+        main_ts,
+        "const ONBOARDING_SCRIPT_MESSAGES",
+        "function desktopT",
+    )
+
+    desktop_keys = [
+        "migration.nav.title",
+        "migration.nav.sub",
+        "migration.step.badge",
+        "migration.step.heading",
+        "migration.step.subtitle",
+        "migration.step.sourceLabel",
+        "migration.step.preview",
+        "migration.step.import",
+        "migration.step.skip",
+    ]
+    for key in desktop_keys:
+        assert desktop_catalog.count(f"'{key}':") == 6, key
+
+    script_keys = [
+        "migrationPreviewRunning",
+        "migrationApplyRunning",
+        "migrationItems",
+        "migrationPausedJobs",
+        "migrationDisk",
+        "migrationNotesLabel",
+        "migrationPreviewFailed",
+        "migrationApplyFailed",
+        "migrationDone",
+    ]
+    for key in script_keys:
+        assert script_catalog.count(f"{key}:") == 6, key
+
+
+def test_onboarding_route_prepends_migration_step_only_when_detected() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
+    route = _section(html, "function routeSteps()", "function routePosition")
+
+    # The detection result is JSON-injected like the message bags; the migration
+    # step (screen 5) leads every route only when a legacy home was detected.
+    assert "detection: LegacyImportCandidate | null = null" in html
+    assert "const migrationCandidate = ${JSON.stringify(detection)};" in html
+    assert "return migrationCandidate ? [5, ...base] : base;" in route
+    assert 'data-screen="5"' in html
+    assert 'data-step-label="5"' in html
+    assert "let step = ${detection ? 5 : 0};" in html
+
+
+def test_migration_preload_bridge_and_progress_channel() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+
+    assert "'desktop:migration:summary'" in preload
+    assert "'desktop:migration:run'" in preload
+    assert "'desktop:onboarding:migrate:preview'" in preload
+    assert "'desktop:onboarding:migrate:apply'" in preload
+    assert "onMigrationProgress" in preload
+    assert "'desktop:migration:progress'" in preload
+
+    assert "function publishDesktopMigrationProgress" in main_ts
+    assert "webContents.send('desktop:migration:progress', payload)" in main_ts
