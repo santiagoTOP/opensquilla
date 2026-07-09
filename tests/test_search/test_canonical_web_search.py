@@ -850,6 +850,52 @@ async def test_canonical_web_search_limits_root_domain_spam_without_include_filt
     assert [result["rank"] for result in payload["results"]] == [1, 2, 3, 4]
 
 
+class MultiLabelSuffixProvider:
+    name = "tavily"
+
+    async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        sites = (
+            ("Site One", "https://www.one.co.uk/news/1"),
+            ("Site Two", "https://www.two.co.uk/politics/2"),
+            ("Site Three", "https://www.three.co.uk/product/3"),
+            ("Site Four", "https://www.four.co.uk/content/4"),
+            ("Site Five", "https://news.five.co.uk/story/5"),
+        )
+        return [
+            SearchResult(
+                title=title,
+                url=url,
+                snippet=f"{title} coverage of the topic.",
+                provider="tavily",
+                source="tavily",
+                content=f"{title} full article body long enough to be an excerpt.",
+            )
+            for title, url in sites
+        ][:max_results]
+
+
+def test_root_domain_returns_registrable_domain_not_public_suffix() -> None:
+    roots = {
+        canonical_module._root_domain("www.one.co.uk"),
+        canonical_module._root_domain("www.two.co.uk"),
+        canonical_module._root_domain("www.three.co.uk"),
+    }
+    assert "co.uk" not in roots
+    assert len(roots) == 3
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_spam_limit_keeps_distinct_multi_label_suffix_sites() -> None:
+    payload = await run_canonical_web_search(
+        SearchOptions(query="uk politics news", max_results=5, fetch_top_k=0),
+        provider_factory=lambda name: MultiLabelSuffixProvider(),
+    )
+
+    assert payload["ok"] is True
+    assert len(payload["results"]) == 5
+    assert payload["diagnostics"]["domain_limited_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_canonical_web_search_preserves_include_domain_depth_without_spam_limit() -> None:
     canonical_module.clear_canonical_web_search_cache_for_tests()

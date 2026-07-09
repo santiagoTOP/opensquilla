@@ -1925,6 +1925,11 @@ def make_llm_chat_from_provider(
                         input_tokens=event.input_tokens,
                         output_tokens=event.output_tokens,
                         model_id=event.model or base_config.model_id or "",
+                        provider=(
+                            getattr(base_config, "provider_id", "")
+                            or getattr(provider, "provider_name", "")
+                            or ""
+                        ),
                         cache_read_tokens=event.cached_tokens,
                         cache_write_tokens=event.cache_write_tokens,
                         billed_cost=event.billed_cost,

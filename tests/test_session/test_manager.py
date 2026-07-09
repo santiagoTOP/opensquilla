@@ -2,7 +2,9 @@
 
 import contextlib
 import json
+import os
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,7 @@ from opensquilla.session.models import (
     SessionSummary,
     TranscriptEntry,
 )
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 
 @pytest_asyncio.fixture
@@ -161,6 +163,59 @@ async def test_apply_intent_reset_same_key_rotates_identity_and_clears_state(
     assert archived["session_id"] == old_session_id
     assert archived["transcript_entries"][0]["content"] == "hello"
     assert archived["summaries"][0]["summary_text"] == "old summary"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics only")
+async def test_reset_archive_is_owner_only(manager, tmp_path, monkeypatch):
+    archive_root = tmp_path / "session-archive"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_root))
+    old_umask = os.umask(0o022)
+    try:
+        await manager.create("agent:main:main")
+        await manager.append_message("agent:main:main", "user", "hello")
+
+        _, rotated = await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+        assert rotated is True
+    finally:
+        os.umask(old_umask)
+
+    archives = list(archive_root.glob("*.json"))
+    assert len(archives) == 1
+    # The archive holds the full raw transcript, so it must match the
+    # sessions.db hardening (0600 file inside a 0700 directory).
+    assert stat.S_IMODE(archive_root.stat().st_mode) & 0o077 == 0
+    assert stat.S_IMODE(archives[0].stat().st_mode) & 0o077 == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_same_key_fences_appends_that_read_the_old_epoch(
+    manager, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    node = await manager.create("agent:main:main")
+    pre_epoch = await manager._storage.get_epoch("agent:main:main")
+
+    applied, rotated = await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+
+    assert rotated is True
+    # The rotation itself bumps the epoch, so a writer holding the pre-reset
+    # node cannot land its entry (or roll back the reset via a stale upsert).
+    assert await manager._storage.get_epoch("agent:main:main") > pre_epoch
+    with pytest.raises(StaleEpochError):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key="agent:main:main",
+                role="user",
+                content="stale in-flight message",
+            ),
+            expected_epoch=pre_epoch,
+        )
+    row = await manager._storage.get_session("agent:main:main")
+    assert row is not None
+    assert row.session_id == applied.session_id
+    assert [e.content for e in await manager.get_transcript("agent:main:main")] == []
 
 
 @pytest.mark.asyncio

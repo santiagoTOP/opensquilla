@@ -58,7 +58,12 @@ _UNSAFE_FILENAME_RE = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]+')
 _SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$")
 _ARTIFACT_MARKER_RE = re.compile(
-    r"(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*",
+    # Anchor on the marker's guaranteed ` (mime)]` tail rather than stopping at
+    # the first ']' — a name may legitimately contain ']'. Do NOT consume
+    # surrounding whitespace (that glued adjacent words/lines together);
+    # strip_artifact_markers_from_text collapses residual spacing afterwards.
+    r"\[generated artifact omitted:\s*[^\n]+? "
+    r"\((?:[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+|artifact)\)\]",
     re.IGNORECASE,
 )
 _PUBLIC_ARTIFACT_FIELDS = (

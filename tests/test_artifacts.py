@@ -16,7 +16,9 @@ from opensquilla.artifacts import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStore,
+    artifact_marker,
     artifact_payload,
+    strip_artifact_markers_from_text,
 )
 from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
@@ -965,3 +967,25 @@ def test_copy_session_artifacts_skips_artifact_with_missing_material(tmp_path: P
     assert child_path.read_bytes() == b"good bytes"
     with pytest.raises(ArtifactNotFoundError):
         store.resolve_for_download(bad.id, session_id="child-1")
+
+
+def test_strip_artifact_markers_preserves_surrounding_whitespace() -> None:
+    marker = "[generated artifact omitted: report.html (text/html)]"
+
+    assert strip_artifact_markers_from_text(f"line1\n{marker}\nline2") in (
+        "line1\nline2",
+        "line1\n\nline2",
+    )
+    assert (
+        strip_artifact_markers_from_text(f"Here is the summary. {marker} Let me know.")
+        == "Here is the summary. Let me know."
+    )
+
+
+def test_strip_artifact_markers_handles_bracket_in_name() -> None:
+    marker = artifact_marker({"name": "weird].html", "mime": "text/html"})
+    assert marker == "[generated artifact omitted: weird].html (text/html)]"
+
+    cleaned = strip_artifact_markers_from_text(f"Done!\n{marker}\nAnything else?")
+    assert "]" not in cleaned
+    assert ".html" not in cleaned

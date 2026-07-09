@@ -96,6 +96,36 @@ def test_usage_status_tracker_row_source_matches_breakdown_when_billed() -> None
     assert breakdown_sum == row["costUsd"]
 
 
+def test_usage_status_tracker_row_estimated_is_the_unbilled_component() -> None:
+    """estimatedCostUsd is the estimated component of the total, so a billed
+    row keeps costUsd == billedCostUsd + estimatedCostUsd (matching the
+    per-model breakdown and the persisted rollup, not the full list-price
+    estimate over all tokens)."""
+    tracker = UsageTracker()
+    tracker.add(
+        "agent:webchat:billed",
+        input_tokens=29213,
+        output_tokens=400,
+        model_id="anthropic/claude-4.7-opus",
+        cache_read_tokens=11588,
+        cache_write_tokens=17772,
+        billed_cost=0.1254,
+    )
+
+    ctx = _ctx(session_manager=None, usage_tracker=tracker)
+    payload = asyncio.run(_handle_usage_status(None, ctx))
+
+    [row] = payload["sessions"]
+    assert row["costSource"] == "provider_billed"
+    assert row["estimatedCostUsd"] == pytest.approx(
+        row["costUsd"] - row["billedCostUsd"], abs=1e-9
+    )
+    for item in row["modelBreakdown"]:
+        assert item["costUsd"] == pytest.approx(
+            item["billedCostUsd"] + item["estimatedCostUsd"]
+        )
+
+
 def test_usage_status_tracker_row_source_mixed_when_some_models_unbilled() -> None:
     """Mix of billed + unbilled models in the tracker → row gets 'mixed'
     source (not provider_billed and not opensquilla_estimate). The row

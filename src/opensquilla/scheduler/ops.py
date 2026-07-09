@@ -356,6 +356,11 @@ class SchedulerOps:
 
         now = datetime.now(UTC)
         job.status = JobStatus.PENDING
+        # Reviving a DISABLED/FAILED job must clear the flags the due-job query
+        # filters on, or the job would stay excluded despite the status change.
+        job.enabled = True
+        job.backoff_until = None
+        job.consecutive_errors = 0
         job.updated_at = now
 
         if job.schedule_kind == ScheduleKind.AT:

@@ -338,7 +338,10 @@ def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
             # canonical cost so it matches the breakdown sum exactly.
             cost_fields["cost_usd"] = usage_total
             cost_fields["billed_cost_usd"] = usage_billed
-            cost_fields["estimated_cost_usd"] = usage_estimate
+            # The estimated component is the UNBILLED remainder, not the full
+            # list-price estimate — otherwise cost_usd != billed + estimated and
+            # fully-billed rows falsely show a large "estimated" figure.
+            cost_fields["estimated_cost_usd"] = max(0.0, usage_total - usage_billed)
             cost_fields["cost_source"] = usage_cost_source  # provider_billed or mixed
         else:
             cost_fields["cost_usd"] = usage_estimate

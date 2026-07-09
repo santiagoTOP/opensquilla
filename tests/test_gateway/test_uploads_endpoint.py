@@ -13,6 +13,7 @@ and cross-origin/wrong-scope variants.
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import time
@@ -166,6 +167,20 @@ def test_failed_upload_does_not_leak_uuid(store: UploadStore) -> None:
         )
     final_markers = list((store.marker_dir).glob("*.meta")) if store.marker_dir.exists() else []
     assert final_markers == initial_markers
+
+
+def test_get_miss_does_not_leak_locks(store: UploadStore) -> None:
+    """Unknown/expired uuid lookups must not grow the per-uuid lock map."""
+
+    async def _run() -> None:
+        for i in range(200):
+            with pytest.raises(AttachmentNotFoundError):
+                await store.get(f"bogus-{i}")
+
+    asyncio.run(_run())
+    gc.collect()
+    assert len(store._entries) == 0
+    assert len(store._locks) == 0
 
 
 def test_uuid_evicted_after_send_success(store: UploadStore) -> None:

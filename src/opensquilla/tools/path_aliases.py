@@ -65,6 +65,20 @@ def resolve_workspace_alias(raw_path: PurePath, workspace_root: Path | None) -> 
     if workspace_root is None or not _is_rooted_path(raw_path):
         return None
 
+    # If the path already resolves inside workspace_root, it is correct as
+    # given — do NOT re-root it. Rewriting here is what caused a nested
+    # directory literally named "workspace" (e.g. packages/workspace/...) to be
+    # silently redirected to a different file. The alias is only for paths that
+    # are NOT already under the active workspace (sandbox /workspace/... stdout
+    # paths and default-home training-prior paths).
+    try:
+        resolved_input = Path(raw_path).resolve(strict=False)
+        resolved_root = workspace_root.resolve(strict=False)
+        resolved_input.relative_to(resolved_root)
+        return None
+    except ValueError:
+        pass
+
     parts = raw_path.parts
     # Use the rightmost workspace boundary so paths shaped like
     # ``/<some-prefix>/workspace/<intended-relative-tail>`` map the tail

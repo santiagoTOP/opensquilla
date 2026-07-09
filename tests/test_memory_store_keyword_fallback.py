@@ -5,7 +5,7 @@ import pytest
 from opensquilla.compat import aiosqlite
 from opensquilla.memory.embedding import NullEmbeddingProvider
 from opensquilla.memory.retrieval import MemoryRetriever
-from opensquilla.memory.store import LongTermMemoryStore
+from opensquilla.memory.store import LongTermMemoryStore, _build_fts_query
 from opensquilla.memory.types import (
     LEXICAL_GUARANTEE_METADATA_KEY,
     LEXICAL_GUARANTEE_METADATA_VALUE,
@@ -52,6 +52,36 @@ class _RecordingVectorDb:
         self.sql = sql
         self.params = params
         return _RecordingVectorCursor()
+
+
+def test_build_fts_query_keeps_non_latin_and_accented_tokens():
+    russian = _build_fts_query("Запускать сервер в тихом режиме")
+    korean = _build_fts_query("서버는 조용한 모드로 시작")
+    german = _build_fts_query("Übernachtung buchen")
+    assert russian is not None and "сервер" in russian
+    assert korean is not None and "서버" in korean
+    assert german is not None and "Übernachtung" in german
+
+
+@pytest.mark.asyncio
+async def test_fts_search_matches_non_latin_scripts():
+    store = LongTermMemoryStore(
+        ":memory:",
+        embedding_provider=NullEmbeddingProvider(),
+    )
+    store._db = await aiosqlite.connect(":memory:")  # type: ignore[assignment]
+    try:
+        await store._ensure_schema()
+        await store.index_file("memory/notes-ru.md", "Запускать сервер в тихом режиме")
+        await store.index_file("memory/notes-de.md", "Die Übernachtung wurde storniert")
+
+        russian_hits = await store._fts_search("сервер", k=3, min_score=0.35)
+        german_hits = await store._fts_search("Übernachtung", k=3, min_score=0.35)
+
+        assert [result.path for result in russian_hits] == ["memory/notes-ru.md"]
+        assert [result.path for result in german_hits] == ["memory/notes-de.md"]
+    finally:
+        await store._db.close()  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

@@ -397,6 +397,18 @@ def _limit_root_domain_spam(
     return limited, limited_count
 
 
+# Generic second-level labels used under two-letter ccTLDs (e.g. co.uk,
+# com.au, gov.uk). When a host ends in one of these under a 2-letter TLD, the
+# registrable domain is the last THREE labels, not two — otherwise distinct
+# organizations (bbc.co.uk vs theguardian.co.uk) collapse into one root.
+_SECOND_LEVEL_SUFFIXES = frozenset(
+    {
+        "co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go",
+        "mil", "sch", "ltd", "plc", "nhs", "police", "me",
+    }
+)
+
+
 def _root_domain(domain: str) -> str:
     normalized = domain.lower().strip(".")
     if not normalized:
@@ -404,6 +416,11 @@ def _root_domain(domain: str) -> str:
     labels = [label for label in normalized.split(".") if label]
     if len(labels) <= 2:
         return normalized
+    tld = labels[-1]
+    second = labels[-2]
+    # Public-suffix-aware: bbc.co.uk / gov.uk stay distinct roots.
+    if len(tld) == 2 and second in _SECOND_LEVEL_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
     return ".".join(labels[-2:])
 
 

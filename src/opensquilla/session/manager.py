@@ -496,6 +496,19 @@ class SessionManager:
 
     async def _rotate_session_id(self, node: SessionNode) -> SessionNode:
         old_session_id = node.session_id
+        # Bump the epoch FIRST (before archive/delete/rotate) so the
+        # StaleEpochError guard in append_transcript_entry fences every
+        # in-flight append that read the pre-reset node: once the epoch
+        # advances, such an append's expected_epoch check fails and its blind
+        # whole-node upsert can no longer roll the rotation back. Doing it here
+        # covers all reset call sites (RPC and non-RPC), not just the ones that
+        # separately call _increment_and_emit_epoch.
+        try:
+            new_epoch = await self._storage.increment_epoch(node.session_key)
+            node.epoch = new_epoch
+            self.set_cached_epoch(node.session_key, new_epoch)
+        except Exception:  # noqa: BLE001 - reset must not fail on epoch bump
+            pass
         await self._archive_session_identity(node)
         await self._storage.delete_transcript(old_session_id)
         await self._storage.delete_summaries(old_session_id)
@@ -531,7 +544,14 @@ class SessionManager:
             if not entries and not summaries:
                 return
             archive_dir = _archive_dir()
+            new_dir = not archive_dir.exists()
             archive_dir.mkdir(parents=True, exist_ok=True)
+            # Harden only the directory this boot creates (mirrors the DB
+            # migrator policy): the archive holds the full raw transcript, so it
+            # must not inherit the umask default of 0755/0644.
+            if new_dir and os.name != "nt":
+                with contextlib.suppress(OSError):
+                    os.chmod(archive_dir, 0o700)
             safe_key = _safe_archive_part(node.session_key)
             safe_id = _safe_archive_part(node.session_id)
             path = archive_dir / f"{_now_ms()}-{safe_key}-{safe_id}.json"
@@ -545,7 +565,15 @@ class SessionManager:
                 "transcript_entries": [entry.model_dump(mode="json") for entry in entries],
                 "summaries": [summary.model_dump(mode="json") for summary in summaries],
             }
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            data = json.dumps(payload, ensure_ascii=False, indent=2)
+            # Create the file owner-only (0600) so the raw transcript is never
+            # group/other-readable, matching the sessions.db hardening.
+            if os.name == "nt":
+                path.write_text(data, encoding="utf-8")
+            else:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(data)
         except Exception:
             return
 

@@ -145,6 +145,15 @@ async def prune_expired_memory_files(
         if path.name in exempt_files:
             continue
 
+        # TTL only applies to DATED notes (memory/YYYY-MM-DD.md and
+        # YYYY-MM-DD-<slug>.md). Named evergreen notes are treated as
+        # non-expiring by retrieval (_is_evergreen), so the sweep must not
+        # delete them. Keep this in lockstep with retrieval's matcher.
+        from opensquilla.memory.retrieval import _match_dated_basename
+
+        if _match_dated_basename(path.name) is None:
+            continue
+
         try:
             rel_to_memory = path.relative_to(mem_root)
         except ValueError:

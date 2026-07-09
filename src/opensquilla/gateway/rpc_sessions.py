@@ -2115,6 +2115,7 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
         if session is None:
             raise KeyError(f"Session not found: {key}")
         previous_session_id = session.session_id
+        previous_epoch = int(getattr(session, "epoch", 0) or 0)
         agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
 
         transcript = await ctx.session_manager.get_transcript(key)
@@ -2125,7 +2126,9 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
                 key,
                 SessionIntent.RESET_SAME_KEY,
             )
-            new_epoch = await _increment_and_emit_epoch(ctx, storage, key)
+            new_epoch = await _ensure_and_emit_reset_epoch(
+                ctx, storage, key, previous_epoch=previous_epoch
+            )
             return {
                 "key": key,
                 "reset": True,
@@ -2175,7 +2178,9 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
                 key,
                 SessionIntent.RESET_SAME_KEY,
             )
-            new_epoch = await _increment_and_emit_epoch(ctx, storage, key)
+            new_epoch = await _ensure_and_emit_reset_epoch(
+                ctx, storage, key, previous_epoch=previous_epoch
+            )
             return {
                 "key": key,
                 "reset": True,
@@ -2189,7 +2194,9 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
             updated, rotated = await ctx.session_manager.apply_intent(
                 key, SessionIntent.RESET_SAME_KEY
             )
-            new_epoch = await _increment_and_emit_epoch(ctx, storage, key)
+            new_epoch = await _ensure_and_emit_reset_epoch(
+                ctx, storage, key, previous_epoch=previous_epoch
+            )
             receipt = FlushReceipt(
                 mode="skipped",
                 flushed_paths=[],
@@ -2270,7 +2277,9 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
             )
 
         updated, rotated = await ctx.session_manager.apply_intent(key, SessionIntent.RESET_SAME_KEY)
-        new_epoch = await _increment_and_emit_epoch(ctx, storage, key)
+        new_epoch = await _ensure_and_emit_reset_epoch(
+            ctx, storage, key, previous_epoch=previous_epoch
+        )
         return _reset_response(
             key,
             rotated,
@@ -2286,24 +2295,35 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
         return await _run_locked()
 
 
-async def _increment_and_emit_epoch(
+async def _ensure_and_emit_reset_epoch(
     ctx: RpcContext,
     storage: Any,
     session_key: str,
+    *,
+    previous_epoch: int,
 ) -> int:
-    """Atomically increment epoch and broadcast session.epoch_changed to WS subscribers.
+    """Broadcast the manager's reset epoch, incrementing only as a fallback.
 
-    increment_epoch commits the UPDATE before returning, so new_epoch
-    is durable before we attempt the WS emit.  If the emit fails the epoch is
-    still committed — WS delivery is best-effort and the client will re-sync on
-    reconnect.
+    ``SessionManager._rotate_session_id`` normally increments before rotating
+    to fence stale writers. Older/test managers may not, and the manager keeps
+    reset best-effort if that increment fails, so this RPC performs one durable
+    increment only when the stored epoch did not advance.
     """
     increment_fn = getattr(storage, "increment_epoch", None)
     if not callable(increment_fn):
         return 0
+    new_epoch = previous_epoch
+    get_session = getattr(storage, "get_session", None)
+    if callable(get_session):
+        try:
+            current = await get_session(session_key)
+            new_epoch = int(getattr(current, "epoch", previous_epoch) or 0)
+        except Exception:
+            new_epoch = previous_epoch
     try:
-        # Durable commit happens inside increment_epoch before it returns.
-        new_epoch = int(await increment_fn(session_key))
+        if new_epoch <= previous_epoch:
+            # Durable commit happens inside increment_epoch before it returns.
+            new_epoch = int(await increment_fn(session_key))
     except Exception:
         log.warning("sessions.reset.epoch_increment_failed", session_key=session_key)
         return 0

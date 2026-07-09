@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -794,6 +795,20 @@ class SessionStorage:
         except Exception as exc:  # noqa: BLE001
             log.warning("session_delete.purge_turn_errors_failed: %s", exc)
 
+        # agent_tasks and memory_durable_receipts are keyed by session_key and
+        # created unconditionally by connect(), but delete_session never purged
+        # them — deleted sessions left orphan task/receipt rows that reattach to
+        # a recreated session sharing the same key. Purge both, best-effort.
+        for table in ("agent_tasks", "memory_durable_receipts"):
+            try:
+                await self.conn.execute(
+                    f"DELETE FROM {table} WHERE session_key = ?",  # noqa: S608 - fixed literals
+                    (session_key,),
+                )
+                await self.conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("session_delete.purge_%s_failed: %s", table, exc)
+
     async def prune_stale_sessions(self, before_ms: int) -> int:
         """Delete sessions not updated since before_ms epoch ms. Returns count deleted."""
         async with self.conn.execute(
@@ -1109,6 +1124,13 @@ class SessionStorage:
             ) as cur:
                 inserted = cur.rowcount or 0
             if inserted == 0:
+                # The 0-row INSERT opened an implicit transaction that changed
+                # nothing; roll it back before raising so the shared aiosqlite
+                # connection is not left mid-transaction (which would make the
+                # next writer's BEGIN IMMEDIATE fail or silently join and get
+                # discarded). Nothing of this write is lost — no row was written.
+                with contextlib.suppress(Exception):
+                    await self.conn.rollback()
                 # Fetch actual epoch for the error message (best-effort).
                 async with self.conn.execute(
                     "SELECT epoch FROM sessions WHERE session_key = ?",

@@ -68,6 +68,9 @@ _PRESETS: dict[str, str] = {
 @dataclass(frozen=True)
 class CronField:
     values: frozenset[int]
+    # True when the field was NOT a bare ``*`` (i.e. the user constrained it).
+    # Needed for the POSIX day-of-month/day-of-week OR rule.
+    restricted: bool = True
 
     def matches(self, value: int) -> bool:
         return value in self.values
@@ -83,13 +86,20 @@ class CronExpression:
     raw: str
 
     def matches(self, dt: datetime) -> bool:
-        return (
-            self.minute.matches(dt.minute)
-            and self.hour.matches(dt.hour)
-            and self.day_of_month.matches(dt.day)
-            and self.month.matches(dt.month)
-            and self.day_of_week.matches((dt.weekday() + 1) % 7)  # Python Mon=0 → cron Sun=0
-        )
+        if not (self.minute.matches(dt.minute) and self.hour.matches(dt.hour)):
+            return False
+        if not self.month.matches(dt.month):
+            return False
+        # POSIX/Vixie day rule: day-of-month and day-of-week are ORed when BOTH
+        # are restricted (neither is ``*``); if only one is restricted, only
+        # that one applies. ANDing them (the old behavior) fired an entry like
+        # "0 0 13 * 5" only on the rare 13th-that-is-a-Friday.
+        dom_matches = self.day_of_month.matches(dt.day)
+        dow = (dt.weekday() + 1) % 7  # Python Mon=0 → cron Sun=0
+        dow_matches = self.day_of_week.matches(dow)
+        if self.day_of_month.restricted and self.day_of_week.restricted:
+            return dom_matches or dow_matches
+        return dom_matches and dow_matches
 
 
 def _parse_field(token: str, field_name: str, names: dict[str, int] | None = None) -> CronField:
@@ -141,7 +151,11 @@ def _parse_field(token: str, field_name: str, names: dict[str, int] | None = Non
         else:
             values.add(_to_int(part, field_name, lo, hi))
 
-    return CronField(frozenset(values))
+    # A field is "unrestricted" only when the whole token is a bare ``*``.
+    # ``*/2`` and explicit ranges/lists are restrictions (they matter for the
+    # POSIX day-of-month/day-of-week OR rule in CronExpression.matches).
+    restricted = token.strip() != "*"
+    return CronField(frozenset(values), restricted=restricted)
 
 
 def _to_int(s: str, field_name: str, lo: int, hi: int) -> int:

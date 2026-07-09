@@ -464,7 +464,20 @@ def create_memory_tools(
 
         max_files = getattr(memory_config, "max_files", 0)
         if max_files > 0 and not mem_path.exists():
-            file_count = len(list(workspace_dir.rglob("*.md")))
+            # Count only visible memory .md files under the resolved memory dir,
+            # not every .md in the whole workspace (that let project docs block
+            # memory writes). Excludes the .raw_fallbacks / .checkpoints sidecars.
+            mem_root = Path(r.memory_dir) if r.memory_dir else workspace_dir / "memory"
+            file_count = 0
+            if mem_root.exists():
+                for p in mem_root.rglob("*.md"):
+                    try:
+                        rel = p.relative_to(mem_root)
+                    except ValueError:
+                        continue
+                    if any(part.startswith(".") for part in rel.parts):
+                        continue
+                    file_count += 1
             if file_count >= max_files:
                 raise ToolError(f"max file count reached ({max_files}).")
 

@@ -77,3 +77,31 @@ def test_parse_iso_at_rejects_empty() -> None:
 def test_parse_iso_at_rejects_non_string() -> None:
     with pytest.raises(CronParseError, match="Expected ISO-8601 string"):
         parse_iso_at(12345)  # type: ignore[arg-type]
+
+
+def test_matches_ors_restricted_day_of_month_and_day_of_week() -> None:
+    # POSIX day rule: with BOTH day fields restricted, either match fires.
+    expr = parse_cron("0 0 13 * 5")
+    monday_13th = datetime(2026, 4, 13, 0, 0, tzinfo=UTC)
+    friday_10th = datetime(2026, 4, 10, 0, 0, tzinfo=UTC)
+
+    assert expr.matches(monday_13th)
+    assert expr.matches(friday_10th)
+
+
+def test_matches_ands_day_fields_when_only_one_is_restricted() -> None:
+    dom_only = parse_cron("0 0 13 * *")
+    dow_only = parse_cron("0 0 * * 5")
+    monday_13th = datetime(2026, 4, 13, 0, 0, tzinfo=UTC)
+
+    assert dom_only.matches(monday_13th)
+    assert not dow_only.matches(monday_13th)
+
+
+def test_next_run_uses_posix_day_union() -> None:
+    from opensquilla.scheduler.engine import _next_run
+
+    expr = parse_cron("0 9 1,15 * 1")
+    after = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
+
+    assert _next_run(expr, after) == datetime(2026, 7, 13, 9, 0, tzinfo=UTC)

@@ -17,8 +17,8 @@ import pytest
 import pytest_asyncio
 
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import SessionNode
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import SessionNode, TranscriptEntry
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 
 @pytest_asyncio.fixture
@@ -244,3 +244,39 @@ async def test_concurrent_increment_and_upsert_high_concurrency(storage):
     assert final_epoch >= 50, (
         f"high-concurrency mix left epoch={final_epoch}, expected >= 50"
     )
+
+
+# ── Epoch-guard failure must leave the shared connection usable ──────────────
+
+
+async def _trigger_stale_epoch_error(storage: SessionStorage) -> SessionNode:
+    key = "agent:main:stale-epoch-cleanup"
+    node = SessionNode(session_key=key, session_id="sid-stale-cleanup")
+    await storage.upsert_session(node)
+    await storage.increment_epoch(key)
+
+    stale = TranscriptEntry(
+        session_id=node.session_id,
+        session_key=key,
+        role="assistant",
+        content="stale write",
+    )
+    with pytest.raises(StaleEpochError):
+        await storage.append_transcript_entry(stale, expected_epoch=0)
+    return node
+
+
+@pytest.mark.asyncio
+async def test_stale_epoch_error_leaves_connection_transaction_clean(storage):
+    await _trigger_stale_epoch_error(storage)
+
+    assert storage.conn.in_transaction is False
+
+
+@pytest.mark.asyncio
+async def test_compaction_rewrite_survives_prior_stale_epoch_error(storage):
+    # rewrite_compacted_session opens an explicit BEGIN IMMEDIATE, which fails
+    # if the failed epoch-guarded insert dangles an implicit transaction.
+    node = await _trigger_stale_epoch_error(storage)
+
+    await storage.rewrite_compacted_session(node=node, summary=None, entries=[])

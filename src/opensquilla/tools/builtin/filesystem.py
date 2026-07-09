@@ -2548,8 +2548,21 @@ async def list_dir(path: str, approval_id: str | None = None) -> str:
             if entry.is_dir():
                 dirs.append(f"[dir]  {entry.name}/")
             else:
-                size = entry.stat().st_size
-                files.append(f"[file] {entry.name} ({size} bytes)")
+                # A broken symlink (or a race deleting the entry) makes stat()
+                # raise; catching it keeps one bad entry from aborting the whole
+                # listing. Fall back to lstat (does not follow the link) and
+                # mark it, or show the size as unavailable.
+                try:
+                    size = entry.stat().st_size
+                    files.append(f"[file] {entry.name} ({size} bytes)")
+                except OSError:
+                    try:
+                        if entry.is_symlink():
+                            files.append(f"[link] {entry.name} (broken symlink)")
+                        else:
+                            files.append(f"[file] {entry.name} (size unavailable)")
+                    except OSError:
+                        files.append(f"[file] {entry.name} (size unavailable)")
         return dirs + files + blocked_entries
 
     # _list reads the current tool context (run mode / full-host access) via

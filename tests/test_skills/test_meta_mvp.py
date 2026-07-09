@@ -2421,6 +2421,44 @@ async def test_make_llm_chat_from_provider_forwards_billed_cost_to_usage_tracker
 
 
 @pytest.mark.asyncio
+async def test_make_llm_chat_from_provider_stamps_provider_for_pricing() -> None:
+    from opensquilla.engine.usage import UsageTracker
+    from opensquilla.provider.types import DoneEvent as ProviderDoneEvent
+    from opensquilla.provider.types import TextDeltaEvent as ProviderTextDelta
+
+    class FakeProvider:
+        async def chat(self, _messages, *, tools, config):
+            yield ProviderTextDelta(text="label_a")
+            yield ProviderDoneEvent(
+                input_tokens=5000,
+                output_tokens=800,
+                model="qwen3:4b",
+                billed_cost=0.0,
+            )
+
+    tracker = UsageTracker()
+    llm_chat = make_llm_chat_from_provider(
+        provider=FakeProvider(),
+        base_config=AgentConfig(model_id="qwen3:4b", provider_id="ollama"),
+        usage_tracker=tracker,
+        session_key="session-a",
+    )
+
+    assert await llm_chat("system", "user") == "label_a"
+
+    usage = tracker.get("session-a")
+    assert usage is not None
+    per_model = (usage._per_model or {}).get("qwen3:4b")
+    assert per_model is not None
+    # provider_id must reach pricing so a local model stays free instead of
+    # falling through to the cloud default estimate.
+    assert per_model.provider == "ollama"
+    assert usage.cost == 0.0
+    assert usage.total_cost == 0.0
+    assert tracker.check_warning("session-a", threshold=0.02) is None
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_final_text_auto_prepends_llm_summary_to_raw() -> None:
     """``final_text_mode='auto'`` (default) renders ``final_text`` as
     ``<LLM Markdown summary>\n\n---\n\n**Output details:**\n\n<raw last

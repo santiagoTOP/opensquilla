@@ -24,6 +24,7 @@ import json
 import logging
 import time
 import uuid as _uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -121,7 +122,14 @@ class UploadStore:
         self.accept_opaque = accept_opaque
         self.max_total_bytes = max_total_bytes
         self._entries: dict[str, _Entry] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        # WeakValueDictionary so a per-uuid lock is reclaimed as soon as no
+        # coroutine holds it — a get()/put() miss can no longer leak locks
+        # without bound. While an operation is inside `async with lock` a strong
+        # ref keeps the entry alive, so concurrent access to the same uuid still
+        # serializes on the same lock.
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._lock_for_locks = asyncio.Lock()
         if self.marker_dir is not None:
             self.marker_dir.mkdir(parents=True, exist_ok=True)

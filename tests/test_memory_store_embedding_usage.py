@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from opensquilla.memory.store import LongTermMemoryStore, _estimate_embedding_cost_usd
+from opensquilla.memory.types import MemorySource
 
 
 def test_estimate_embedding_cost_local_provider_is_free() -> None:
@@ -75,3 +76,60 @@ def test_record_embedding_request_cloud_provider_estimates_cost() -> None:
     usage = store.consume_embedding_usage()
     assert usage["provider"] == "openai"
     assert usage["cost_usd"] > 0.0
+
+
+class _FlakyEmbeddingProvider:
+    """Fails the first embed_batch call, then succeeds."""
+
+    def __init__(self) -> None:
+        self.embed_batch_calls = 0
+
+    @property
+    def provider_id(self) -> str:
+        return "test"
+
+    @property
+    def model(self) -> str:
+        return "test-embed-model"
+
+    async def embed_query(self, text: str) -> list[float]:
+        return [0.6, 0.8]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.embed_batch_calls += 1
+        if self.embed_batch_calls == 1:
+            raise RuntimeError("503 service unavailable")
+        return [[0.6, 0.8] for _ in texts]
+
+    async def probe(self) -> tuple[bool, str | None]:  # pragma: no cover - unused
+        return True, None
+
+
+async def _chunk_embedding(store: LongTermMemoryStore, path: str) -> bytes | None:
+    assert store._db is not None
+    async with store._db.execute("SELECT embedding FROM chunks WHERE path = ?", (path,)) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    return row[0]
+
+
+async def test_index_file_retries_embedding_after_transient_failure(tmp_path) -> None:
+    provider = _FlakyEmbeddingProvider()
+    store = LongTermMemoryStore(tmp_path / "memory.db", embedding_provider=provider)
+    await store.initialize()
+    try:
+        path = "notes/deploy.md"
+        content = "# Deploy notes\n\nThe staging cluster restarts every Sunday at 03:00 UTC.\n"
+
+        assert await store.index_file(path, content, source=MemorySource.memory) == 1
+        assert provider.embed_batch_calls == 1
+        assert await _chunk_embedding(store, path) is None
+
+        # Same content, provider recovered: the vector-less chunk is re-embedded
+        # instead of being skipped forever by the unchanged-hash short-circuit.
+        await store.index_file(path, content, source=MemorySource.memory)
+
+        assert provider.embed_batch_calls == 2
+        assert await _chunk_embedding(store, path) is not None
+    finally:
+        await store.close()

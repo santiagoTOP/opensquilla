@@ -61,6 +61,7 @@ class FakeSession:
     origin: dict | None = None
     model: str | None = None
     model_override: str | None = None
+    epoch: int = 0
 
 
 class FakeStorage:
@@ -88,6 +89,11 @@ class FakeStorage:
 
     async def delete_transcript(self, session_id: str) -> None:
         self._transcripts.pop(session_id, None)
+
+    async def increment_epoch(self, key: str) -> int:
+        session = self._sessions[key]
+        session.epoch += 1
+        return session.epoch
 
     async def get_transcript(
         self, session_id: str, limit: int | None = None, offset: int = 0
@@ -300,6 +306,7 @@ class FakeSessionManager:
         if str(intent) != "reset_same_key":
             raise KeyError(f"Session not found: {session_key}")
         old_id = session.session_id
+        session.epoch = await self._storage.increment_epoch(session_key)
         await self._storage.delete_transcript(old_id)
         session.session_id = f"{old_id}-rotated"
         return session, True
@@ -3016,6 +3023,7 @@ class TestSessionsReset:
         assert res.ok is True
         assert res.payload["session_id"] != before
         assert res.payload["previous_session_id"] == before
+        assert res.payload["epoch"] == 1
 
     @pytest.mark.asyncio
     async def test_reset_allowed_for_operator_write_scope(self, dispatcher, session):
