@@ -61,7 +61,7 @@ def test_legacy_openrouter_mix_exact_preset_save_writes_canonical_recommended() 
 
 def test_legacy_openrouter_mix_model_difference_saves_custom_inline_tiers() -> None:
     tiers = _router_tier_profile_defaults("openrouter")
-    tiers["c3"] = dict(tiers["c3"], model="anthropic/claude-opus-4.8")
+    tiers["c3"] = dict(tiers["c3"], model="z-ai/glm-5.2")
     cfg = GatewayConfig(
         # openrouter-mix requires the openrouter provider, which is no longer
         # the built-in default.
@@ -78,7 +78,7 @@ def test_legacy_openrouter_mix_model_difference_saves_custom_inline_tiers() -> N
     assert res.public_payload["mode"] == "custom"
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
-    assert res.config.squilla_router.tiers["c3"]["model"] == "anthropic/claude-opus-4.8"
+    assert res.config.squilla_router.tiers["c3"]["model"] == "z-ai/glm-5.2"
 
 
 def test_legacy_openrouter_mix_description_difference_saves_custom_inline_tiers() -> None:

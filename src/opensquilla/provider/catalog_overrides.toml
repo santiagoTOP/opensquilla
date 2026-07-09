@@ -139,7 +139,8 @@ max_output_tokens = 16384
 #   wrong vision flag) to arbitrary proxy base URLs.
 
 # dashscope (Qwen): reasoning for qwen3/qwen-plus/qwen-flash/qwen-turbo/
-# qwen-max/qwq prefixes; vision for qwen3.5/qwen3.6/qwen-vl; tools always.
+# qwen-max/qwq prefixes; vision for qwen3.5/qwen3.6/qwen3.7/qwen-vl;
+# tools always.
 
 [dashscope."qwen3.5*"]
 supports_reasoning = true
@@ -148,6 +149,12 @@ supports_vision = true
 reasoning_format = "dashscope"
 
 [dashscope."qwen3.6*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "dashscope"
+
+[dashscope."qwen3.7*"]
 supports_reasoning = true
 supports_tools = true
 supports_vision = true
@@ -204,8 +211,9 @@ supports_tools = true
 supports_vision = false
 reasoning_format = "none"
 
-# moonshot (Kimi): reasoning for kimi-k2.5/kimi-k2.6/kimi-k2-thinking
-# prefixes; vision for kimi-k2.5/kimi-k2.6; tools always. (The exact
+# moonshot (Kimi): reasoning for kimi-k2.5/kimi-k2.6/kimi-k2.7/
+# kimi-k2-thinking prefixes; vision for kimi-k2.5/kimi-k2.6/kimi-k2.7;
+# tools always. (The exact
 # moonshot-v1-* window rows above carry no capability fields, so the "*"
 # row fills their capabilities: non-reasoning, tools on.)
 
@@ -216,6 +224,12 @@ supports_vision = true
 reasoning_format = "moonshot"
 
 [moonshot."kimi-k2.6*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "moonshot"
+
+[moonshot."kimi-k2.7*"]
 supports_reasoning = true
 supports_tools = true
 supports_vision = true
@@ -232,6 +246,119 @@ supports_reasoning = false
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
+
+# Kimi Coding private plan endpoints expose a single coding model through both
+# OpenAI-compatible and Anthropic-compatible shapes. Tool support follows the
+# conservative synthesized default; no structured reasoning dialect is asserted.
+
+[kimi_coding_openai."kimi-for-coding"]
+display_name = "Kimi for Coding"
+supports_tools = true
+supports_vision = false
+
+[kimi_coding_anthropic."kimi-for-coding"]
+display_name = "Kimi for Coding"
+supports_tools = true
+supports_vision = false
+
+# MiniMax direct and compatibility endpoints used by synthesized router
+# presets. Pricing/window fields are intentionally omitted unless verified by
+# provider documentation or a live catalog response with those fields.
+
+[minimax."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_cn."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax_cn."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_global."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax_global."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_openai."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax_openai."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_openai."minimax-m2.7"]
+display_name = "MiniMax M2.7"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_openai."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_anthropic."minimax-m2.7"]
+display_name = "MiniMax M2.7"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_anthropic."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+# MiMo coding-plan endpoints.
+
+[mimo_openai."mimo-v2.5"]
+display_name = "MiMo v2.5"
+supports_tools = true
+supports_vision = false
+
+[mimo_openai."mimo-v2.5-pro"]
+display_name = "MiMo v2.5 Pro"
+supports_tools = true
+supports_vision = false
+
+[mimo_anthropic."mimo-v2.5"]
+display_name = "MiMo v2.5"
+supports_tools = true
+supports_vision = false
+
+[mimo_anthropic."mimo-v2.5-pro"]
+display_name = "MiMo v2.5 Pro"
+supports_tools = true
+supports_vision = false
+
+# Baidu Qianfan live-smoked ERNIE 4.5 model ids. Only the VL row asserts
+# vision support.
+
+[qianfan."ernie-4.5-turbo-128k"]
+display_name = "ERNIE 4.5 Turbo 128K"
+supports_tools = true
+supports_vision = false
+
+[qianfan."ernie-4.5-turbo-vl-32k"]
+display_name = "ERNIE 4.5 Turbo VL 32K"
+supports_tools = true
+supports_vision = true
 
 # volcengine (Ark, doubao): doubao-seed-1-6 and -1-8 and the seed-2 line
 # are reasoning models; without 1-6 here the stream path emits no thinking
@@ -265,6 +392,18 @@ supports_vision = false
 reasoning_format = "volcengine"
 
 [volcengine."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+[volcengine_coding_plan."doubao-seed-2*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[volcengine_coding_plan."*"]
 supports_reasoning = false
 supports_tools = true
 supports_vision = false
@@ -330,9 +469,15 @@ supports_tools = true
 supports_vision = false
 reasoning_format = "deepseek"
 
-# gemini (reasoning_shape="gemini"): reasoning only for the gemini-2.5
-# prefix; vision and tools for every model.
+# gemini (reasoning_shape="gemini"): reasoning for Gemini 2.5 and 3.x
+# model families; vision and tools for every model.
 [gemini."gemini-2.5*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "gemini"
+
+[gemini."gemini-3*"]
 supports_reasoning = true
 supports_tools = true
 supports_vision = true

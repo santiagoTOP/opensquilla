@@ -97,6 +97,145 @@ class ProviderPreset:
         return {name: dict(value) for name, value in self.tiers.items()}
 
 
+def _tier(
+    provider_id: str,
+    model: str,
+    description: str,
+    *,
+    thinking_level: str = "",
+    supports_image: bool = False,
+    image_only: bool = False,
+) -> dict:
+    entry: dict[str, object] = {
+        "provider": provider_id,
+        "model": model,
+        "description": description,
+        "supports_image": supports_image,
+    }
+    if thinking_level:
+        entry["thinking_level"] = thinking_level
+    if image_only:
+        entry["image_only"] = True
+    return entry
+
+
+def _text_ladder(
+    provider_id: str,
+    c0: str,
+    c1: str,
+    c2: str,
+    c3: str,
+    *,
+    subject: str,
+) -> dict[str, dict]:
+    return {
+        "c0": _tier(provider_id, c0, f"{subject} fast route.", thinking_level="off"),
+        "c1": _tier(provider_id, c1, f"{subject} balanced route.", thinking_level="low"),
+        "c2": _tier(provider_id, c2, f"{subject} strong route.", thinking_level="medium"),
+        "c3": _tier(provider_id, c3, f"{subject} highest route.", thinking_level="high"),
+    }
+
+
+def _minimax_ladder(provider_id: str) -> tuple[str, dict[str, dict]]:
+    return (
+        "MiniMax-M2.7",
+        _text_ladder(
+            provider_id,
+            "MiniMax-M2.7",
+            "MiniMax-M2.7",
+            "MiniMax-M3",
+            "MiniMax-M3",
+            subject="MiniMax",
+        ),
+    )
+
+
+_CURATED_SYNTHESIZED_PRESETS: Mapping[str, tuple[str, dict[str, dict]]] = {
+    "qianfan": (
+        "ernie-4.5-turbo-128k",
+        {
+            **_text_ladder(
+                "qianfan",
+                "ernie-4.5-turbo-128k",
+                "ernie-4.5-turbo-128k",
+                "ernie-4.5-turbo-128k",
+                "ernie-4.5-turbo-128k",
+                subject="Qianfan ERNIE 4.5 Turbo",
+            ),
+            "image_model": _tier(
+                "qianfan",
+                "ernie-4.5-turbo-vl-32k",
+                "Qianfan vision route.",
+                thinking_level="medium",
+                supports_image=True,
+                image_only=True,
+            ),
+        },
+    ),
+    "minimax": _minimax_ladder("minimax"),
+    "minimax_coding_openai": _minimax_ladder("minimax_coding_openai"),
+    "minimax_coding_anthropic": _minimax_ladder("minimax_coding_anthropic"),
+    "minimax_cn": _minimax_ladder("minimax_cn"),
+    "minimax_global": _minimax_ladder("minimax_global"),
+    "minimax_openai": _minimax_ladder("minimax_openai"),
+    "kimi_coding_openai": (
+        "kimi-for-coding",
+        _text_ladder(
+            "kimi_coding_openai",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            subject="Kimi Coding",
+        ),
+    ),
+    "kimi_coding_anthropic": (
+        "kimi-for-coding",
+        _text_ladder(
+            "kimi_coding_anthropic",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            subject="Kimi Coding Anthropic-compatible",
+        ),
+    ),
+    "mimo_openai": (
+        "mimo-v2.5",
+        _text_ladder(
+            "mimo_openai",
+            "mimo-v2.5",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2.5-pro",
+            subject="MiMo",
+        ),
+    ),
+    "mimo_anthropic": (
+        "mimo-v2.5",
+        _text_ladder(
+            "mimo_anthropic",
+            "mimo-v2.5",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2.5-pro",
+            subject="MiMo Anthropic-compatible",
+        ),
+    ),
+    "volcengine_coding_plan": (
+        "doubao-seed-2.0-pro",
+        _text_ladder(
+            "volcengine_coding_plan",
+            "doubao-seed-2.0-lite",
+            "doubao-seed-2.0-pro",
+            "doubao-seed-2.0-code",
+            "doubao-seed-2.0-code",
+            subject="Volcengine Coding Plan",
+        ),
+    ),
+}
+
+
 def _load_packaged_preset(preset_id: str) -> ProviderPreset | None:
     import tomllib
 
@@ -167,6 +306,22 @@ def _synthesized_tiers(provider_id: str, default_model: str) -> dict[str, dict]:
     return tiers
 
 
+def _curated_synthesized_preset(provider_id: str) -> ProviderPreset | None:
+    data = _CURATED_SYNTHESIZED_PRESETS.get(provider_id)
+    if data is None:
+        return None
+    default_model, tiers = data
+    return ProviderPreset(
+        preset_id=provider_id,
+        provider_id=provider_id,
+        label=provider_id,
+        description=f"Curated inline router preset for {provider_id}.",
+        default_model=default_model,
+        tiers=tiers,
+        synthesized=True,
+    )
+
+
 @cache
 def _synthesized_presets() -> dict[str, ProviderPreset]:
     """Build synthesized presets for every non-legacy runtime provider."""
@@ -180,6 +335,10 @@ def _synthesized_presets() -> dict[str, ProviderPreset]:
         if provider_id in packaged or provider_id in LEGACY_PROVIDER_PRESET_IDS:
             continue
         if not spec.runtime_supported:
+            continue
+        curated = _curated_synthesized_preset(provider_id)
+        if curated is not None:
+            presets[provider_id] = curated
             continue
         # Onboarding's default-direct-model semantics, inlined (provider must
         # not import onboarding — architecture import contract): only curated

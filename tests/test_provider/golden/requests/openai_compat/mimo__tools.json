@@ -31,14 +31,12 @@
         "tool_call_id": "call_001"
       }
     ],
-    "model": "kimi-k2.7-code",
+    "model": "test-chat-model",
     "stream": true,
     "stream_options": {
       "include_usage": true
     },
-    "thinking": {
-      "type": "disabled"
-    },
+    "temperature": 0.7,
     "tools": [
       {
         "function": {
@@ -91,5 +89,5 @@
   },
   "content_type": "application/json",
   "method": "POST",
-  "url": "https://api.moonshot.ai/v1/chat/completions"
+  "url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions"
 }

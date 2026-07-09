@@ -10,8 +10,8 @@ default_model = "glm-5"
 
 [tiers.c0]
 provider = "zhipu"
-model = "glm-4.7-flashx"
-description = "Zhipu fast route: GLM-4.7 FlashX for simple text tasks; live smoke may require fallback."
+model = "glm-5-turbo"
+description = "Zhipu fast route: GLM-5-Turbo for simple text tasks."
 supports_image = false
 
 [tiers.c1]
@@ -30,7 +30,7 @@ supports_image = false
 
 [tiers.c3]
 provider = "zhipu"
-model = "glm-5.1"
-description = "Zhipu highest route: GLM-5.1 with high reasoning effort."
+model = "glm-5.2"
+description = "Zhipu highest route: GLM-5.2 with high reasoning effort for hardest coding and long-context routes."
 thinking_level = "high"
 supports_image = false

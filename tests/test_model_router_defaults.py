@@ -62,7 +62,7 @@ def test_squilla_router_defaults_match_runtime_router_config() -> None:
     assert cfg.tiers["c1"]["thinking_level"] == "high"
     assert cfg.tiers["c2"]["model"] == "z-ai/glm-5.2"
     assert cfg.tiers["c2"]["thinking_level"] == "high"
-    assert cfg.tiers["c3"]["model"] == "z-ai/glm-5.2"
+    assert cfg.tiers["c3"]["model"] == "anthropic/claude-opus-4.8"
     assert cfg.tiers["c3"]["thinking_level"] == "high"
     assert cfg.tiers["image_model"]["model"] == "moonshotai/kimi-k2.6"
     assert cfg.tiers["image_model"]["supports_image"] is True
@@ -272,19 +272,20 @@ def test_openai_profile_uses_streaming_compatible_models() -> None:
     assert cfg.tiers["c3"]["model"] == "gpt-5.5"
     assert cfg.tiers["c3"]["thinking_level"] == "high"
     assert all(
-        cfg.tiers[tier]["model"] != "gpt-5.5-pro" for tier in ("c0", "c1", "c2", "c3")
+        cfg.tiers[tier]["model"] not in {"gpt-5", "gpt-5-mini", "gpt-5.5-pro"}
+        for tier in ("c0", "c1", "c2", "c3")
     )
 
 
-def test_zhipu_profile_uses_glm_5_1_for_strong_tiers() -> None:
+def test_zhipu_profile_uses_current_glm_5_ladder() -> None:
     squilla_router_config_cls = _squilla_router_config_cls()
 
     cfg = squilla_router_config_cls(tier_profile="zhipu")
 
-    assert cfg.tiers["c0"]["model"] == "glm-4.7-flashx"
+    assert cfg.tiers["c0"]["model"] == "glm-5-turbo"
     assert cfg.tiers["c1"]["model"] == "glm-5"
     assert cfg.tiers["c2"]["model"] == "glm-5.1"
-    assert cfg.tiers["c3"]["model"] == "glm-5.1"
+    assert cfg.tiers["c3"]["model"] == "glm-5.2"
     assert cfg.tiers["c3"]["thinking_level"] == "high"
 
 
@@ -293,10 +294,10 @@ def test_moonshot_profile_uses_kimi_for_strong_tiers() -> None:
 
     cfg = squilla_router_config_cls(tier_profile="moonshot")
 
-    assert cfg.tiers["c0"]["model"] == "kimi-k2.5"
-    assert cfg.tiers["c1"]["model"] == "kimi-k2.5"
+    assert cfg.tiers["c0"]["model"] == "kimi-k2.6"
+    assert cfg.tiers["c1"]["model"] == "kimi-k2.6"
     assert cfg.tiers["c2"]["model"] == "kimi-k2.6"
-    assert cfg.tiers["c3"]["model"] == "kimi-k2.6"
+    assert cfg.tiers["c3"]["model"] == "kimi-k2.7-code"
     assert all(
         cfg.tiers[tier]["supports_image"] is True for tier in ("c0", "c1", "c2", "c3")
     )
@@ -307,13 +308,13 @@ def test_volcengine_profile_uses_seed_2_capability_ladder() -> None:
 
     cfg = squilla_router_config_cls(tier_profile="volcengine")
 
-    assert cfg.tiers["c0"]["model"] == "doubao-seed-2-0-mini-260215"
+    assert cfg.tiers["c0"]["model"] == "doubao-seed-2-0-lite-260215"
     assert cfg.tiers["c0"]["thinking_level"] == "off"
     assert cfg.tiers["c1"]["model"] == "doubao-seed-2-0-lite-260215"
     assert cfg.tiers["c1"]["thinking_level"] == "low"
     assert cfg.tiers["c2"]["model"] == "doubao-seed-2-0-pro-260215"
     assert cfg.tiers["c2"]["thinking_level"] == "medium"
-    assert cfg.tiers["c3"]["model"] == "doubao-seed-2-0-code-preview-260215"
+    assert cfg.tiers["c3"]["model"] == "doubao-seed-2-0-pro-260215"
     assert cfg.tiers["c3"]["thinking_level"] == "high"
 
 
@@ -341,7 +342,7 @@ def test_profile_tier_override_merges_keys_inside_tier() -> None:
     )
 
     assert cfg.tiers["c2"]["provider"] == "gemini"
-    assert cfg.tiers["c2"]["model"] == "gemini-2.5-pro"
+    assert cfg.tiers["c2"]["model"] == "gemini-3.1-pro-preview"
     assert cfg.tiers["c2"]["thinking_level"] == "high"
 
 
@@ -432,9 +433,9 @@ def test_runtime_router_config_does_not_ship_unused_cost_fields() -> None:
     assert data["tier_registry"]["S"] == ["deepseek/deepseek-v4-flash"]
     assert data["tier_registry"]["M"] == ["deepseek/deepseek-v4-pro"]
     assert data["tier_registry"]["L"] == ["z-ai/glm-5.2"]
-    assert data["tier_registry"]["XL"] == ["z-ai/glm-5.2"]
+    assert data["tier_registry"]["XL"] == ["anthropic/claude-opus-4.8"]
     assert data["tier_explanations"]["L"]["model"] == "z-ai/glm-5.2"
-    assert data["tier_explanations"]["XL"]["model"] == "z-ai/glm-5.2"
+    assert data["tier_explanations"]["XL"]["model"] == "anthropic/claude-opus-4.8"
     assert "cost_ratios:" not in text
     assert "cost_matrix:" not in text
     assert "under_routing_multiplier" not in text

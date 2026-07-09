@@ -31,6 +31,9 @@ from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
     Message,
+    ProviderHeartbeatEvent,
+    ReasoningDeltaEvent,
+    TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
     ToolUseDeltaEvent,
@@ -178,6 +181,99 @@ def test_missing_index_does_not_fail_stream_for_non_gemini(monkeypatch: Any) -> 
     assert len(ends) == 1
     assert ends[0].tool_use_id == "call_1"
     assert ends[0].arguments == {"query": "x"}
+    assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_null_tool_calls_delta_is_treated_as_empty(monkeypatch: Any) -> None:
+    """OpenAI-compatible gateways may stream ``tool_calls: null``."""
+    chunks = [
+        {"choices": [{"delta": {"content": "ok", "tool_calls": None}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    _patch_stream_body(monkeypatch, "openai", _openai_sse(chunks))
+    provider = OpenAIProvider(api_key="k", model="m", provider_kind="openai")
+    events = _collect(provider, tools=[_SEARCH_TOOL])
+
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+    assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_empty_stream_falls_back_to_non_stream_for_policy_kind(monkeypatch: Any) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append(payload)
+        if payload.get("stream") is True:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"data: [DONE]\n\n",
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "kimi-for-coding",
+                "choices": [{"message": {"content": "fallback ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    provider = OpenAIProvider(api_key="k", model="kimi-for-coding", provider_kind="moonshot")
+    events = _collect(provider)
+
+    assert len(calls) == 2
+    assert calls[0]["stream"] is True
+    assert calls[1]["stream"] is False
+    assert any(isinstance(e, ProviderHeartbeatEvent) for e in events)
+    assert [e.text for e in events if isinstance(e, TextDeltaEvent)] == ["fallback ok"]
+    assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_reasoning_only_stream_does_not_trigger_empty_stream_fallback(monkeypatch: Any) -> None:
+    """A stream that delivered reasoning deltas is not empty: retrying it
+    non-stream would deliver (and bill) the same turn twice."""
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append(payload)
+        chunks = [
+            {
+                "choices": [
+                    {"delta": {"reasoning_content": "thinking..."}, "finish_reason": None}
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_openai_sse(chunks),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    provider = OpenAIProvider(api_key="k", model="kimi-for-coding", provider_kind="moonshot")
+    events = _collect(provider)
+
+    assert len(calls) == 1
+    assert calls[0]["stream"] is True
+    assert any(isinstance(e, ReasoningDeltaEvent) for e in events)
     assert any(isinstance(e, DoneEvent) for e in events)
 
 

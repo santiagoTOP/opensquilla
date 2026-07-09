@@ -60,6 +60,7 @@ class OpenAICompatPolicy:
     supports_explicit_prompt_cache: bool = False
     anthropic_top_level_cache: bool = False
     stream_timeout_fallback: bool = False
+    empty_stream_fallback: bool = False
     log_payload_cache_shape: bool = False
 
     # Gateway proxies with their own routing (LiteLLM): pin the requested
@@ -162,12 +163,14 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "bailian_coding": OpenAICompatPolicy(display_name="Bailian Coding"),
     "moonshot": OpenAICompatPolicy(
         display_name="Moonshot",
-        fixed_sampling_model_prefixes=("kimi-k2.5", "kimi-k2.6"),
+        fixed_sampling_model_prefixes=("kimi-k2.5", "kimi-k2.6", "kimi-k2.7"),
+        empty_stream_fallback=True,
     ),
     "minimax": OpenAICompatPolicy(
         display_name="MiniMax",
         text_tool_synthesis=True,
     ),
+    "mimo": OpenAICompatPolicy(display_name="MiMo"),
     "mistral": OpenAICompatPolicy(display_name="Mistral"),
     "groq": OpenAICompatPolicy(display_name="Groq"),
     "zhipu": OpenAICompatPolicy(display_name="Zhipu"),

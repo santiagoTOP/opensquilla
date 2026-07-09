@@ -31,26 +31,26 @@
   },
   "dashscope": {
     "c0": {
-      "description": "DashScope fast route: Qwen3.6 Flash for simple text tasks; pending live smoke.",
+      "description": "DashScope fast route: Qwen3.6 Flash for simple text tasks.",
       "model": "qwen3.6-flash",
       "provider": "dashscope",
       "supports_image": false
     },
     "c1": {
-      "description": "DashScope balanced route: Qwen3.6 Plus for normal agent and coding work; pending live smoke.",
-      "model": "qwen3.6-plus",
+      "description": "DashScope balanced route: Qwen3.7 Plus for normal agent and coding work.",
+      "model": "qwen3.7-plus",
       "provider": "dashscope",
       "supports_image": false
     },
     "c2": {
-      "description": "DashScope strong route: Qwen3 Max for complex text tasks.",
-      "model": "qwen3-max",
+      "description": "DashScope strong route: Qwen3.7 Max for complex text tasks.",
+      "model": "qwen3.7-max",
       "provider": "dashscope",
       "supports_image": false
     },
     "c3": {
-      "description": "DashScope highest route: Qwen3 Max; higher-thinking behavior requires future payload support.",
-      "model": "qwen3-max",
+      "description": "DashScope highest route: Qwen3.7 Max for the hardest text and coding routes.",
+      "model": "qwen3.7-max",
       "provider": "dashscope",
       "supports_image": false
     }
@@ -87,28 +87,28 @@
   },
   "gemini": {
     "c0": {
-      "description": "Gemini fast route: 2.5 Flash-Lite for low-latency tasks.",
-      "model": "gemini-2.5-flash-lite",
+      "description": "Gemini fast route: 3.1 Flash-Lite for low-latency tasks.",
+      "model": "gemini-3.1-flash-lite",
       "provider": "gemini",
       "supports_image": false
     },
     "c1": {
-      "description": "Gemini balanced route: 2.5 Flash for normal agent work.",
-      "model": "gemini-2.5-flash",
+      "description": "Gemini balanced route: 3.5 Flash for normal agent work.",
+      "model": "gemini-3.5-flash",
       "provider": "gemini",
       "supports_image": false,
       "thinking_level": "low"
     },
     "c2": {
-      "description": "Gemini strong route: 2.5 Pro for complex coding and reasoning.",
-      "model": "gemini-2.5-pro",
+      "description": "Gemini strong route: 3.1 Pro Preview for complex coding and reasoning.",
+      "model": "gemini-3.1-pro-preview",
       "provider": "gemini",
       "supports_image": false,
       "thinking_level": "medium"
     },
     "c3": {
-      "description": "Gemini highest route: 2.5 Pro with high thinking; 3.1 preview remains opt-in.",
-      "model": "gemini-2.5-pro",
+      "description": "Gemini highest route: 3.1 Pro Preview with high thinking for hardest routes.",
+      "model": "gemini-3.1-pro-preview",
       "provider": "gemini",
       "supports_image": false,
       "thinking_level": "high"
@@ -116,15 +116,15 @@
   },
   "moonshot": {
     "c0": {
-      "description": "Moonshot fast route: Kimi K2.5 for cost-efficient agent work with 256K context.",
-      "model": "kimi-k2.5",
+      "description": "Moonshot fast route: Kimi K2.6 for cost-efficient multimodal agent work with 256K context.",
+      "model": "kimi-k2.6",
       "provider": "moonshot",
       "supports_image": true,
       "thinking_level": "low"
     },
     "c1": {
-      "description": "Moonshot balanced route: Kimi K2.5 for normal multimodal agent work.",
-      "model": "kimi-k2.5",
+      "description": "Moonshot balanced route: Kimi K2.6 for normal multimodal agent work.",
+      "model": "kimi-k2.6",
       "provider": "moonshot",
       "supports_image": true,
       "thinking_level": "medium"
@@ -137,8 +137,8 @@
       "thinking_level": "medium"
     },
     "c3": {
-      "description": "Moonshot highest route: Kimi K2.6 for the hardest long-horizon agent work.",
-      "model": "kimi-k2.6",
+      "description": "Moonshot highest route: Kimi K2.7 Code for the hardest coding and long-horizon agent routes.",
+      "model": "kimi-k2.7-code",
       "provider": "moonshot",
       "supports_image": true,
       "thinking_level": "high"
@@ -146,7 +146,7 @@
   },
   "openai": {
     "c0": {
-      "description": "OpenAI fast route: GPT-5.4 Nano for fast, high-throughput simple work.",
+      "description": "OpenAI fast route: GPT-5.4 Nano for simple and low-latency work.",
       "model": "gpt-5.4-nano",
       "provider": "openai",
       "supports_image": false,
@@ -167,7 +167,7 @@
       "thinking_level": "medium"
     },
     "c3": {
-      "description": "OpenAI highest route: GPT-5.5 with high reasoning; GPT-5.5 Pro is excluded because it is not streaming-compatible.",
+      "description": "OpenAI highest route: GPT-5.5 for harder analysis and review.",
       "model": "gpt-5.5",
       "provider": "openai",
       "supports_image": false,
@@ -197,8 +197,8 @@
       "thinking_level": "high"
     },
     "c3": {
-      "description": "Highest-tier GLM 5.2 route for difficult planning, deep review, complex debugging, and high-stakes synthesis",
-      "model": "z-ai/glm-5.2",
+      "description": "Highest-tier Claude Opus 4.8 route for difficult planning, deep review, complex debugging, and high-stakes synthesis",
+      "model": "anthropic/claude-opus-4.8",
       "provider": "openrouter",
       "supports_image": false,
       "thinking_level": "high"
@@ -214,8 +214,8 @@
   },
   "volcengine": {
     "c0": {
-      "description": "Volcengine fast route: Doubao Seed 2.0 Mini for low-latency, low-cost simple text tasks.",
-      "model": "doubao-seed-2-0-mini-260215",
+      "description": "Volcengine fast route: Doubao Seed 2.0 Lite for low-latency simple text tasks.",
+      "model": "doubao-seed-2-0-lite-260215",
       "provider": "volcengine",
       "supports_image": false,
       "thinking_level": "off"
@@ -235,8 +235,8 @@
       "thinking_level": "medium"
     },
     "c3": {
-      "description": "Volcengine highest route: Doubao Seed 2.0 Code Preview for the hardest coding and code-review routes.",
-      "model": "doubao-seed-2-0-code-preview-260215",
+      "description": "Volcengine highest route: Doubao Seed 2.0 Pro for hard analysis and code-review routes without preview-model dependency.",
+      "model": "doubao-seed-2-0-pro-260215",
       "provider": "volcengine",
       "supports_image": false,
       "thinking_level": "high"
@@ -244,8 +244,8 @@
   },
   "zhipu": {
     "c0": {
-      "description": "Zhipu fast route: GLM-4.7 FlashX for simple text tasks; live smoke may require fallback.",
-      "model": "glm-4.7-flashx",
+      "description": "Zhipu fast route: GLM-5-Turbo for simple text tasks.",
+      "model": "glm-5-turbo",
       "provider": "zhipu",
       "supports_image": false
     },
@@ -264,8 +264,8 @@
       "thinking_level": "medium"
     },
     "c3": {
-      "description": "Zhipu highest route: GLM-5.1 with high reasoning effort.",
-      "model": "glm-5.1",
+      "description": "Zhipu highest route: GLM-5.2 with high reasoning effort for hardest coding and long-context routes.",
+      "model": "glm-5.2",
       "provider": "zhipu",
       "supports_image": false,
       "thinking_level": "high"

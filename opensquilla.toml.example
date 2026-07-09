@@ -121,6 +121,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # zhipu         ZAI_API_KEY              https://open.bigmodel.cn/api/paas/v4
 # siliconflow   SILICONFLOW_API_KEY      https://api.siliconflow.cn/v1
 # volcengine    VOLCENGINE_API_KEY       https://ark.cn-beijing.volces.com/api/v3
+# volcengine_coding_plan VOLCENGINE_API_KEY https://ark.cn-beijing.volces.com/api/coding/v3
 # byteplus      BYTEPLUS_API_KEY         https://ark.ap-southeast.bytepluses.com/api/v3
 # vllm          none                     explicit base_url required
 # custom        CUSTOM_LLM_API_KEY (optional)  explicit base_url required
@@ -129,7 +130,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # qianfan       QIANFAN_API_KEY          https://qianfan.baidubce.com/v2
 # aihubmix      AIHUBMIX_API_KEY         https://aihubmix.com/v1
 # minimax       MINIMAX_API_KEY          https://api.minimaxi.com/anthropic  (Anthropic-shape backend)
-# minimax_openai MINIMAX_API_KEY          https://api.minimaxi.com/v1         (OpenAI-compatible variant)
+# minimax_openai MINIMAX_API_KEY          https://api.minimax.io/v1          (OpenAI-compatible variant)
 # azure         provider-specific        unsupported_for_A
 #
 # Example direct DeepSeek config:

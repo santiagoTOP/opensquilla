@@ -71,16 +71,16 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # _DEEPSEEK_V4_MODEL_IDS: thinking-toggle + require-reasoning_content
     # sets (compat_policy); deepseek reasoning_shape -> "deepseek".
     "deepseek": ("deepseek-v4-flash", "deepseek"),
-    # gemini-2.5 prefix ladder (model_catalog) -> "gemini"; the flash id also
-    # exercises the documented reasoning_effort="none" off-toggle.
-    "gemini": ("gemini-2.5-flash", "gemini"),
+    # gemini-3 prefix ladder (model_catalog) -> "gemini".
+    "gemini": ("gemini-3.5-flash", "gemini"),
     # qwen3 prefix ladder (model_catalog dashscope branch) -> "dashscope".
     "dashscope": ("qwen3-coder-plus", "dashscope"),
     "bailian_coding": (_NEUTRAL_MODEL, "none"),
-    # kimi-k2.5 ladder (model_catalog moonshot branch) -> "moonshot"; also in
+    # kimi-k2.7 ladder (model_catalog moonshot branch) -> "moonshot"; also in
     # fixed_sampling_model_prefixes so the non-default temperature is dropped.
-    "moonshot": ("kimi-k2.5", "moonshot"),
+    "moonshot": ("kimi-k2.7-code", "moonshot"),
     "minimax": (_NEUTRAL_MODEL, "none"),
+    "mimo": (_NEUTRAL_MODEL, "none"),
     "mistral": (_NEUTRAL_MODEL, "none"),
     "groq": (_NEUTRAL_MODEL, "none"),
     # glm-5 prefix in the zai ladder (model_catalog) -> "zai".

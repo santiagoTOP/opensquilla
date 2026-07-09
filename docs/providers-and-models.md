@@ -113,8 +113,8 @@ Both read the same key and base URL, so switching between them needs only a
 Use `volcengine` for regular Ark chat/completions models. Its default base URL
 is the OpenAI-compatible endpoint `https://ark.cn-beijing.volces.com/api/v3`.
 
-Use `volcengine_coding_plan` for Volcengine's OpenAI Responses-compatible
-coding-plan subscription surface. Its default base URL is
+Use `volcengine_coding_plan` for Volcengine's OpenAI Responses-compatible coding-plan
+subscription surface. Its default base URL is
 `https://ark.cn-beijing.volces.com/api/coding/v3`; OpenSquilla appends
 `/responses` when it sends the request.
 

@@ -61,10 +61,16 @@ _PROVIDER_LABELS: dict[str, str] = {
     "dashscope": "Aliyun DashScope",
     "bailian_coding": "Bailian Coding",
     "moonshot": "Moonshot AI",
+    "kimi_coding_openai": "Kimi Coding OpenAI-compatible",
+    "kimi_coding_anthropic": "Kimi Coding Anthropic-compatible",
     "minimax": "MiniMax",
     "minimax_openai": "MiniMax OpenAI-compatible",
+    "minimax_coding_openai": "MiniMax Coding OpenAI-compatible",
+    "minimax_coding_anthropic": "MiniMax Coding Anthropic-compatible",
     "minimax_cn": "MiniMax Mainland",
     "minimax_global": "MiniMax Global",
+    "mimo_openai": "MiMo OpenAI-compatible",
+    "mimo_anthropic": "MiMo Anthropic-compatible",
     "mistral": "Mistral",
     "groq": "Groq",
     "zhipu": "Zhipu (Z.AI)",
@@ -101,6 +107,22 @@ _CATALOG_RANK = {
     "tokenrhythm": 0,
     "openrouter": 1,
 }
+
+_INLINE_ROUTER_SUPPORTED_PROVIDER_IDS: frozenset[str] = frozenset(
+    {
+        "qianfan",
+        "volcengine_coding_plan",
+        "kimi_coding_openai",
+        "kimi_coding_anthropic",
+        "minimax",
+        "minimax_cn",
+        "minimax_global",
+        "minimax_coding_openai",
+        "minimax_coding_anthropic",
+        "mimo_openai",
+        "mimo_anthropic",
+    }
+)
 
 _ONBOARDING_VERIFIED_PROVIDER_IDS = frozenset(
     {
@@ -145,9 +167,16 @@ def _has_curated_router_ladder(provider_id: str) -> bool:
     return preset is not None and not preset.synthesized
 
 
+def _is_router_supported_provider(provider_id: str) -> bool:
+    return (
+        _has_curated_router_ladder(provider_id)
+        or provider_id in _INLINE_ROUTER_SUPPORTED_PROVIDER_IDS
+    )
+
+
 def _what_you_need(spec: ProviderSpec) -> tuple[str, ...]:
     needs: list[str] = []
-    if not _has_curated_router_ladder(spec.provider_id):
+    if not _is_router_supported_provider(spec.provider_id):
         needs.append(
             "A local model name available from your model server."
             if spec.provider_id in _LOCAL_PROVIDER_IDS
@@ -171,10 +200,16 @@ def _what_you_need(spec: ProviderSpec) -> tuple[str, ...]:
 def _default_direct_model(provider_id: str) -> str:
     preset = get_preset(provider_id)
     if preset is None or preset.synthesized:
+        if provider_id in _INLINE_ROUTER_SUPPORTED_PROVIDER_IDS and preset is not None:
+            return preset.default_model
         return ""
-    tiers = preset.tier_defaults()
-    tier = tiers.get("c1") or tiers.get("c0") or {}
-    return str(tier.get("model") or "")
+    if _has_curated_router_ladder(provider_id):
+        tiers = preset.tier_defaults()
+        tier = tiers.get("c1") or tiers.get("c0") or {}
+        return str(tier.get("model") or "")
+    if provider_id in _INLINE_ROUTER_SUPPORTED_PROVIDER_IDS:
+        return preset.default_model
+    return ""
 
 
 def _model_description(spec: ProviderSpec, *, router_supported: bool) -> str:
@@ -189,7 +224,7 @@ def _model_description(spec: ProviderSpec, *, router_supported: bool) -> str:
 
 
 def _fields_for(spec: ProviderSpec) -> tuple[ProviderSetupField, ...]:
-    router_supported = _has_curated_router_ladder(spec.provider_id)
+    router_supported = _is_router_supported_provider(spec.provider_id)
     return (
         ProviderSetupField(
             name="model",
@@ -277,7 +312,7 @@ def _to_setup_spec(spec: ProviderSpec) -> ProviderSetupSpec:
         default_base_url=spec.default_base_url,
         requires_api_key=spec.requires_api_key(),
         requires_base_url=spec.requires_base_url(),
-        router_supported=_has_curated_router_ladder(spec.provider_id),
+        router_supported=_is_router_supported_provider(spec.provider_id),
         deployment=_deployment_for(spec),
         blocking=True,
         # Runtime-supported providers can be probed live (one-token chat via

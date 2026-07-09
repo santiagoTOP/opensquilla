@@ -43,15 +43,22 @@ _MODEL_ENV = {
     "deepseek": "DEEPSEEK_MODEL",
     "gemini": "GEMINI_MODEL",
     "volcengine": "VOLCENGINE_MODEL",
+    "volcengine_coding_plan": "VOLCENGINE_CODING_MODEL",
     "byteplus": "BYTEPLUS_MODEL",
     "bailian_coding": "BAILIAN_CODING_MODEL",
     "moonshot": "MOONSHOT_MODEL",
+    "kimi_coding_openai": "KIMI_CODING_MODEL",
+    "kimi_coding_anthropic": "KIMI_CODING_MODEL",
     "zhipu": "ZAI_MODEL",
     "qianfan": "QIANFAN_MODEL",
     "minimax": "MINIMAX_MODEL",
     "minimax_openai": "MINIMAX_MODEL",
+    "minimax_coding_openai": "MINIMAX_CODING_MODEL",
+    "minimax_coding_anthropic": "MINIMAX_CODING_MODEL",
     "minimax_cn": "MINIMAX_CN_MODEL",
     "minimax_global": "MINIMAX_GLOBAL_MODEL",
+    "mimo_openai": "MIMO_MODEL",
+    "mimo_anthropic": "MIMO_MODEL",
     "tencent_tokenhub": "TENCENT_TOKENHUB_MODEL",
     "tencent_tokenhub_anthropic": "TENCENT_TOKENHUB_MODEL",
     "tencent_tokenhub_intl": "TENCENT_TOKENHUB_INTL_MODEL",
@@ -66,15 +73,22 @@ _BASE_ENV = {
     "deepseek": "DEEPSEEK_BASE_URL",
     "gemini": "GEMINI_BASE_URL",
     "volcengine": "VOLCENGINE_BASE_URL",
+    "volcengine_coding_plan": "VOLCENGINE_CODING_BASE_URL",
     "byteplus": "BYTEPLUS_BASE_URL",
     "bailian_coding": "BAILIAN_CODING_BASE_URL",
     "moonshot": "MOONSHOT_BASE_URL",
+    "kimi_coding_openai": "KIMI_CODING_OPENAI_BASE_URL",
+    "kimi_coding_anthropic": "KIMI_CODING_ANTHROPIC_BASE_URL",
     "zhipu": "ZAI_BASE_URL",
     "qianfan": "QIANFAN_BASE_URL",
     "minimax": "MINIMAX_BASE_URL",
     "minimax_openai": "MINIMAX_OPENAI_BASE_URL",
+    "minimax_coding_openai": "MINIMAX_CODING_OPENAI_BASE_URL",
+    "minimax_coding_anthropic": "MINIMAX_CODING_ANTHROPIC_BASE_URL",
     "minimax_cn": "MINIMAX_CN_BASE_URL",
     "minimax_global": "MINIMAX_GLOBAL_BASE_URL",
+    "mimo_openai": "MIMO_OPENAI_BASE_URL",
+    "mimo_anthropic": "MIMO_ANTHROPIC_BASE_URL",
     "tencent_tokenhub": "TENCENT_TOKENHUB_BASE_URL",
     "tencent_tokenhub_anthropic": "TENCENT_TOKENHUB_ANTHROPIC_BASE_URL",
     "tencent_tokenhub_intl": "TENCENT_TOKENHUB_INTL_BASE_URL",
@@ -84,20 +98,27 @@ _BASE_ENV = {
 }
 
 _DEFAULT_MODELS = {
-    "openai": "gpt-4.1",
-    "dashscope": "qwen3.6-plus",
+    "openai": "gpt-5.4-mini",
+    "dashscope": "qwen3.7-plus",
     "deepseek": "deepseek-v4-flash",
-    "gemini": "gemini-2.5-flash",
-    "volcengine": "doubao-seed-1-6-251015",
+    "gemini": "gemini-3.5-flash",
+    "volcengine": "doubao-seed-2-0-lite-260215",
+    "volcengine_coding_plan": "doubao-seed-2.0-pro",
     "byteplus": "seed-2-0-lite-260228",
     "bailian_coding": "kimi-k2.5",
     "moonshot": "kimi-k2.6",
-    "zhipu": "glm-4.5",
-    "qianfan": "ernie-4.0-turbo-8k",
+    "kimi_coding_openai": "kimi-for-coding",
+    "kimi_coding_anthropic": "kimi-for-coding",
+    "zhipu": "glm-5",
+    "qianfan": "ernie-4.5-turbo-128k",
     "minimax": "MiniMax-M2.7",
     "minimax_openai": "MiniMax-M2.7",
+    "minimax_coding_openai": "MiniMax-M2.7",
+    "minimax_coding_anthropic": "MiniMax-M2.7",
     "minimax_cn": "MiniMax-M2.7",
     "minimax_global": "MiniMax-M2.7",
+    "mimo_openai": "mimo-v2.5",
+    "mimo_anthropic": "mimo-v2.5-pro",
     "tencent_tokenhub": "hy3",
     "tencent_tokenhub_anthropic": "hy3",
     "tencent_tokenhub_intl": "deepseek-v3.2",
@@ -159,9 +180,17 @@ def _versioned_chat_url(base_url: str) -> str:
 
 
 def _direct_openai_temperature(provider: str, model: str) -> int:
+    if provider == "kimi_coding_openai" and model == "kimi-for-coding":
+        return 1
     if provider == "moonshot" and model.lower().startswith("kimi-k2."):
         return 1
     return 0
+
+
+def _direct_openai_token_limit_field(provider: str, model: str) -> str:
+    if provider == "openai" and model.lower().startswith(("gpt-5", "o1", "o3", "o4")):
+        return "max_completion_tokens"
+    return "max_tokens"
 
 
 async def _direct_openai(
@@ -182,8 +211,8 @@ async def _direct_openai(
             }
         ],
         "temperature": _direct_openai_temperature(provider, model),
-        "max_tokens": max_tokens,
     }
+    payload[_direct_openai_token_limit_field(provider, model)] = max_tokens
     try:
         async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             resp = await client.post(
@@ -214,7 +243,7 @@ async def _direct_anthropic(
     start = time.perf_counter()
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": expected}],
+        "messages": [{"role": "user", "content": f"Reply exactly with: {expected}"}],
         "max_tokens": max_tokens,
         "temperature": 1,
     }

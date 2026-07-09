@@ -4,6 +4,7 @@ import pytest
 
 from opensquilla.provider.anthropic import AnthropicProvider
 from opensquilla.provider.openai import OpenAIProvider
+from opensquilla.provider.openai_responses import OpenAIResponsesProvider
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import ProviderBuildError, ProviderConfig, _build_provider
 
@@ -16,6 +17,9 @@ from opensquilla.provider.selector import ProviderBuildError, ProviderConfig, _b
         ("dashscope", "dashscope"),
         ("bailian_coding", "bailian_coding"),
         ("moonshot", "moonshot"),
+        ("kimi_coding_openai", "moonshot"),
+        ("minimax_coding_openai", "minimax"),
+        ("mimo_openai", "mimo"),
         ("mistral", "mistral"),
         ("groq", "groq"),
         ("zhipu", "zhipu"),
@@ -55,6 +59,21 @@ def test_new_openai_compatible_profiles_have_vendor_provider_kind(
             "https://coding-intl.dashscope.aliyuncs.com/v1",
         ),
         ("moonshot", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1"),
+        (
+            "kimi_coding_openai",
+            "KIMI_CODING_API_KEY",
+            "https://api.kimi.com/coding/v1",
+        ),
+        (
+            "minimax_coding_openai",
+            "MINIMAX_CODING_API_KEY",
+            "https://api.minimaxi.com/v1",
+        ),
+        (
+            "mimo_openai",
+            "MIMO_API_KEY",
+            "https://token-plan-cn.xiaomimimo.com/v1",
+        ),
         ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
         ("groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1"),
         ("zhipu", "ZAI_API_KEY", "https://open.bigmodel.cn/api/paas/v4"),
@@ -190,6 +209,39 @@ def test_minimax_region_profiles_are_explicit_anthropic_compatible_endpoints() -
     assert global_.failure_family == "anthropic"
 
 
+def test_kimi_coding_anthropic_profile_is_explicit_anthropic_compatible() -> None:
+    spec = get_provider_spec("kimi_coding_anthropic")
+
+    assert spec.backend == "anthropic"
+    assert spec.provider_kind == "moonshot"
+    assert spec.env_key == "KIMI_CODING_API_KEY"
+    assert spec.default_base_url == "https://api.kimi.com/coding"
+    assert spec.failure_family == "anthropic"
+    assert spec.auth_header_style == "bearer"
+
+
+def test_minimax_coding_anthropic_profile_is_explicit_anthropic_compatible() -> None:
+    spec = get_provider_spec("minimax_coding_anthropic")
+
+    assert spec.backend == "anthropic"
+    assert spec.provider_kind == "minimax"
+    assert spec.env_key == "MINIMAX_CODING_API_KEY"
+    assert spec.default_base_url == "https://api.minimaxi.com/anthropic"
+    assert spec.failure_family == "anthropic"
+    assert spec.auth_header_style == "bearer"
+
+
+def test_mimo_anthropic_profile_is_explicit_anthropic_compatible() -> None:
+    spec = get_provider_spec("mimo_anthropic")
+
+    assert spec.backend == "anthropic"
+    assert spec.provider_kind == "mimo"
+    assert spec.env_key == "MIMO_API_KEY"
+    assert spec.default_base_url == "https://token-plan-cn.xiaomimimo.com/anthropic"
+    assert spec.failure_family == "anthropic"
+    assert spec.auth_header_style == "bearer"
+
+
 @pytest.mark.parametrize(
     ("provider", "model"),
     [
@@ -198,6 +250,7 @@ def test_minimax_region_profiles_are_explicit_anthropic_compatible_endpoints() -
         ("dashscope", "qwen-plus"),
         ("bailian_coding", "kimi-k2.5"),
         ("moonshot", "kimi-k2.5"),
+        ("kimi_coding_openai", "kimi-for-coding"),
         ("mistral", "mistral-large-latest"),
         ("groq", "llama-3.3-70b-versatile"),
         ("zhipu", "glm-4.5"),
@@ -207,6 +260,8 @@ def test_minimax_region_profiles_are_explicit_anthropic_compatible_endpoints() -
         ("qianfan", "ernie-4.5-turbo-128k"),
         ("aihubmix", "openai/gpt-5-mini"),
         ("minimax_openai", "MiniMax-M2.7"),
+        ("minimax_coding_openai", "MiniMax-M2.7"),
+        ("mimo_openai", "mimo-v2.5"),
         ("tencent_tokenhub", "hy3"),
         ("tencent_tokenhub_intl", "deepseek-v3.2"),
         ("tencent_token_plan", "hy3"),
@@ -223,6 +278,26 @@ def test_model_selector_builds_registered_openai_compatible_providers(
     assert isinstance(built, OpenAIProvider)
 
 
+def test_model_selector_preserves_volcengine_coding_plan_responses_contract() -> None:
+    spec = get_provider_spec("volcengine_coding_plan")
+
+    assert spec.backend == "openai_responses"
+    assert spec.provider_kind == "volcengine_coding_plan"
+    assert spec.env_key == "VOLCENGINE_API_KEY"
+    assert spec.default_base_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
+    assert spec.capabilities == frozenset({"chat", "coding_plan", "responses"})
+
+    built = _build_provider(
+        ProviderConfig(
+            provider="volcengine_coding_plan",
+            model="doubao-seed-2.0-pro",
+            api_key="test-key",
+        )
+    )
+
+    assert isinstance(built, OpenAIResponsesProvider)
+
+
 def test_model_selector_builds_minimax_mainland_anthropic_provider() -> None:
     built = _build_provider(
         ProviderConfig(provider="minimax", model="MiniMax-M2.7", api_key="test-key")
@@ -236,7 +311,7 @@ def test_model_selector_builds_minimax_openai_compatible_provider() -> None:
     assert spec.backend == "openai_compat"
     assert spec.provider_kind == "minimax"
     assert spec.env_key == "MINIMAX_API_KEY"
-    assert spec.default_base_url == "https://api.minimaxi.com/v1"
+    assert spec.default_base_url == "https://api.minimax.io/v1"
 
     built = _build_provider(
         ProviderConfig(provider="minimax_openai", model="MiniMax-M2.7", api_key="test-key")
@@ -251,6 +326,25 @@ def test_model_selector_builds_explicit_minimax_region_anthropic_providers(
 ) -> None:
     built = _build_provider(
         ProviderConfig(provider=provider, model="MiniMax-M2.7", api_key="test-key")
+    )
+
+    assert isinstance(built, AnthropicProvider)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("kimi_coding_anthropic", "kimi-for-coding"),
+        ("minimax_coding_anthropic", "MiniMax-M2.7"),
+        ("mimo_anthropic", "mimo-v2.5-pro"),
+    ],
+)
+def test_model_selector_builds_coding_plan_anthropic_providers(
+    provider: str,
+    model: str,
+) -> None:
+    built = _build_provider(
+        ProviderConfig(provider=provider, model=model, api_key="test-key")
     )
 
     assert isinstance(built, AnthropicProvider)

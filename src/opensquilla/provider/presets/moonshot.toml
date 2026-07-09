@@ -6,19 +6,19 @@ id = "moonshot"
 provider = "moonshot"
 label = "Moonshot AI"
 description = "Curated Moonshot AI router tier ladder (c0-c3)."
-default_model = "kimi-k2.5"
+default_model = "kimi-k2.6"
 
 [tiers.c0]
 provider = "moonshot"
-model = "kimi-k2.5"
-description = "Moonshot fast route: Kimi K2.5 for cost-efficient agent work with 256K context."
+model = "kimi-k2.6"
+description = "Moonshot fast route: Kimi K2.6 for cost-efficient multimodal agent work with 256K context."
 thinking_level = "low"
 supports_image = true
 
 [tiers.c1]
 provider = "moonshot"
-model = "kimi-k2.5"
-description = "Moonshot balanced route: Kimi K2.5 for normal multimodal agent work."
+model = "kimi-k2.6"
+description = "Moonshot balanced route: Kimi K2.6 for normal multimodal agent work."
 thinking_level = "medium"
 supports_image = true
 
@@ -31,7 +31,7 @@ supports_image = true
 
 [tiers.c3]
 provider = "moonshot"
-model = "kimi-k2.6"
-description = "Moonshot highest route: Kimi K2.6 for the hardest long-horizon agent work."
+model = "kimi-k2.7-code"
+description = "Moonshot highest route: Kimi K2.7 Code for the hardest coding and long-horizon agent routes."
 thinking_level = "high"
 supports_image = true

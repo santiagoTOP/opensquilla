@@ -65,8 +65,10 @@ EXPECTED_VERIFIED = {
 }
 # Experimental: registry-runnable, offered with a visible caveat.
 EXPECTED_EXPERIMENTAL = {
-    "azure", "bailian_coding", "minimax", "minimax_openai", "minimax_cn",
-    "minimax_global", "mistral", "groq", "aihubmix", "vllm", "custom",
+    "azure", "bailian_coding", "kimi_coding_openai", "kimi_coding_anthropic",
+    "minimax", "minimax_openai", "minimax_coding_openai",
+    "minimax_coding_anthropic", "minimax_cn", "minimax_global", "mimo_openai",
+    "mimo_anthropic", "mistral", "groq", "aihubmix", "vllm", "custom",
     "lm_studio", "siliconflow", "ovms", "litellm_proxy", "openai_codex",
     "volcengine_coding_plan", "volcengine_coding_plan_anthropic",
     "byteplus_coding_plan", "byteplus_coding_plan_anthropic",
@@ -169,7 +171,7 @@ def test_api_key_field_description_stays_accurate_without_an_env_key():
 
 
 def test_non_router_providers_explain_required_model_in_setup_spec():
-    for provider_id in ("anthropic", "ollama", "qianfan", "openai_responses"):
+    for provider_id in ("anthropic", "ollama", "openai_responses"):
         spec = get_provider_setup_spec(provider_id)
         model_field = next(f for f in spec.fields if f.name == "model")
 
@@ -178,6 +180,41 @@ def test_non_router_providers_explain_required_model_in_setup_spec():
         assert "Required" in model_field.description
         assert "router" not in model_field.description.lower()
         assert any("model" in item.lower() for item in spec.what_you_need)
+
+
+@pytest.mark.parametrize(
+    "provider_id",
+    [
+        "qianfan",
+        "volcengine_coding_plan",
+        "kimi_coding_openai",
+        "kimi_coding_anthropic",
+        "minimax",
+        "minimax_cn",
+        "minimax_global",
+        "minimax_coding_openai",
+        "minimax_coding_anthropic",
+        "mimo_openai",
+        "mimo_anthropic",
+    ],
+)
+def test_inline_router_preset_providers_are_router_supported(provider_id: str):
+    spec = get_provider_setup_spec(provider_id)
+    row = next(row for row in provider_catalog_payload() if row["providerId"] == provider_id)
+    model_field = next(f for f in spec.fields if f.name == "model")
+
+    assert spec.router_supported is True
+    assert model_field.required is False
+    assert row["routerSupported"] is True
+    assert row["presets"]
+
+
+def test_minimax_openai_remains_direct_only_for_current_support_matrix():
+    spec = get_provider_setup_spec("minimax_openai")
+    row = next(row for row in provider_catalog_payload() if row["providerId"] == "minimax_openai")
+
+    assert spec.router_supported is False
+    assert row["routerSupported"] is False
 
 
 def test_azure_requires_base_url_in_setup_spec():

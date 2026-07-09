@@ -28,7 +28,7 @@
         "role": "user"
       }
     ],
-    "model": "kimi-k2.5",
+    "model": "kimi-k2.7-code",
     "stream": true,
     "stream_options": {
       "include_usage": true

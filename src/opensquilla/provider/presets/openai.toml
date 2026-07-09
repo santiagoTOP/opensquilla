@@ -11,7 +11,7 @@ default_model = "gpt-5.4-mini"
 [tiers.c0]
 provider = "openai"
 model = "gpt-5.4-nano"
-description = "OpenAI fast route: GPT-5.4 Nano for fast, high-throughput simple work."
+description = "OpenAI fast route: GPT-5.4 Nano for simple and low-latency work."
 thinking_level = "none"
 supports_image = false
 
@@ -32,6 +32,6 @@ supports_image = false
 [tiers.c3]
 provider = "openai"
 model = "gpt-5.5"
-description = "OpenAI highest route: GPT-5.5 with high reasoning; GPT-5.5 Pro is excluded because it is not streaming-compatible."
+description = "OpenAI highest route: GPT-5.5 for harder analysis and review."
 thinking_level = "high"
 supports_image = false

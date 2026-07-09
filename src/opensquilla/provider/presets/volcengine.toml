@@ -10,8 +10,8 @@ default_model = "doubao-seed-2-0-lite-260215"
 
 [tiers.c0]
 provider = "volcengine"
-model = "doubao-seed-2-0-mini-260215"
-description = "Volcengine fast route: Doubao Seed 2.0 Mini for low-latency, low-cost simple text tasks."
+model = "doubao-seed-2-0-lite-260215"
+description = "Volcengine fast route: Doubao Seed 2.0 Lite for low-latency simple text tasks."
 thinking_level = "off"
 supports_image = false
 
@@ -31,7 +31,7 @@ supports_image = false
 
 [tiers.c3]
 provider = "volcengine"
-model = "doubao-seed-2-0-code-preview-260215"
-description = "Volcengine highest route: Doubao Seed 2.0 Code Preview for the hardest coding and code-review routes."
+model = "doubao-seed-2-0-pro-260215"
+description = "Volcengine highest route: Doubao Seed 2.0 Pro for hard analysis and code-review routes without preview-model dependency."
 thinking_level = "high"
 supports_image = false

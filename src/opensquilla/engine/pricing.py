@@ -413,6 +413,9 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("moonshotai/kimi-k2.6", PriceEntry(0.95, 4.0)),
     ("moonshotai/kimi-k2.5", PriceEntry(0.3827, 1.72)),
     # Direct provider smoke estimates.
+    # Keep narrower prefixes before broader families.
+    ("gpt-4.1-nano", PriceEntry(0.10, 0.40)),
+    ("gpt-4.1-mini", PriceEntry(0.40, 1.60)),
     ("gpt-4.1", PriceEntry(2.0, 8.0)),
     # Zhipu docs quote GLM-4.5 series API prices in CNY; converted to USD at
     # roughly 6.975 CNY/USD for OpenSquilla estimates only.
@@ -433,9 +436,14 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("gpt-5.5", PriceEntry(5.0, 30.0)),
     ("glm-5.2", PriceEntry(1.40, 4.40, cache_read_per_m=0.26)),
     ("glm-5.1", PriceEntry(1.40, 4.40)),
-    ("glm-5", PriceEntry(0.72, 2.30)),
+    ("glm-5-turbo", PriceEntry(1.20, 4.0, cache_read_per_m=0.24)),
+    ("glm-5", PriceEntry(1.0, 3.20, cache_read_per_m=0.20)),
     ("kimi-k2.7-code", PriceEntry(0.95, 4.0, cache_read_per_m=0.19)),
+    ("kimi-k2.6", PriceEntry(0.95, 4.0)),
     ("kimi-k2.5", PriceEntry(0.3827, 1.72)),
+    ("gemini-3.1-flash-lite", PriceEntry(0.25, 1.50, cache_read_per_m=0.025)),
+    ("gemini-3.5-flash", PriceEntry(1.50, 9.0, cache_read_per_m=0.15)),
+    ("gemini-3.1-pro-preview", PriceEntry(2.0, 12.0, cache_read_per_m=0.20)),
     ("claude-haiku-4-5", PriceEntry(1.0, 5.0, cache_read_per_m=0.1, cache_write_per_m=1.25)),
     ("deepseek-v4-flash", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
     ("deepseek-v4-pro", PriceEntry(0.435, 0.87, cache_read_per_m=0.003625)),
@@ -463,6 +471,7 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("deepseek/deepseek-v3", PriceEntry(0.26, 0.38)),
     ("deepseek/deepseek-chat", PriceEntry(0.14, 0.28)),
     # OpenAI (OpenRouter prices).
+    ("openai/gpt-4.1-nano", PriceEntry(0.10, 0.40)),
     ("openai/gpt-4.1-mini", PriceEntry(0.40, 1.60)),
     ("openai/gpt-4.1", PriceEntry(2.0, 8.0)),
     ("openai/gpt-4o-mini", PriceEntry(0.15, 0.60)),

@@ -52,7 +52,7 @@ TIERS = {
     },
     "c3": {
         "provider": "openrouter",
-        "model": "z-ai/glm-5.2",
+        "model": "anthropic/claude-opus-4.8",
         "description": "deep reasoning and hard recovery turns",
         "thinking_level": "high",
     },
@@ -963,7 +963,7 @@ def _live_tier_model_map(live_model: str) -> dict[str, str]:
         "c3": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C3_MODEL",
             "OPENSQUILLA_LIVE_LLM_T3_MODEL",
-            "z-ai/glm-5.2",
+            "anthropic/claude-opus-4.8",
         ),
     }
     if live_model:

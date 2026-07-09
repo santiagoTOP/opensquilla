@@ -26,6 +26,12 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
         # Deployment-defined aggregation proxy: the model set is whatever
         # the operator's LiteLLM instance routes; no stable public catalog.
         "litellm_proxy",
+        # Private coding-plan endpoints expose their own model lists, but
+        # models.dev has no stable source id for these plan surfaces.
+        "kimi_coding_openai",
+        "kimi_coding_anthropic",
+        "mimo_openai",
+        "mimo_anthropic",
         # Hosted aggregator with no models.dev source mapped; the vendored
         # snapshot has never carried aihubmix rows.
         "aihubmix",
@@ -66,6 +72,8 @@ _EXPECTED_CATALOG_SOURCES: dict[str, tuple[str, ...]] = {
     "zhipu": ("zhipuai", "zai"),
     "minimax": ("minimax",),
     "minimax_openai": ("minimax",),
+    "minimax_coding_openai": ("minimax",),
+    "minimax_coding_anthropic": ("minimax",),
     "minimax_cn": ("minimax",),
     "minimax_global": ("minimax",),
     "mistral": ("mistral",),
@@ -118,8 +126,11 @@ def test_anthropic_backend_auth_header_styles() -> None:
     assert get_provider_spec("anthropic").auth_header_style == "x-api-key"
     for provider_id in (
         "minimax",
+        "minimax_coding_anthropic",
         "minimax_cn",
         "minimax_global",
+        "kimi_coding_anthropic",
+        "mimo_anthropic",
         "volcengine_coding_plan_anthropic",
         "byteplus_coding_plan_anthropic",
         # Tencent's Token Plan tool guides authenticate the Anthropic

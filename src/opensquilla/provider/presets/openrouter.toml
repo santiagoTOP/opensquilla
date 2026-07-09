@@ -31,8 +31,8 @@ supports_image = false
 
 [tiers.c3]
 provider = "openrouter"
-model = "z-ai/glm-5.2"
-description = "Highest-tier GLM 5.2 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+model = "anthropic/claude-opus-4.8"
+description = "Highest-tier Claude Opus 4.8 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 thinking_level = "high"
 supports_image = false
 

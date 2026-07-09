@@ -164,19 +164,38 @@ def test_experimental_provider_configurable_with_required_fields():
     assert res.config.llm.provider == "azure"
 
 
-def test_coding_plan_provider_configurable_with_protocol_endpoint():
+def test_byteplus_coding_plan_provider_configurable_with_protocol_endpoint():
+    cfg = GatewayConfig()
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="byteplus_coding_plan",
+        model="seed-2-0-lite-260228",
+        api_key="k",
+    )
+
+    assert res.changed is True
+    assert res.config.llm.provider == "byteplus_coding_plan"
+    assert res.config.llm.model == "seed-2-0-lite-260228"
+    assert res.config.llm.api_key == "k"
+    assert res.config.llm.base_url == "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+
+
+def test_volcengine_coding_plan_provider_configurable():
     cfg = GatewayConfig()
     res = upsert_llm_provider(
         cfg,
         provider_id="volcengine_coding_plan",
-        model="x",
+        model="doubao-seed-2.0-pro",
         api_key="k",
     )
 
+    assert res.changed is True
     assert res.config.llm.provider == "volcengine_coding_plan"
-    assert res.config.llm.model == "x"
+    assert res.config.llm.model == "doubao-seed-2.0-pro"
     assert res.config.llm.api_key == "k"
     assert res.config.llm.base_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
+    assert res.config.squilla_router.tiers["c0"]["model"] == "doubao-seed-2.0-lite"
+    assert res.config.squilla_router.tiers["c3"]["model"] == "doubao-seed-2.0-code"
 
 
 def test_ollama_does_not_require_api_key():
@@ -560,6 +579,29 @@ def test_upsert_llm_provider_preset_id_synthesized_writes_custom_shape():
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert "tier_profile" not in persisted
     assert persisted["tiers"]["c0"]["model"] == "llama-3.3-70b"
+
+
+def test_upsert_llm_provider_curated_synthesized_preset_preserves_ladder():
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="qianfan",
+        api_key_env="QIANFAN_API_KEY",
+        preset_id="qianfan",
+    )
+
+    router = res.config.squilla_router
+    assert router.enabled is True
+    assert router.tier_profile is None
+    assert res.config.llm.model == "ernie-4.5-turbo-128k"
+    assert router.tiers["c0"]["model"] == "ernie-4.5-turbo-128k"
+    assert router.tiers["c3"]["model"] == "ernie-4.5-turbo-128k"
+    assert router.tiers["image_model"]["model"] == "ernie-4.5-turbo-vl-32k"
+    assert router.tiers["image_model"]["image_only"] is True
+    persisted = res.config.to_toml_dict()["squilla_router"]
+    assert "tier_profile" not in persisted
+    assert persisted["tiers"]["c0"]["model"] == "ernie-4.5-turbo-128k"
 
 
 def test_upsert_llm_provider_preset_id_must_match_provider():

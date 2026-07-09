@@ -36,6 +36,22 @@ LEGACY_NINE = frozenset(
     }
 )
 TEXT_TIERS = ("c0", "c1", "c2", "c3")
+CURATED_SYNTHETIC_PRESET_IDS = frozenset(
+    {
+        "qianfan",
+        "minimax",
+        "minimax_cn",
+        "minimax_global",
+        "minimax_openai",
+        "minimax_coding_openai",
+        "minimax_coding_anthropic",
+        "kimi_coding_openai",
+        "kimi_coding_anthropic",
+        "mimo_openai",
+        "mimo_anthropic",
+        "volcengine_coding_plan",
+    }
+)
 
 
 def _golden() -> dict[str, dict]:
@@ -175,16 +191,102 @@ def test_synthesized_presets_bind_all_text_tiers_to_provider_default() -> None:
     assert synthesized, "expected at least one synthesized preset"
     for preset in synthesized:
         assert preset.preset_id not in LEGACY_NINE
-        # Onboarding's direct default model is empty for non-curated providers.
-        assert preset.default_model == ""
-        assert set(preset.tiers) == set(TEXT_TIERS)
-        assert "image_model" not in preset.tiers
+        if preset.preset_id in CURATED_SYNTHETIC_PRESET_IDS:
+            assert preset.default_model
+            assert set(TEXT_TIERS).issubset(preset.tiers)
+        else:
+            # Onboarding's direct default model is empty for non-curated providers.
+            assert preset.default_model == ""
+            assert set(preset.tiers) == set(TEXT_TIERS)
+            assert "image_model" not in preset.tiers
         for tier in TEXT_TIERS:
             entry = preset.tiers[tier]
             assert entry["provider"] == preset.provider_id
-            assert entry["model"] == preset.default_model
+            if preset.preset_id not in CURATED_SYNTHETIC_PRESET_IDS:
+                assert entry["model"] == preset.default_model
+            else:
+                assert entry["model"]
             assert entry["description"]
             assert entry["supports_image"] is False
+
+
+def test_curated_synthesized_presets_pin_live_verified_ladders() -> None:
+    expected = {
+        "qianfan": {
+            "default": "ernie-4.5-turbo-128k",
+            "tiers": {
+                "c0": "ernie-4.5-turbo-128k",
+                "c1": "ernie-4.5-turbo-128k",
+                "c2": "ernie-4.5-turbo-128k",
+                "c3": "ernie-4.5-turbo-128k",
+                "image_model": "ernie-4.5-turbo-vl-32k",
+            },
+        },
+        "minimax_openai": {
+            "default": "MiniMax-M2.7",
+            "tiers": {
+                "c0": "MiniMax-M2.7",
+                "c1": "MiniMax-M2.7",
+                "c2": "MiniMax-M3",
+                "c3": "MiniMax-M3",
+            },
+        },
+        "minimax_coding_openai": {
+            "default": "MiniMax-M2.7",
+            "tiers": {
+                "c0": "MiniMax-M2.7",
+                "c1": "MiniMax-M2.7",
+                "c2": "MiniMax-M3",
+                "c3": "MiniMax-M3",
+            },
+        },
+        "minimax_coding_anthropic": {
+            "default": "MiniMax-M2.7",
+            "tiers": {
+                "c0": "MiniMax-M2.7",
+                "c1": "MiniMax-M2.7",
+                "c2": "MiniMax-M3",
+                "c3": "MiniMax-M3",
+            },
+        },
+        "kimi_coding_openai": {
+            "default": "kimi-for-coding",
+            "tiers": {
+                "c0": "kimi-for-coding",
+                "c1": "kimi-for-coding",
+                "c2": "kimi-for-coding",
+                "c3": "kimi-for-coding",
+            },
+        },
+        "mimo_openai": {
+            "default": "mimo-v2.5",
+            "tiers": {
+                "c0": "mimo-v2.5",
+                "c1": "mimo-v2.5",
+                "c2": "mimo-v2.5-pro",
+                "c3": "mimo-v2.5-pro",
+            },
+        },
+        "volcengine_coding_plan": {
+            "default": "doubao-seed-2.0-pro",
+            "tiers": {
+                "c0": "doubao-seed-2.0-lite",
+                "c1": "doubao-seed-2.0-pro",
+                "c2": "doubao-seed-2.0-code",
+                "c3": "doubao-seed-2.0-code",
+            },
+        },
+    }
+
+    for preset_id, spec in expected.items():
+        preset = get_preset(preset_id)
+        assert preset is not None
+        assert preset.synthesized is True
+        assert preset.default_model == spec["default"]
+        assert {
+            tier: preset.tiers[tier]["model"]
+            for tier in spec["tiers"]
+        } == spec["tiers"]
 
 
 def test_synthesized_ids_are_never_legacy_profile_ids() -> None:
