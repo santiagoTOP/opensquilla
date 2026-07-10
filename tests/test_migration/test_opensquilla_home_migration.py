@@ -1207,6 +1207,54 @@ def test_interrupted_overwrite_is_restored_before_retry(tmp_path: Path) -> None:
     assert (target / "workspace" / "MEMORY.md").is_file()
 
 
+@pytest.mark.parametrize("journal_phase", [None, "prepared", "published"])
+def test_completed_receipt_makes_retry_idempotent_across_marker_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_phase: str | None,
+) -> None:
+    fake_home = tmp_path / "userhome"
+    fake_home.mkdir()
+    source = _build_source_home(fake_home)
+    source.rename(fake_home / ".opensquilla")
+    source = fake_home / ".opensquilla"
+    target = tmp_path / "target-home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    first = _run(source, target, apply=True)
+    assert not _errors(first)
+    transaction_id = Path(first["output_dir"]).name
+    (source / IMPORT_MARKER_FILENAME).unlink()
+
+    journal = tmp_path / ".target-home.import-commit.json"
+    if journal_phase is not None:
+        journal.write_text(
+            json.dumps(
+                {
+                    "target": str(target),
+                    "staging": str(tmp_path / f".opensquilla-import-{transaction_id}"),
+                    "backup": str(tmp_path / f"target-home.backup.{transaction_id}"),
+                    "phase": journal_phase,
+                    "target_existed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert detect_legacy_cli_home(target) is None
+    retried = _run(source, target, apply=True)
+
+    assert not _errors(retried)
+    assert retried["output_dir"] == first["output_dir"]
+    assert not journal.exists()
+    assert [path.name for path in (target / "migration" / "opensquilla").iterdir()] == [
+        transaction_id
+    ]
+    marker = json.loads((source / IMPORT_MARKER_FILENAME).read_text(encoding="utf-8"))
+    assert marker["transaction_id"] == transaction_id
+    assert detect_legacy_cli_home(target) is None
+
+
 def test_dry_run_reports_interrupted_commit_without_mutating_it(tmp_path: Path) -> None:
     source = _build_source_home(tmp_path)
     target = tmp_path / "target-home"

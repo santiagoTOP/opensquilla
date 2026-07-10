@@ -448,34 +448,68 @@ function windowsPortableHomeRoots(): string[] {
   return roots
 }
 
+function targetHasAppliedImportReceipt(
+  source: string,
+  target: string,
+  transactionId?: string,
+): boolean {
+  const receiptRoot = join(target, 'migration', 'opensquilla')
+  let transactionIds: string[]
+  if (transactionId) {
+    if (!MIGRATION_TRANSACTION_ID_RE.test(transactionId)) return false
+    transactionIds = [transactionId]
+  } else {
+    try {
+      transactionIds = readdirSync(receiptRoot)
+        .filter((entry) => MIGRATION_TRANSACTION_ID_RE.test(entry))
+        .sort()
+        .reverse()
+    } catch {
+      return false
+    }
+  }
+  for (const candidateId of transactionIds) {
+    const receiptDir = join(receiptRoot, candidateId)
+    try {
+      const report = JSON.parse(readFileSync(join(receiptDir, 'report.json'), 'utf8')) as unknown
+      const validationError = migrationReportValidationError(report, {
+        source,
+        target,
+        apply: true,
+      })
+      const record = migrationRecord(report)
+      if (
+        validationError === null
+        && record
+        && typeof record.output_dir === 'string'
+        && resolvedPathsEqual(record.output_dir, receiptDir)
+        && migrationReportErrors(record).length === 0
+      ) {
+        return true
+      }
+    } catch {
+      // Ignore incomplete or unrelated report directories and keep looking.
+    }
+  }
+  return false
+}
+
 function sourceWasImportedToTarget(source: string, target: string): boolean {
   try {
     const payload = JSON.parse(
       readFileSync(join(source, '.opensquilla-imported.json'), 'utf8'),
     ) as { target?: unknown; transaction_id?: unknown }
-    if (typeof payload.target !== 'string' || !resolvedPathsEqual(payload.target, target)) {
-      return false
+    if (typeof payload.target === 'string' && resolvedPathsEqual(payload.target, target)) {
+      const transactionId = typeof payload.transaction_id === 'string'
+        ? payload.transaction_id
+        : ''
+      if (targetHasAppliedImportReceipt(source, target, transactionId)) return true
     }
-    const transactionId = typeof payload.transaction_id === 'string'
-      ? payload.transaction_id
-      : ''
-    if (!MIGRATION_TRANSACTION_ID_RE.test(transactionId)) return false
-    const receipt = JSON.parse(
-      readFileSync(
-        join(target, 'migration', 'opensquilla', transactionId, 'report.json'),
-        'utf8',
-      ),
-    ) as unknown
-    const validationError = migrationReportValidationError(receipt, {
-      source,
-      target,
-      apply: true,
-    })
-    return validationError === null
-      && migrationReportErrors(receipt as Record<string, unknown>).length === 0
   } catch {
-    return false
+    // A process can exit after publishing the receipt but before this
+    // best-effort source marker is written. Fall through to the receipt scan.
   }
+  return targetHasAppliedImportReceipt(source, target)
 }
 
 // The Python importer publishes a complete sibling staging tree by renaming the

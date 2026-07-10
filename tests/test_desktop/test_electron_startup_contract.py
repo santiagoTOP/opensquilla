@@ -1430,7 +1430,18 @@ def test_desktop_migration_detection_respects_matching_completion_marker() -> No
     assert "sourceWasImportedToTarget(candidate, desktopHome())" in detection
     assert "'.opensquilla-imported.json'" in main_ts
     assert "payload.transaction_id" in main_ts
-    assert "join(target, 'migration', 'opensquilla', transactionId, 'report.json')" in main_ts
+    assert "join(receiptDir, 'report.json')" in main_ts
+    assert "function targetHasAppliedImportReceipt" in main_ts
+    assert "transactionIds = readdirSync(receiptRoot)" in main_ts
+    assert "resolvedPathsEqual(record.output_dir, receiptDir)" in main_ts
+    assert "return targetHasAppliedImportReceipt(source, target)" in main_ts
+    marker_check = _section(
+        main_ts,
+        "function sourceWasImportedToTarget",
+        "// The Python importer publishes",
+    )
+    assert "return false" not in marker_check
+    assert marker_check.count("targetHasAppliedImportReceipt(source, target") == 2
 
 
 def test_desktop_boot_recovers_interrupted_import_before_profile_use() -> None:
