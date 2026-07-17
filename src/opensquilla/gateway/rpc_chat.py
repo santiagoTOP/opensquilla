@@ -480,6 +480,10 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("fork_before_message_id", "fork_before_message_id"),
             ("clientRequestId", "clientRequestId"),
             ("client_request_id", "client_request_id"),
+            ("clientMessageId", "clientMessageId"),
+            ("client_message_id", "client_message_id"),
+            ("surfaceId", "surfaceId"),
+            ("surface_id", "surface_id"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]

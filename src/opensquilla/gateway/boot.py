@@ -1031,7 +1031,8 @@ async def dispatch_task_runtime_turn(
             session_model=getattr(session, "model", None),
         ),
     )
-    raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+    from opensquilla.engine.runtime import accepted_turn_config_scope
+
     raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
     stream_idle_timeout: float | None = (
         raw_stream_idle_timeout if raw_stream_idle_timeout > 0 else None
@@ -1040,15 +1041,23 @@ async def dispatch_task_runtime_turn(
         config, "agent_stream_heartbeat_interval_seconds", 15.0
     )
     try:
-        await _emit_task_runtime_stream_events(
-            raw_stream,
-            run.session_key,
-            event_emitter,
-            idle_timeout=stream_idle_timeout,
-            heartbeat_interval=heartbeat_interval,
-            stream_event_sink=getattr(run, "stream_event_sink", None),
-            task_id=getattr(run, "task_id", None),
-        )
+        with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
+            raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+            await _emit_task_runtime_stream_events(
+                raw_stream,
+                run.session_key,
+                event_emitter,
+                idle_timeout=stream_idle_timeout,
+                heartbeat_interval=heartbeat_interval,
+                stream_event_sink=getattr(run, "stream_event_sink", None),
+                task_id=getattr(run, "task_id", None),
+                session_id=getattr(run.envelope, "session_id", None),
+                client_message_id=getattr(run.envelope, "metadata", {}).get(
+                    "client_message_id"
+                ),
+                user_message_id=getattr(run, "persisted_user_message_id", None),
+                surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
+            )
     except TaskRuntimeStreamError as exc:
         if exc.code in {
             "provider_request_budget_exhausted",
@@ -1170,6 +1179,7 @@ def build_task_runtime_run_kwargs(
         "no_memory_capture": run.no_memory_capture,
         "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
         "ingress_pipeline_steps": ingress_steps,
+        "pending_input_provider": getattr(run, "pending_input_provider", None),
     }
     if run.semantic_message is not None:
         # Prefetch query shape: channels carry the raw user text
@@ -1309,6 +1319,10 @@ async def _emit_task_runtime_stream_events(
     heartbeat_interval: float | None = None,
     stream_event_sink: Any = None,
     task_id: str | None = None,
+    session_id: str | None = None,
+    client_message_id: str | None = None,
+    user_message_id: str | None = None,
+    surface_id: str | None = None,
 ) -> None:
     """Emit turn events and fail the task if the stream reports an error.
 
@@ -1394,6 +1408,15 @@ async def _emit_task_runtime_stream_events(
             event_dict["error_message"] = safe_error_message
         if task_id:
             event_dict["task_id"] = task_id
+            event_dict["turn_id"] = task_id
+        if session_id:
+            event_dict["session_id"] = session_id
+        if client_message_id:
+            event_dict["client_message_id"] = client_message_id
+        if user_message_id:
+            event_dict["user_message_id"] = user_message_id
+        if surface_id:
+            event_dict["surface_id"] = surface_id
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",
@@ -2150,9 +2173,7 @@ async def build_services(
             # 0o700: session transcripts are sensitive — keep a freshly created
             # state directory owner-only (umask-masked; no-op on Windows and on
             # pre-existing directories).
-            Path(session_db_path).expanduser().parent.mkdir(
-                mode=0o700, parents=True, exist_ok=True
-            )
+            Path(session_db_path).expanduser().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         migrations_dir = _resolve_migrations_dir()
         applied = apply_pending(session_db_path, migrations_dir)
         if applied:
@@ -2605,8 +2626,7 @@ async def build_services(
                 # contended WAL write cannot stall service startup wiring.
                 await asyncio.to_thread(
                     meta_run_writer.mark_orphans_failed,
-                    age_ms=int(getattr(persistence_cfg, "orphan_cleanup_age_seconds", 3600))
-                    * 1000,
+                    age_ms=int(getattr(persistence_cfg, "orphan_cleanup_age_seconds", 3600)) * 1000,
                 )
     except Exception as e:  # noqa: BLE001 - meta traces must not block boot.
         log.warning("build_services.meta_run_writer_failed", error=str(e))
@@ -2640,8 +2660,7 @@ async def build_services(
                 router_decision_writer = open_router_decision_writer(
                     decisions_db_path,
                     retention_days=int(
-                        getattr(router_cfg_for_decisions, "decision_retention_days", 30)
-                        or 30
+                        getattr(router_cfg_for_decisions, "decision_retention_days", 30) or 30
                     ),
                 )
                 set_decision_writer(router_decision_writer)
@@ -2670,9 +2689,7 @@ async def build_services(
     try:
         errors_storage = get_session_storage(session_manager)
         errors_db_path = (
-            getattr(errors_storage, "_db_path", None)
-            if errors_storage is not None
-            else None
+            getattr(errors_storage, "_db_path", None) if errors_storage is not None else None
         )
         if errors_db_path and errors_db_path != ":memory:":
             from opensquilla.persistence.turn_error_writer import (
@@ -2827,9 +2844,7 @@ def build_turn_runner_from_services(
         compaction_hooks=getattr(svc, "compaction_hooks", None),
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         turn_error_writer=getattr(svc, "turn_error_writer", None),
-        provider_call_observer=build_provider_call_observer(
-            getattr(svc, "provider_stats", None)
-        ),
+        provider_call_observer=build_provider_call_observer(getattr(svc, "provider_stats", None)),
     )
 
 
@@ -3048,6 +3063,7 @@ async def start_gateway_server(
 
     from opensquilla.gateway.background_completion import BackgroundCompletionManager
     from opensquilla.gateway.event_bridge import EventBridge
+    from opensquilla.gateway.model_routing import capture_model_routing_config
     from opensquilla.gateway.subagent_announce import set_background_completion_manager
     from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 
@@ -3135,6 +3151,7 @@ async def start_gateway_server(
             getattr(getattr(config, "subagents", None), "subagent_reserved_slots", 0)
         ),
         turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
+        accepted_config_provider=lambda: capture_model_routing_config(config),
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),

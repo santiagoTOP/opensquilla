@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     tool_call_id TEXT,
     reasoning_content TEXT,
     turn_usage TEXT,
+    turn_context TEXT,
     created_at INTEGER NOT NULL,
     token_count INTEGER,
     provenance_kind TEXT,
@@ -256,6 +257,7 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     tool_call_id TEXT,
     reasoning_content TEXT,
     turn_usage TEXT,
+    turn_context TEXT,
     created_at INTEGER NOT NULL,
     token_count INTEGER,
     provenance_kind TEXT,
@@ -516,6 +518,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "delivery_context",
         "tool_calls",
         "turn_usage",
+        "turn_context",
         "origin",
         "details",
         "summary_payload",
@@ -811,6 +814,7 @@ class SessionStorage:
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
+        await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE)
@@ -888,6 +892,18 @@ class SessionStorage:
                 "ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT"
             )
             await self._conn.commit()
+
+    async def _migrate_transcript_turn_context_column(self) -> None:
+        """Idempotently add causal turn identity to active and archived rows."""
+        assert self._conn is not None
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            if "turn_context" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN turn_context TEXT"
+                )
+        await self._conn.commit()
 
     async def _migrate_summary_metadata_columns(self) -> None:
         """Idempotently add structured compaction summary metadata columns."""
@@ -1757,6 +1773,7 @@ class SessionStorage:
                 tool_call_id,
                 reasoning_content,
                 turn_usage,
+                turn_context,
                 created_at,
                 token_count,
                 provenance_kind,
@@ -1779,6 +1796,7 @@ class SessionStorage:
                 tool_call_id,
                 reasoning_content,
                 turn_usage,
+                turn_context,
                 created_at,
                 token_count,
                 provenance_kind,
@@ -2534,6 +2552,7 @@ class SessionStorage:
                 tool_call_id,
                 reasoning_content,
                 turn_usage,
+                turn_context,
                 created_at,
                 token_count,
                 provenance_kind,
@@ -2557,6 +2576,7 @@ class SessionStorage:
                 tool_call_id,
                 reasoning_content,
                 turn_usage,
+                turn_context,
                 created_at,
                 token_count,
                 provenance_kind,
@@ -2684,6 +2704,30 @@ class SessionStorage:
             ) as cur:
                 removed = cur.rowcount or 0
         return removed > 0
+
+    async def update_transcript_turn_context(
+        self,
+        session_key: str,
+        message_id: str,
+        turn_context: dict[str, Any],
+    ) -> bool:
+        """Replace one message's additive causal identity snapshot.
+
+        The row can cross into the compacted archive while a queued turn waits,
+        so update both canonical transcript tables in one transaction.
+        """
+
+        encoded = _serialize(turn_context)
+        changed = 0
+        async with self._write_transaction("update_transcript_turn_context") as conn:
+            for table in ("transcript_entries", "compacted_transcript_entries"):
+                async with conn.execute(
+                    f"UPDATE {table} SET turn_context = ? "
+                    "WHERE session_key = ? AND message_id = ?",
+                    (encoded, session_key, message_id),
+                ) as cur:
+                    changed += cur.rowcount or 0
+        return changed > 0
 
     async def delete_summaries(self, session_id: str) -> None:
         async with self._write_transaction("delete_summaries") as conn:
@@ -2912,6 +2956,7 @@ class SessionStorage:
                 tool_call_id,
                 reasoning_content,
                 turn_usage,
+                turn_context,
                 created_at,
                 token_count,
                 provenance_kind,
