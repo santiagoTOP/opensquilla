@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from opensquilla.engine.usage_accounting import (
+    account_provider_stream,
+    current_usage_accounting_scope,
+    provider_accounts_physical_usage,
+)
 from opensquilla.memory.dream.candidates import scan_dream_candidates
 from opensquilla.memory.dream.curated_apply import apply_promotion_patch
 from opensquilla.memory.dream.evidence import (
@@ -29,6 +34,11 @@ from opensquilla.memory.dream.ranking import rank_promotion_candidates
 from opensquilla.memory.dream.receipts import write_dream_receipt
 from opensquilla.memory.dream.rehydrate import rehydrate_candidate
 from opensquilla.memory.protocols import MemoryProviderCapability
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
+from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import Message
 
 logger = logging.getLogger(__name__)
@@ -46,9 +56,18 @@ async def _run_complete(
     ``provider.chat(messages)`` and concatenating text deltas (real
     providers like OpenAIProvider).
     """
+    budget = resolve_auxiliary_request_budget(
+        provider,
+        max_output_tokens=max_tokens,
+    )
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=budget.provider_request_max_chars,
+        max_tokens=budget.max_input_tokens,
+    )
     complete = getattr(provider, "complete", None)
     if callable(complete):
-        resp = await complete(messages=messages, max_tokens=max_tokens)
+        resp = await complete(messages=messages, max_tokens=budget.max_output_tokens)
         return getattr(resp, "content", None) or getattr(resp, "text", "") or ""
     chat = getattr(provider, "chat", None)
     if not callable(chat):
@@ -57,17 +76,42 @@ async def _run_complete(
         )
     from opensquilla.provider.types import ChatConfig
 
+    config = ChatConfig(
+        max_tokens=budget.max_output_tokens,
+        provider_request_max_chars=budget.provider_request_max_chars,
+    )
+    scope = current_usage_accounting_scope()
+    close_stream = None
+    if scope is None:
+        stream = chat(messages, config=config)
+    elif provider_accounts_physical_usage(provider):
+        stream = chat(messages, config=config)
+        close_stream = stream
+    else:
+        metadata = provider_metadata(provider)
+        stream = account_provider_stream(
+            lambda: chat(messages, config=config),
+            provider=metadata.provider_name or metadata.provider_kind,
+            model=metadata.model,
+        )
+        close_stream = stream
+
     chunks: list[str] = []
-    async for event in chat(messages, config=ChatConfig(max_tokens=max_tokens)):
-        ev_name = type(event).__name__
-        if ev_name == "ErrorEvent":
-            # Surface provider errors (auth, rate-limit, HTTP) instead of
-            # pretending we got an empty response that fails later as bad JSON.
-            msg = getattr(event, "message", "") or "provider error"
-            raise RuntimeError(f"provider error: {msg}")
-        text = getattr(event, "text", "") or ""
-        if text and "Delta" in ev_name:
-            chunks.append(text)
+    try:
+        async for event in stream:
+            ev_name = type(event).__name__
+            if ev_name == "ErrorEvent":
+                # Surface provider errors (auth, rate-limit, HTTP) instead of
+                # pretending we got an empty response that fails later as bad JSON.
+                msg = getattr(event, "message", "") or "provider error"
+                raise RuntimeError(f"provider error: {msg}")
+            text = getattr(event, "text", "") or ""
+            if text and "Delta" in ev_name:
+                chunks.append(text)
+    finally:
+        aclose = getattr(close_stream, "aclose", None)
+        if callable(aclose):
+            await aclose()
     return "".join(chunks)
 
 

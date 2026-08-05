@@ -15,6 +15,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
+from opensquilla.cli.chat.turn_stream import turn_stream_error_message
 from opensquilla.cli.main import app
 from opensquilla.cli.repl import commands as repl_commands
 from opensquilla.cli.repl import slash_bridge
@@ -31,6 +32,18 @@ from opensquilla.session.compaction import CompactionConfig
 from opensquilla.tools.types import CallerKind, ToolContext
 
 runner = CliRunner()
+
+
+def test_cli_surfaces_actionable_ensemble_image_rejection() -> None:
+    event = SimpleNamespace(
+        code="ensemble_multimodal_unsupported",
+        message=(
+            "Ensemble does not support image input yet. "
+            "Switch to a single-model routing mode and try again."
+        ),
+    )
+
+    assert turn_stream_error_message(event) == event.message
 
 
 def _install_fake_inputs(monkeypatch, inputs: Iterable[str]) -> None:
@@ -1088,7 +1101,7 @@ async def test_standalone_repl_uses_exact_slash_tokens(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_standalone_slash_compact_passes_provider_config(monkeypatch) -> None:
+async def test_standalone_slash_compact_uses_selected_physical_deployment(monkeypatch) -> None:
     services = _FakeServices()
     services.provider_selector = _FakeProviderSelector()
     services.config = SimpleNamespace(
@@ -1126,7 +1139,7 @@ async def test_standalone_slash_compact_passes_provider_config(monkeypatch) -> N
     assert context_window == 1234
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "cli-provider-key"
-    assert config.model == "openrouter/test"
+    assert config.model == "provider/model"
     assert config.base_url == "https://openrouter.ai/api/v1"
     assert config.timeout_seconds == 12.5
 

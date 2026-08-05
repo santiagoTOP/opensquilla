@@ -6,6 +6,7 @@ import {
   normalizeHomePaths,
   providerBlocksAgent,
   settingsLinkForFinding,
+  withoutLegacyMigrationFinding,
   xmlEscape,
 } from './overviewDiagnostics'
 
@@ -82,7 +83,11 @@ describe('settingsLinkForFinding', () => {
   })
 
   it('maps channels, capabilities, and both router spellings', () => {
-    expect(settingsLinkForFinding({ surface: 'channels' })).toEqual({ path: '/settings/channels' })
+    // Channel setup lives on the /channels workspace; a named finding
+    // deep-links straight into the in-place editor.
+    expect(settingsLinkForFinding({ surface: 'channels' })).toEqual({ path: '/channels' })
+    expect(settingsLinkForFinding({ surface: 'channels', evidence: { channelName: 'ops-slack' } }))
+      .toEqual({ path: '/channels', query: { channel: 'ops-slack', tab: 'configuration', edit: '1' } })
     expect(settingsLinkForFinding({ surface: 'router' })).toEqual({ path: '/settings/modelStrategy' })
     expect(settingsLinkForFinding({ surface: 'squilla_router' })).toEqual({ path: '/settings/modelStrategy' })
     expect(settingsLinkForFinding({ surface: 'image_generation' })).toEqual({ path: '/settings/capabilities' })
@@ -90,12 +95,12 @@ describe('settingsLinkForFinding', () => {
     expect(settingsLinkForFinding({ surface: 'memory_embedding' })).toEqual({ path: '/settings/capabilities' })
   })
 
-  it('maps migration only for a Desktop-owned local gateway', () => {
+  it('never maps optional migration findings into Overview actions', () => {
     const migration = { surface: 'migration' }
     expect(settingsLinkForFinding(migration, {
       isDesktop: true,
       ownsGatewayConnection: true,
-    })).toEqual({ path: '/settings/runtime' })
+    })).toBeNull()
     expect(settingsLinkForFinding(migration, {
       isDesktop: true,
       ownsGatewayConnection: false,
@@ -154,7 +159,7 @@ describe('buildAgentDiagnosisHandoff', () => {
       hasTerminalWorkflow: false,
       ownsGateway: true,
       connectionScope: 'local_owned',
-      applicableSettingsRoutes: ['/settings/runtime', '/settings/capabilities'],
+      applicableSettingsRoutes: ['/settings/capabilities'],
       guidance: {
         preferInAppSettings: true,
         allowBareCliCommands: false,
@@ -165,6 +170,7 @@ describe('buildAgentDiagnosisHandoff', () => {
         advancedCliFallback: 'available_on_doctor_page',
       },
     })
+    expect(JSON.stringify(handoff.report)).not.toContain('migration.legacy_home_detected')
     expect(JSON.stringify(handoff.report)).not.toContain('"command"')
     expect(JSON.stringify(handoff.report)).toContain('"advancedCliAvailable":true')
     // The public report object is not mutated by the derived hand-off.
@@ -185,7 +191,7 @@ describe('buildAgentDiagnosisHandoff', () => {
     expect(handoff.clientContext.guidance.remoteGatewayActions).toBe('handle_on_gateway_host')
   })
 
-  it('keeps terminal commands in the Web hand-off', () => {
+  it('keeps non-migration terminal commands in the Web hand-off', () => {
     const handoff = buildAgentDiagnosisHandoff(report, {
       platform: 'web',
       hasTerminalWorkflow: true,
@@ -196,7 +202,51 @@ describe('buildAgentDiagnosisHandoff', () => {
     expect(handoff.clientContext.platform).toBe('web')
     expect(handoff.clientContext.hasTerminalWorkflow).toBe(true)
     expect(handoff.clientContext.guidance.allowBareCliCommands).toBe(true)
-    expect(JSON.stringify(handoff.report)).toContain('"command":"opensquilla migrate')
+    expect(JSON.stringify(handoff.report)).not.toContain('migration.legacy_home_detected')
+  })
+})
+
+describe('withoutLegacyMigrationFinding', () => {
+  it('turns an old migration-only optional report into a clean ready report', () => {
+    const report = withoutLegacyMigrationFinding({
+      status: 'degraded',
+      ready: true,
+      summary: 'Ready, 1 optional setup item',
+      counts: { error: 0, warn: 0, info: 1, ok: 0 },
+      impactCounts: { blocks_ready: 0, degrades: 0, optional: 1, none: 0 },
+      findings: [{
+        id: 'migration.legacy_home_detected',
+        surface: 'migration',
+        severity: 'info',
+        readinessImpact: 'optional',
+      }],
+    })
+
+    expect(report).toMatchObject({
+      status: 'ready',
+      ready: true,
+      summary: 'Ready',
+      counts: { info: 0 },
+      impactCounts: { optional: 0 },
+      findings: [],
+    })
+  })
+
+  it('preserves and recomputes the remaining health findings', () => {
+    const report = withoutLegacyMigrationFinding({
+      status: 'degraded',
+      ready: true,
+      summary: 'Ready, 1 degraded check, 1 optional setup item',
+      counts: { error: 0, warn: 1, info: 1, ok: 0 },
+      impactCounts: { blocks_ready: 0, degrades: 1, optional: 1, none: 0 },
+      findings: [
+        { id: 'migration.legacy_home_detected', severity: 'info', readinessImpact: 'optional' },
+        { id: 'memory.degraded', severity: 'warn', readinessImpact: 'degrades' },
+      ],
+    })
+    expect(report.summary).toBe('Ready, 1 degraded check')
+    expect(report.status).toBe('degraded')
+    expect(report.findings).toHaveLength(1)
   })
 })
 

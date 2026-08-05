@@ -9,7 +9,8 @@ import pytest
 
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.sandbox import sensitive_paths
-from opensquilla.sandbox.integration import reset_runtime
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import (
@@ -22,7 +23,9 @@ from opensquilla.tools.types import (
 
 
 def _original_async(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
-    return fn.__wrapped__.__wrapped__  # type: ignore[attr-defined, no-any-return]
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__  # type: ignore[attr-defined]
+    return fn
 
 
 @pytest.fixture(autouse=True)
@@ -57,12 +60,47 @@ def test_apply_patch_schema_exposes_optional_approval_id() -> None:
     assert "approval_id" not in registered.spec.required
 
 
+def test_apply_patch_schema_exposes_structured_elevation_fields() -> None:
+    registered = get_default_registry().get("apply_patch")
+
+    assert registered is not None
+    params = registered.spec.parameters
+    assert params["sandbox_permissions"]["enum"] == [
+        "use_default",
+        "require_escalated",
+    ]
+    assert "justification" in params
+    assert "prefix_rule" in params
+
+
 def test_apply_patch_schema_exposes_optional_patch_file_path() -> None:
     registered = get_default_registry().get("apply_patch")
 
     assert registered is not None
     assert "path" in registered.spec.parameters
     assert "path" not in registered.spec.required
+
+
+def test_patch_request_preserves_absolute_target_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "outside" / "target.txt"
+    token = current_tool_context.set(ToolContext(workspace_dir=str(workspace)))
+    try:
+        request = patch_tool._patch_request(
+            {
+                "patch": f"""*** Begin Patch
+*** Add File: {target.as_posix()}
++created
+*** End Patch"""
+            }
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert request.path == target
+    assert request.paths == (target,)
+    assert request.root == workspace
 
 
 @pytest.mark.asyncio
@@ -272,6 +310,170 @@ async def test_apply_patch_context_mismatch_is_model_retriable(tmp_path: Path) -
     assert target.read_text(encoding="utf-8") == "actual = 1\n"
 
 
+@pytest.mark.parametrize("trailing_whitespace", ["  ", "\t"])
+@pytest.mark.asyncio
+async def test_apply_patch_tolerates_trailing_space_or_tab(
+    tmp_path: Path,
+    trailing_whitespace: str,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text(
+        f"value = 1{trailing_whitespace}\nname = 'a'\n",
+        encoding="utf-8",
+    )
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_preserves_trailing_whitespace_on_context_lines(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\nname = 'a'  \n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'  \n"
+
+
+@pytest.mark.parametrize("significant_whitespace", ["\u00a0", "\u2003"])
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_non_ascii_trailing_whitespace(
+    tmp_path: Path,
+    significant_whitespace: str,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    original = f"value = 1{significant_whitespace}\n"
+    target.write_text(original, encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-value = 1
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_leading_indentation_drift(tmp_path: Path) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("    value = 1\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-value = 1
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == "    value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_inserted_blank_line_in_hunk_context(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    original = "value = 1\n\nname = 'a'\n"
+    target.write_text(original, encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_context_drift_still_rejects_real_mismatch(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-unrelated = 9
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
 @pytest.mark.asyncio
 async def test_apply_patch_allows_workspace_under_sensitive_parent(
     tmp_path: Path,
@@ -464,6 +666,89 @@ async def test_apply_patch_elevated_full_skips_outside_workspace_approval(
 
 
 @pytest.mark.asyncio
+async def test_apply_patch_full_host_accepts_absolute_path_outside_patch_root(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("old\n", encoding="utf-8")
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            workspace_dir=str(workspace),
+            run_mode="full",
+            elevated="full",
+            session_key="agent:main:test",
+        )
+    )
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            f"""*** Begin Patch
+*** Update File: {outside.as_posix()}
+@@ -1,1 +1,1 @@
+-old
++new
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result.startswith("Applied patch: 1 file(s) modified")
+    assert outside.read_text(encoding="utf-8") == "new\n"
+    assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_trusted_auto_grants_absolute_user_path_before_root_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("old\n", encoding="utf-8")
+    configure_runtime(
+        SandboxSettings(run_mode="trusted", backend="noop", allow_legacy_mode=True),
+        workspace=workspace,
+    )
+
+    async def run_direct(_operation, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.filesystem._run_sandbox_operation_if_required",
+        run_direct,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            workspace_dir=str(workspace),
+            run_mode="trusted",
+            session_key="agent:main:trusted-patch",
+        )
+    )
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            f"""*** Begin Patch
+*** Update File: {outside.as_posix()}
+@@ -1,1 +1,1 @@
+-old
++new
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    assert result.startswith("Applied patch: 1 file(s) modified")
+    assert outside.read_text(encoding="utf-8") == "new\n"
+    assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
 async def test_apply_patch_run_mode_full_skips_sandbox_wrapper_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -495,10 +780,48 @@ async def test_apply_patch_run_mode_full_skips_sandbox_wrapper_gate(
         current_tool_context.reset(token)
         reset_runtime()
 
-    assert result == (
-        "Applied patch: 1 file(s) modified Note: workspace changes are now present. "
-        "Before final, inspect git_diff and run focused verification for the changed behavior."
+    assert result == "Applied patch: 1 file(s) modified"
+    assert outside.read_text(encoding="utf-8") == "new\n"
+    assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_sandbox_disabled_ignores_stale_restricted_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("old\n", encoding="utf-8")
+    configure_runtime(
+        SandboxSettings(sandbox=False, security_grading=False),
+        workspace=workspace,
     )
+    monkeypatch.setattr(patch_tool, "_default_patch_root", lambda: tmp_path.resolve())
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            workspace_dir=str(workspace),
+            workspace_lockdown=True,
+            workspace_write_deny_globs=["**"],
+            run_mode="standard",
+            session_key="full-patch",
+        )
+    )
+    try:
+        await patch_tool.apply_patch(
+            """*** Begin Patch
+*** Update File: outside.txt
+@@@ -1,1 +1,1 @@@
+-old
++new
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
     assert outside.read_text(encoding="utf-8") == "new\n"
     assert get_approval_queue().list_pending("exec") == []
 

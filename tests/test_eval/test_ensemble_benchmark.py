@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from opensquilla.engine.pricing import ModelPrice
+from opensquilla.engine.pricing import ModelPrice, PriceEntry
 from opensquilla.eval.ensemble_benchmark import (
     ArmReport,
     BenchmarkPrompt,
@@ -29,7 +31,7 @@ from opensquilla.eval.ensemble_benchmark import (
 )
 from opensquilla.eval.synthetic import SyntheticProvider
 from opensquilla.provider.failures import ProviderFailureKind
-from opensquilla.provider.types import ChatConfig, FailureInjector
+from opensquilla.provider.types import ChatConfig, DoneEvent, FailureInjector
 
 
 class ScriptedClock:
@@ -302,6 +304,73 @@ def test_pricing_price_lookup_is_offline_for_unqualified_model() -> None:
     assert price.output_per_token == pytest.approx(30.0 / 1_000_000)
 
 
+def test_live_pricing_estimate_sums_provider_aware_four_bucket_breakdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.eval.ensemble_benchmark as benchmark
+
+    resolved: list[tuple[str, str]] = []
+
+    def fake_resolve(model: str, provider: str) -> SimpleNamespace:
+        resolved.append((model, provider))
+        return SimpleNamespace(
+            entry=PriceEntry(
+                input_per_m=10.0,
+                output_per_m=20.0,
+                cache_read_per_m=1.0,
+                cache_write_per_m=2.0,
+            )
+        )
+
+    class BreakdownProvider:
+        provider_name = "ensemble"
+
+        async def chat(self, *_args: Any, **_kwargs: Any):
+            yield DoneEvent(
+                input_tokens=300,
+                output_tokens=30,
+                model="ensemble/static-tokenrhythm-b5",
+                model_usage_breakdown=[
+                    {
+                        "model": "model-a",
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cached_tokens": 40,
+                    },
+                    {
+                        "model": "model-b",
+                        "input_tokens": 200,
+                        "output_tokens": 20,
+                        "cache_write_tokens": 50,
+                    },
+                ],
+            )
+
+    monkeypatch.setattr(benchmark, "resolve_model_price", fake_resolve)
+    report = asyncio.run(
+        run_benchmark(
+            prompts=_prompts(1),
+            ensemble_provider=BreakdownProvider(),
+            baseline_provider=BreakdownProvider(),
+            price_lookup=pricing_price_lookup,
+            ensemble_provider_hint="tokenrhythm",
+            baseline_provider_hint="tokenrhythm",
+            clock=_latency_clock([0.0, 0.0]),
+        )
+    )
+
+    # model-a: 60*10 + 40*1 + 10*20 = 840; model-b:
+    # 150*10 + 50*2 + 20*20 = 2000, all prices per million.
+    assert report.ensemble.total_estimated_cost_usd == pytest.approx(2840 / 1_000_000)
+    assert report.baseline.total_estimated_cost_usd == pytest.approx(2840 / 1_000_000)
+    assert resolved == [
+        ("model-a", "tokenrhythm"),
+        ("model-b", "tokenrhythm"),
+        ("model-a", "tokenrhythm"),
+        ("model-b", "tokenrhythm"),
+    ]
+
+
 def test_report_to_dict_shape() -> None:
     prompts = _prompts(2)
     provider = SyntheticProvider(model="base-model", input_tokens=10, output_tokens=5)
@@ -348,3 +417,29 @@ def test_config_system_override_per_prompt() -> None:
     )
     assert runs[0].ok is True
     assert base.system is None  # base config not mutated
+
+
+def test_benchmark_binds_nonzero_budget_to_physical_provider() -> None:
+    class CapturingProvider(SyntheticProvider):
+        def __init__(self) -> None:
+            super().__init__(model="m")
+            self.seen_config: ChatConfig | None = None
+
+        def chat(self, messages, *, tools=None, config=None):
+            self.seen_config = config
+            return super().chat(messages, tools=tools, config=config)
+
+    provider = CapturingProvider()
+    runs = asyncio.run(
+        run_arm(
+            provider,
+            [BenchmarkPrompt(id="budget", text="small prompt")],
+            arm="x",
+            base_config=ChatConfig(max_tokens=42),
+            clock=_latency_clock([0.0]),
+        )
+    )
+
+    assert runs[0].ok is True
+    assert provider.seen_config is not None
+    assert provider.seen_config.provider_request_max_chars > 0

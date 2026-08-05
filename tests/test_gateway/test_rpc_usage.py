@@ -54,6 +54,97 @@ def test_usage_status_tracker_only_path_surfaces_cache_totals() -> None:
     assert row["cost_ephemeral"] is True
     assert row["billedCostUsd"] == 0.0
     assert row["estimatedCostUsd"] == row["costUsd"]
+    assert row["deploymentBreakdown"][0]["model"] == "claude-opus-4-7"
+
+
+def test_usage_status_surfaces_provider_model_deployment_breakdown() -> None:
+    tracker = UsageTracker()
+    tracker.add(
+        "agent:webchat:shared",
+        input_tokens=100,
+        output_tokens=10,
+        model_id="shared-model",
+        provider="provider-a",
+        billed_cost=0.01,
+    )
+    tracker.add(
+        "agent:webchat:shared",
+        input_tokens=200,
+        output_tokens=20,
+        model_id="shared-model",
+        provider="provider-b",
+        billed_cost=0.02,
+    )
+
+    payload = asyncio.run(
+        _handle_usage_status(None, _ctx(session_manager=None, usage_tracker=tracker))
+    )
+
+    [row] = payload["sessions"]
+    assert len(row["modelBreakdown"]) == 1
+    deployments = {
+        (item["provider"], item["model"]): item
+        for item in row["deploymentBreakdown"]
+    }
+    assert set(deployments) == {
+        ("provider-a", "shared-model"),
+        ("provider-b", "shared-model"),
+    }
+    assert sum(item["billedCostUsd"] for item in deployments.values()) == pytest.approx(
+        row["billedCostUsd"]
+    )
+
+
+def test_usage_status_merges_deployment_breakdown_into_persisted_session() -> None:
+    session = SimpleNamespace(
+        session_key="agent:webchat:persisted-shared",
+        status="running",
+        input_tokens=300,
+        output_tokens=30,
+        total_cost_usd=0.03,
+        billed_cost_usd=0.03,
+        estimated_cost_component_usd=0.0,
+        cost_source="provider_billed",
+        cache_read=0,
+        cache_write=0,
+        model="shared-model",
+    )
+    tracker = UsageTracker()
+    tracker.add(
+        session.session_key,
+        input_tokens=100,
+        output_tokens=10,
+        model_id="shared-model",
+        provider="provider-a",
+        billed_cost=0.01,
+    )
+    tracker.add(
+        session.session_key,
+        input_tokens=200,
+        output_tokens=20,
+        model_id="shared-model",
+        provider="provider-b",
+        billed_cost=0.02,
+    )
+
+    payload = asyncio.run(
+        _handle_usage_status(
+            None,
+            _ctx(
+                session_manager=_FakeSessionManager([session]),
+                usage_tracker=tracker,
+            ),
+        )
+    )
+
+    [row] = payload["sessions"]
+    assert {
+        (item["provider"], item["model"])
+        for item in row["deploymentBreakdown"]
+    } == {
+        ("provider-a", "shared-model"),
+        ("provider-b", "shared-model"),
+    }
 
 
 def test_usage_status_tracker_row_source_matches_breakdown_when_billed() -> None:
@@ -94,6 +185,31 @@ def test_usage_status_tracker_row_source_matches_breakdown_when_billed() -> None
     assert all(item["costSource"] == "provider_billed" for item in breakdown)
     breakdown_sum = sum(item["costUsd"] for item in breakdown)
     assert breakdown_sum == row["costUsd"]
+
+
+def test_usage_status_tracker_row_preserves_confirmed_zero_receipt() -> None:
+    tracker = UsageTracker()
+    tracker.add(
+        "agent:webchat:confirmed-zero",
+        input_tokens=1_000,
+        output_tokens=50,
+        model_id="anthropic/claude-4.7-opus",
+        billed_cost=0.0,
+        cost_source="provider_billed",
+    )
+
+    payload = asyncio.run(
+        _handle_usage_status(
+            None,
+            _ctx(session_manager=None, usage_tracker=tracker),
+        )
+    )
+
+    [row] = payload["sessions"]
+    assert row["costUsd"] == 0.0
+    assert row["billedCostUsd"] == 0.0
+    assert row["estimatedCostUsd"] == 0.0
+    assert row["costSource"] == "provider_billed"
 
 
 def test_usage_status_tracker_row_estimated_is_the_unbilled_component() -> None:
@@ -184,6 +300,28 @@ class _FakeTranscriptSessionManager(_FakeSessionManager):
         return self._transcript
 
 
+class _FakeIndexedSessionManager(_FakeSessionManager):
+    def __init__(self, sessions):
+        super().__init__(sessions)
+        self.list_calls = 0
+        self.get_calls = []
+
+    async def list_sessions(self):
+        self.list_calls += 1
+        return await super().list_sessions()
+
+    async def get_session(self, session_key):
+        self.get_calls.append(session_key)
+        return next(
+            (
+                session
+                for session in self._sessions
+                if getattr(session, "session_key", None) == session_key
+            ),
+            None,
+        )
+
+
 def test_usage_status_session_manager_path_reads_cache_fields() -> None:
     """When session_manager has records, getattr on cache_read/cache_write must flow through."""
     session = SimpleNamespace(
@@ -211,6 +349,61 @@ def test_usage_status_session_manager_path_reads_cache_fields() -> None:
     assert row["billedCostUsd"] == 0.0
     assert row["costSource"] == "opensquilla_estimate"
     assert row["costEphemeral"] is False
+
+
+def test_usage_status_requested_session_uses_indexed_lookup_without_scanning_all_sessions() -> None:
+    requested_key = "agent:webchat:requested"
+    sessions = [
+        SimpleNamespace(
+            session_key=requested_key,
+            status="running",
+            input_tokens=500,
+            output_tokens=20,
+            context_tokens=100,
+            model="claude-opus-4-7",
+        ),
+        *[
+            SimpleNamespace(
+                session_key=f"agent:webchat:historical-{index}",
+                status="finished",
+                input_tokens=index,
+                output_tokens=1,
+                context_tokens=10,
+                model="claude-opus-4-7",
+            )
+            for index in range(250)
+        ],
+    ]
+    manager = _FakeIndexedSessionManager(sessions)
+    tracker = UsageTracker()
+    tracker.add(
+        requested_key,
+        input_tokens=500,
+        output_tokens=20,
+        model_id="claude-opus-4-7",
+    )
+    tracker.add(
+        "agent:webchat:historical-249",
+        input_tokens=249,
+        output_tokens=1,
+        model_id="claude-opus-4-7",
+    )
+
+    payload = asyncio.run(
+        _handle_usage_status(
+            {"sessionKey": requested_key},
+            _ctx(
+                session_manager=manager,
+                usage_tracker=tracker,
+            ),
+        )
+    )
+
+    assert manager.get_calls == [requested_key]
+    assert manager.list_calls == 0
+    assert payload["totalSessions"] == 1
+    assert payload["activeSessions"] == 1
+    assert [row["session"] for row in payload["sessions"]] == [requested_key]
 
 
 def test_usage_status_reports_context_pressure_from_session_context_not_lifetime_usage() -> None:

@@ -5,8 +5,9 @@ RPC context provides one (``ctx.config``). The same context exposes the
 running ``provider_selector``; provider mutations are mirrored into it so a
 ``configure`` from the WebUI takes effect on the next chat without a restart.
 
-Channel mutations always require a restart because ``ChannelManager`` is built
-once at boot.
+Channel mutations reconcile live through the boot-registered channels
+reconciler when one is available; webhook-mode entries (HTTP routes bound at
+boot) and reconciler-less contexts stay restart-gated.
 
 The onboarding mutation/store modules import ``opensquilla.gateway.config`` at
 module top level, which transitively re-enters ``opensquilla.gateway`` during
@@ -16,15 +17,21 @@ handler bodies.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import structlog
 
 from opensquilla.gateway.config_secrets import inherit_runtime_secrets
 from opensquilla.gateway.model_routing import broadcast_model_routing_changed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.onboarding.redaction import is_redacted_secret_sentinel
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS
+
+if TYPE_CHECKING:
+    from opensquilla.onboarding.config_store import CredentialBackupRedaction
+    from opensquilla.onboarding.probe import ProviderProbeResult
 
 
 @contextmanager
@@ -54,7 +61,16 @@ def _channel_error() -> Iterator[None]:
     except KeyError as exc:
         raise RpcHandlerError("onboarding.channel.not_found", str(exc)) from exc
     except ValueError as exc:
-        raise RpcHandlerError("onboarding.channel.invalid", str(exc)) from exc
+        # A ChannelValidationError additionally carries per-field detail so the
+        # Web UI can anchor errors to fields instead of parsing the message.
+        details = getattr(exc, "field_errors", None)
+        raise RpcHandlerError(
+            "onboarding.channel.invalid",
+            str(exc),
+            details={"fields": details} if details else None,
+        ) from exc
+
+log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
 
@@ -151,6 +167,7 @@ def _sync_image_generation(config: Any) -> None:
 
     configure_image_generation(
         getattr(config, "image_generation", None),
+        gateway_config=config,
         llm_config=getattr(config, "llm", None),
         squilla_router_config=getattr(config, "squilla_router", None),
     )
@@ -172,7 +189,14 @@ def _sync_search_provider(config: Any) -> None:
     )
 
 
-def _persist(ctx: RpcContext, new_cfg: Any, *, restart_required: bool) -> str:
+def _persist(
+    ctx: RpcContext,
+    new_cfg: Any,
+    *,
+    restart_required: bool,
+    backup_credential_redaction: CredentialBackupRedaction | None = None,
+    remove_paths: tuple[str, ...] = (),
+) -> str:
     from opensquilla.onboarding.config_store import persist_config
 
     # Mutation results are cloned from the active config and carry their own
@@ -182,7 +206,13 @@ def _persist(ctx: RpcContext, new_cfg: Any, *, restart_required: bool) -> str:
     # back would silently omit the replacement from disk and keep exposing the
     # startup environment credential through the live settings UI.
     path = _config_path_for(ctx, new_cfg) or _config_path_for(ctx, ctx.config)
-    persist = persist_config(new_cfg, path=path, restart_required=restart_required)
+    persist = persist_config(
+        new_cfg,
+        path=path,
+        restart_required=restart_required,
+        backup_credential_redaction=backup_credential_redaction,
+        remove_paths=remove_paths,
+    )
     # Preserve the resolved path on the running config so subsequent saves
     # round-trip to the same file.
     if hasattr(new_cfg, "config_path") and not getattr(new_cfg, "config_path", None):
@@ -196,13 +226,27 @@ def _persist(ctx: RpcContext, new_cfg: Any, *, restart_required: bool) -> str:
     return str(persist.path)
 
 
+def _provider_backup_credential_redaction(
+    provider_id: str,
+) -> CredentialBackupRedaction:
+    """Build a secret-safe backup scrub request for one provider."""
+
+    from opensquilla.onboarding.config_store import CredentialBackupRedaction
+
+    return CredentialBackupRedaction(
+        provider_id=str(provider_id or "").strip().lower(),
+    )
+
+
 def _status_payload(ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.legacy_data import legacy_data_payload
+    from opensquilla.onboarding.mutations import capability_resettable
     from opensquilla.onboarding.next_steps import env_recovery_commands
+    from opensquilla.onboarding.probe_history import load_probe_history
     from opensquilla.onboarding.status import get_onboarding_status
 
     cfg = _active_config(ctx)
-    s = get_onboarding_status(cfg)
+    s = get_onboarding_status(cfg, probe_history=load_probe_history(cfg))
     llm_credential_status = dict(s.llm_credential_status)
     llm_credential_status["revealAllowed"] = bool(
         ctx.principal.is_owner
@@ -216,12 +260,14 @@ def _status_payload(ctx: RpcContext) -> dict[str, Any]:
         "llmSource": s.llm_source,
         "llmEnvKey": s.llm_env_key,
         "llmCredentialStatus": llm_credential_status,
+        "llmProfileStatus": list(s.llm_profile_status),
         "imageGenerationConfigured": s.image_generation_configured,
         "imageGenerationEnabled": s.image_generation_enabled,
         "imageGenerationSource": s.image_generation_source,
         "imageGenerationProvider": s.image_generation_provider,
         "imageGenerationPrimary": s.image_generation_primary,
         "imageGenerationEnvKey": s.image_generation_env_key,
+        "imageGenerationState": s.image_generation_state,
         "audioConfigured": s.audio_configured,
         "audioEnabled": s.audio_enabled,
         "audioSource": s.audio_source,
@@ -235,6 +281,17 @@ def _status_payload(ctx: RpcContext) -> dict[str, Any]:
         "memoryEmbeddingProvider": s.memory_embedding_provider,
         "memoryEmbeddingSource": s.memory_embedding_source,
         "memoryEmbeddingEnvKey": s.memory_embedding_env_key,
+        "capabilityConfiguration": {
+            capability_id: {
+                "resettable": capability_resettable(cfg, capability_id=capability_id)
+            }
+            for capability_id in (
+                "search",
+                "image_generation",
+                "audio",
+                "memory_embedding",
+            )
+        },
         "channelCount": s.channel_count,
         "channelsConfigured": s.channels_configured,
         "ensembleCredentialStatus": list(s.ensemble_credential_status),
@@ -243,13 +300,14 @@ def _status_payload(ctx: RpcContext) -> dict[str, Any]:
         "sectionDetails": s.section_details,
         "envRecoveryCommands": env_recovery_commands(s),
         "warnings": list(s.warnings),
-        # Read-only legacy-home advisory for the Web UI setup flow; execution
-        # stays at the CLI layer (the block carries the command to run).
+        # Frozen compatibility key. Discovery moved to the settings-only
+        # migration RPC and this value remains null through this major.
         "legacyData": legacy_data_payload(),
     }
 
 
 def _active_llm_credential_reveal_payload(ctx: RpcContext, provider_id: str) -> dict[str, Any]:
+    from opensquilla.gateway.llm_runtime import resolve_llm_credential
     from opensquilla.onboarding.provider_specs import get_provider_setup_spec
 
     if not ctx.principal.is_owner:
@@ -275,38 +333,80 @@ def _active_llm_credential_reveal_payload(ctx: RpcContext, provider_id: str) -> 
             "onboarding.provider.credential.unsupported_provider",
             f"Unsupported active provider: {active_provider}",
         ) from exc
-    env_key = (
-        str(getattr(llm, "api_key_env", "") or "").strip()
-        or str(getattr(spec, "env_key", "") or "").strip()
+    credential = resolve_llm_credential(
+        cfg,
+        registry_env_key=str(getattr(spec, "env_key", "") or "").strip(),
+        include_runtime_cache=False,
     )
-    runtime_secret_paths: set[str] = getattr(cfg, "_runtime_secret_paths", set())
-    explicit_key = (
-        ""
-        if "llm.api_key" in runtime_secret_paths
-        else str(getattr(llm, "api_key", "") or "")
-    )
-    if explicit_key:
+    if credential.source in {"explicit", "env"} and credential.api_key:
         return {
             "ok": True,
             "provider": active_provider,
-            "source": "explicit",
-            "envKey": env_key,
-            "apiKey": explicit_key,
+            "source": credential.source,
+            "envKey": credential.env_name,
+            "apiKey": credential.api_key,
         }
-    if env_key:
-        env_value = str(os.environ.get(env_key) or "")
-        if env_value:
-            return {
-                "ok": True,
-                "provider": active_provider,
-                "source": "env",
-                "envKey": env_key,
-                "apiKey": env_value,
-            }
     raise RpcHandlerError(
         "onboarding.provider.credential.unavailable",
         "No revealable credential is available for the active provider.",
     )
+
+
+def _credential_clear_effective_payload(
+    config: Any,
+    provider_id: str,
+    *,
+    active: bool,
+) -> dict[str, Any]:
+    """Describe post-clear credential availability without exposing a value.
+
+    Clearing removes stored sources only. Provider registry environment
+    variables are process-owned external inputs, so an exported default key
+    can remain effective after the config fields are gone. Report that state
+    explicitly so clients never promise that an external credential was
+    deleted.
+    """
+    from opensquilla.onboarding.status import get_onboarding_status
+
+    provider = str(provider_id or "").strip().lower()
+    status = get_onboarding_status(config)
+    if active:
+        row = dict(status.llm_credential_status)
+        source = str(row.get("source") or "none")
+        env_key = str(row.get("envKey") or "")
+        available = bool(row.get("available"))
+    else:
+        row = next(
+            (
+                dict(candidate)
+                for candidate in status.llm_profile_status
+                if str(candidate.get("provider") or "").strip().lower() == provider
+            ),
+            {},
+        )
+        raw_source = str(row.get("credentialSource") or "none")
+        if raw_source in {
+            "member_env",
+            "profile_env",
+            "profile_pool",
+            "profile_pool_env",
+            "registry_env",
+        }:
+            source = "env"
+        elif raw_source == "keyless":
+            source = "not_required"
+        elif raw_source in {"member", "profile", "inherited"}:
+            source = "explicit"
+        else:
+            source = "none"
+        env_key = str(row.get("credentialEnv") or "")
+        available = source in {"explicit", "env", "not_required"}
+    return {
+        "credentialAvailable": available,
+        "credentialSource": source,
+        "credentialEnv": env_key,
+        "externalCredentialActive": source == "env",
+    }
 
 
 @_d.method("onboarding.status", scope="operator.read")
@@ -386,6 +486,96 @@ def _provider_candidate_identity(
     )
 
 
+def _request_changes_active_provider_connection(params: Any, cfg: Any) -> bool:
+    """Return whether explicitly supplied connection fields differ from active.
+
+    The Web UI may echo the saved Base URL and proxy when asking for a manual
+    refresh.  Presence alone does not make that request an unsaved draft: only
+    a different effective value must keep entitlement data ephemeral.
+    """
+
+    if not isinstance(params, dict):
+        return False
+    llm = getattr(cfg, "llm", None)
+    from opensquilla.endpoint_identity import base_url_matches_official_api
+    from opensquilla.provider.tokenrhythm_catalog import (
+        canonical_tokenrhythm_base_url,
+    )
+
+    requested_provider = str(
+        params.get("providerId") or getattr(llm, "provider", "") or ""
+    ).strip().lower()
+
+    comparisons = (
+        ("apiKey", "api_key"),
+        ("apiKeyEnv", "api_key_env"),
+        ("baseUrl", "base_url"),
+        ("proxy", "proxy"),
+    )
+    for rpc_field, config_field in comparisons:
+        raw_value = params.get(rpc_field)
+        if raw_value is None:
+            continue
+        candidate = str(raw_value or "").strip()
+        if rpc_field == "apiKey" and is_redacted_secret_sentinel(candidate):
+            continue
+        # Blank discovery/probe fields retain the saved value.
+        if not candidate:
+            continue
+        active = str(getattr(llm, config_field, "") or "").strip()
+        if rpc_field == "baseUrl":
+            # Treat scheme/host casing, an explicit default port, and a
+            # trailing slash as the same deployment while keeping the API
+            # path, query, fragment, and user-info boundary fail-closed.
+            if requested_provider == "tokenrhythm":
+                active_identity = canonical_tokenrhythm_base_url(active)
+                candidate_identity = canonical_tokenrhythm_base_url(candidate)
+                if not active_identity or candidate_identity != active_identity:
+                    return True
+            elif not base_url_matches_official_api(active, candidate):
+                return True
+        elif candidate != active:
+            return True
+    return False
+
+
+def _llm_profile_for(config: Any, provider_id: str) -> Any | None:
+    provider = str(provider_id or "").strip().lower()
+    for key, profile in (getattr(config, "llm_profiles", None) or {}).items():
+        if str(key or "").strip().lower() == provider:
+            return profile
+    return None
+
+
+def _llm_profile_credential_signature(config: Any, provider_id: str) -> tuple[object, ...]:
+    """Return the in-memory credential-source shape for pool invalidation."""
+
+    profile = _llm_profile_for(config, provider_id)
+    if profile is None:
+        return ()
+    return (
+        str(getattr(profile, "api_key", "") or ""),
+        str(getattr(profile, "api_key_env", "") or ""),
+        tuple(getattr(profile, "api_key_env_pool", None) or ()),
+    )
+
+
+async def _reconcile_saved_llm_profile(
+    previous_config: Any,
+    current_config: Any,
+    provider_id: str,
+) -> None:
+    from opensquilla.gateway.model_catalog_refresh import (
+        reconcile_tokenrhythm_profile_transition,
+    )
+
+    await reconcile_tokenrhythm_profile_transition(
+        previous_config,
+        current_config,
+        provider_id=provider_id,
+    )
+
+
 @_d.method("onboarding.provider.configure", scope="operator.admin")
 async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.mutations import upsert_llm_provider
@@ -408,6 +598,12 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             # Explicit-user-action only (D18): a preset is applied exactly when
             # the client sends presetId; a plain save never auto-applies one.
             preset_id=_param(params, "presetId", ""),
+            router_action=_param(params, "routerAction", "preserve"),
+            image_generation_intent=_param(
+                params,
+                "imageGenerationIntent",
+                "preserve",
+            ),
         )
     # Persist first: if the write fails, the live config is untouched and
     # memory/disk stay consistent. Tool syncs run only on applied state.
@@ -430,18 +626,582 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     }
 
 
+@_d.method("onboarding.llmProfile.upsert", scope="operator.admin")
+async def _llm_profile_upsert(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Create/update a non-primary provider profile without exposing its secret."""
+    from opensquilla.onboarding.mutations import upsert_llm_profile
+
+    provider_id = _require(params, "providerId")
+    p = params if isinstance(params, dict) else {}
+    pool = p.get("apiKeyEnvPool") if "apiKeyEnvPool" in p else None
+    if pool is not None and not isinstance(pool, list):
+        raise RpcHandlerError(
+            "onboarding.llmProfile.invalid",
+            "params.apiKeyEnvPool must be an array of environment-variable names",
+        )
+    preserve_value = p.get("keepCurrentSecret", p.get("preserveApiKey", False))
+    if not isinstance(preserve_value, bool):
+        raise RpcHandlerError(
+            "onboarding.llmProfile.invalid",
+            "params.keepCurrentSecret must be a boolean",
+        )
+    cfg = _active_config(ctx)
+    previous_config = cfg.model_copy(deep=True)
+    with _validation_error("onboarding.llmProfile.invalid"):
+        res = upsert_llm_profile(
+            cfg,
+            provider_id=str(provider_id),
+            model=p.get("model") if "model" in p else None,
+            api_key=p.get("apiKey") if "apiKey" in p else None,
+            api_key_env=p.get("apiKeyEnv") if "apiKeyEnv" in p else None,
+            api_key_env_pool=pool,
+            preserve_api_key=preserve_value,
+            base_url=p.get("baseUrl") if "baseUrl" in p else None,
+            proxy=p.get("proxy") if "proxy" in p else None,
+        )
+    credential_source_changed = _llm_profile_credential_signature(
+        cfg, str(provider_id)
+    ) != _llm_profile_credential_signature(res.config, str(provider_id))
+    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
+    _apply_inplace(ctx, res.config)
+    if credential_source_changed:
+        from opensquilla.gateway.llm_runtime import discard_profile_credential_pool
+
+        discard_profile_credential_pool(str(provider_id))
+    await _reconcile_saved_llm_profile(previous_config, res.config, str(provider_id))
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": res.warnings,
+    }
+
+
+@_d.method("onboarding.llmProfile.credential.clear", scope="operator.admin")
+async def _llm_profile_credential_clear(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Clear stored profile credentials without removing the profile."""
+    from opensquilla.gateway.llm_runtime import discard_profile_credential_pool
+    from opensquilla.onboarding.mutations import clear_llm_profile_credentials
+
+    provider_id = str(_require(params, "providerId"))
+    cfg = _active_config(ctx)
+    previous_config = cfg.model_copy(deep=True)
+    backup_redaction = _provider_backup_credential_redaction(provider_id)
+    with _validation_error("onboarding.llmProfile.invalid"):
+        res = clear_llm_profile_credentials(cfg, provider_id=provider_id)
+    config_path = _persist(
+        ctx,
+        res.config,
+        restart_required=res.restart_required,
+        backup_credential_redaction=backup_redaction,
+    )
+    _apply_inplace(ctx, res.config)
+    # A configured rotation pool holds resolved key values, cooldowns and
+    # session pins in process memory. Purge that provider only after disk is
+    # committed and the live config is updated.
+    discard_profile_credential_pool(provider_id)
+    await _reconcile_saved_llm_profile(previous_config, res.config, provider_id)
+    _sync_image_generation(res.config)
+    entry = {
+        **res.public_payload,
+        **_credential_clear_effective_payload(
+            ctx.config if ctx.config is not None else res.config,
+            provider_id,
+            active=False,
+        ),
+    }
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": entry,
+        "warnings": res.warnings,
+    }
+
+
+@_d.method("onboarding.llmProfile.remove", scope="operator.admin")
+async def _llm_profile_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Remove a profile only when no Router/Ensemble deployment references it."""
+    from opensquilla.gateway.llm_runtime import discard_profile_credential_pool
+    from opensquilla.onboarding.mutations import remove_llm_profile
+
+    provider_id = _require(params, "providerId")
+    cfg = _active_config(ctx)
+    previous_config = cfg.model_copy(deep=True)
+    with _validation_error("onboarding.llmProfile.invalid"):
+        res = remove_llm_profile(cfg, provider_id=str(provider_id))
+    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
+    _apply_inplace(ctx, res.config)
+    discard_profile_credential_pool(str(provider_id))
+    await _reconcile_saved_llm_profile(previous_config, res.config, str(provider_id))
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": res.warnings,
+    }
+
+
+@_d.method("onboarding.llmProfile.active.remove", scope="operator.admin")
+async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Atomically replace and remove the current primary provider."""
+    from opensquilla.onboarding.mutations import (
+        LlmProfileActivationError,
+        LlmProfileRemovalError,
+        remove_active_llm_profile,
+    )
+
+    provider_id = str(_require(params, "providerId"))
+    replacement_provider_id = str(_require(params, "replacementProviderId"))
+    replacement_model = str(_param(params, "replacementModel", "") or "")
+    router_action = str(_param(params, "routerAction", "preserve"))
+    image_generation_intent = str(
+        _param(params, "imageGenerationIntent", "preserve")
+    )
+    cfg = _active_config(ctx)
+    previous_config = cfg.model_copy(deep=True)
+    try:
+        res = remove_active_llm_profile(
+            cfg,
+            provider_id=provider_id,
+            replacement_provider_id=replacement_provider_id,
+            replacement_model=replacement_model,
+            router_action=router_action,
+            image_generation_intent=image_generation_intent,
+        )
+    except LlmProfileActivationError as exc:
+        code_by_reason = {
+            "primary_pool_unsupported": (
+                "onboarding.llmProfile.primary_pool_unsupported"
+            ),
+            "router_provider_conflict": (
+                "onboarding.llmProfile.router_provider_conflict"
+            ),
+        }
+        raise RpcHandlerError(
+            code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid"),
+            str(exc),
+            details={
+                "reason": exc.reason,
+                "providerId": provider_id.strip().lower(),
+                "replacementProviderId": replacement_provider_id.strip().lower(),
+                **exc.details,
+            },
+        ) from exc
+    except LlmProfileRemovalError as exc:
+        code_by_reason = {
+            "active_mismatch": "onboarding.llmProfile.active_mismatch",
+            "profile_referenced": "onboarding.llmProfile.referenced",
+        }
+        raise RpcHandlerError(
+            code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid"),
+            str(exc),
+            details={
+                "reason": exc.reason,
+                "providerId": provider_id.strip().lower(),
+                "replacementProviderId": replacement_provider_id.strip().lower(),
+                **exc.details,
+            },
+        ) from exc
+    except (ValueError, KeyError) as exc:
+        raise RpcHandlerError("onboarding.llmProfile.invalid", str(exc)) from exc
+
+    # This is the sole transaction boundary for the composite mutation.
+    # Activation/removal remain pure until the complete candidate is durable.
+    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
+    _apply_inplace(ctx, res.config)
+    from opensquilla.gateway.llm_runtime import discard_profile_credential_pool
+
+    discard_profile_credential_pool(provider_id)
+    await _reconcile_saved_llm_profile(previous_config, res.config, provider_id)
+    _sync_provider_selector(ctx, res.config.llm)
+    _sync_image_generation(res.config)
+    from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
+
+    await refresh_live_model_catalog(ctx.config if ctx.config is not None else res.config)
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": res.warnings,
+    }
+
+
+@_d.method("onboarding.llmProfile.activate", scope="operator.admin")
+async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Promote one stored profile without moving secrets through the client."""
+    from opensquilla.onboarding.mutations import (
+        LlmProfileActivationError,
+        activate_llm_profile,
+    )
+
+    provider_id = str(_require(params, "providerId"))
+    model = str(_param(params, "model", "") or "")
+    router_action = _param(params, "routerAction", "preserve")
+    image_generation_intent = _param(
+        params,
+        "imageGenerationIntent",
+        "preserve",
+    )
+    cfg = _active_config(ctx)
+    try:
+        res = activate_llm_profile(
+            cfg,
+            provider_id=provider_id,
+            model=model,
+            router_action=str(router_action),
+            image_generation_intent=str(image_generation_intent),
+        )
+    except LlmProfileActivationError as exc:
+        code_by_reason = {
+            "primary_pool_unsupported": (
+                "onboarding.llmProfile.primary_pool_unsupported"
+            ),
+            "router_provider_conflict": (
+                "onboarding.llmProfile.router_provider_conflict"
+            ),
+        }
+        code = code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid")
+        details = {
+            "reason": exc.reason,
+            "providerId": provider_id.strip().lower(),
+            **exc.details,
+        }
+        raise RpcHandlerError(
+            code,
+            str(exc),
+            details=details,
+        ) from exc
+    except (ValueError, KeyError) as exc:
+        raise RpcHandlerError("onboarding.llmProfile.invalid", str(exc)) from exc
+
+    # Disk commit is the transaction boundary. No selector/media/catalog
+    # update is attempted when persistence fails.
+    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
+    _apply_inplace(ctx, res.config)
+    _sync_provider_selector(ctx, res.config.llm)
+    _sync_image_generation(res.config)
+    from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
+
+    await refresh_live_model_catalog(ctx.config if ctx.config is not None else res.config)
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": res.warnings,
+    }
+
+
+def _llm_profile_rpc_session_key(ctx: RpcContext, provider_id: str) -> str:
+    provider = str(provider_id or "").strip().lower()
+    return f"onboarding-profile-rpc:{ctx.conn_id}:{provider}"
+
+
+def _resolved_llm_profile_config(
+    cfg: Any,
+    provider_id: str,
+    model: str,
+    *,
+    session_key: str,
+) -> Any:
+    """Resolve a stored profile or raise a stable, secret-free validation error."""
+    from opensquilla.engine.selector_override import acquire_profile_credential
+    from opensquilla.provider.deployment import resolve_provider_deployment
+
+    provider = str(provider_id or "").strip().lower()
+    profiles = getattr(cfg, "llm_profiles", None) or {}
+    if not any(str(key or "").strip().lower() == provider for key in profiles):
+        raise ValueError(f"provider profile {provider!r} does not exist")
+    resolution = resolve_provider_deployment(
+        cfg,
+        provider,
+        model,
+        session_key=session_key,
+        credential_pool_acquirer=acquire_profile_credential,
+    )
+    if not resolution.ready or resolution.provider_config is None:
+        raise ValueError(
+            f"provider profile {resolution.provider!r} is not executable: {resolution.reason}"
+        )
+    return resolution
+
+
+def _report_llm_profile_rpc_failure(
+    provider_id: str,
+    session_key: str,
+    failure_kind: str,
+) -> None:
+    """Park a failed pooled credential; non-pool/profile failures are no-ops."""
+    if not failure_kind:
+        return
+    from opensquilla.engine.selector_override import report_profile_credential_failure
+    from opensquilla.provider.failures import ProviderFailureKind
+
+    try:
+        kind = ProviderFailureKind(failure_kind)
+    except ValueError:
+        return
+    report_profile_credential_failure(provider_id, session_key, kind)
+
+
+def _draft_llm_profile_config(params: Any, ctx: RpcContext) -> tuple[str, Any]:
+    """Build an in-memory profile draft without persisting or hot-applying it."""
+    from opensquilla.onboarding.mutations import upsert_llm_profile
+
+    provider_id = str(_require(params, "providerId"))
+    provider = provider_id.strip().lower()
+    p = params if isinstance(params, dict) else {}
+    preserve_value = p.get("keepCurrentSecret", True)
+    if not isinstance(preserve_value, bool):
+        raise ValueError("params.keepCurrentSecret must be a boolean")
+    cfg = _active_config(ctx)
+    profiles = getattr(cfg, "llm_profiles", None) or {}
+    if not any(str(key or "").strip().lower() == provider for key in profiles):
+        raise ValueError(f"provider profile {provider!r} does not exist")
+    draft = upsert_llm_profile(
+        cfg,
+        provider_id=provider,
+        api_key=p.get("apiKey") if "apiKey" in p else None,
+        api_key_env=p.get("apiKeyEnv") if "apiKeyEnv" in p else None,
+        preserve_api_key=preserve_value,
+        base_url=p.get("baseUrl") if "baseUrl" in p else None,
+        proxy=p.get("proxy") if "proxy" in p else None,
+    )
+    return provider, draft.config
+
+
+async def _usage_accounted_provider_probe(
+    ctx: RpcContext,
+    *,
+    provider_id: str,
+    model: str,
+    api_key: str,
+    api_key_env: str,
+    base_url: str,
+    proxy: str,
+    allow_default_api_key_env: bool,
+) -> ProviderProbeResult:
+    """Probe one deployment under the shared physical-call usage boundary."""
+    import uuid
+
+    from opensquilla.engine.usage_accounting import (
+        UsageAccountingScope,
+        UsageExecutionContext,
+        account_provider_stream,
+        bind_usage_accounting_scope,
+        provider_accounts_physical_usage,
+    )
+    from opensquilla.onboarding.probe import probe_llm_provider
+
+    usage_scope = None
+    chat_stream_factory = None
+    if ctx.usage_event_sink is not None:
+        execution_id = uuid.uuid4().hex
+        usage_scope = UsageAccountingScope(
+            sink=ctx.usage_event_sink,
+            context=UsageExecutionContext(
+                execution_id=execution_id,
+                agent_run_id=execution_id,
+                turn_id=execution_id,
+                session_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    "opensquilla:system:onboarding-provider-probe",
+                ).hex,
+                agent_id="system",
+                run_kind="onboarding_probe",
+            ),
+        )
+
+        def chat_stream_factory(provider: Any, messages: Any, chat_config: Any) -> Any:
+            if provider_accounts_physical_usage(provider):
+                return provider.chat(messages, config=chat_config)
+            return account_provider_stream(
+                lambda: provider.chat(messages, config=chat_config),
+                provider=str(provider_id),
+                model=str(model),
+            )
+
+    probe_kwargs: dict[str, Any] = {
+        "provider_id": provider_id,
+        "model": model,
+        "api_key": api_key,
+        "api_key_env": api_key_env,
+        "base_url": base_url,
+        "proxy": proxy,
+        "allow_default_api_key_env": allow_default_api_key_env,
+    }
+    if chat_stream_factory is not None:
+        probe_kwargs["chat_stream_factory"] = chat_stream_factory
+    with bind_usage_accounting_scope(usage_scope):
+        return await probe_llm_provider(**probe_kwargs)
+
+
+@_d.method("onboarding.llmProfile.probe", scope="operator.admin")
+async def _llm_profile_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Run a small live probe using the stored profile's resolved deployment."""
+    provider_id = str(_require(params, "providerId"))
+    model = str(_require(params, "model") or "").strip()
+    cfg = _active_config(ctx)
+    session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+    with _validation_error("onboarding.llmProfile.invalid"):
+        resolution = _resolved_llm_profile_config(
+            cfg,
+            provider_id,
+            model,
+            session_key=session_key,
+        )
+        deployment = resolution.provider_config
+        result = await _usage_accounted_provider_probe(
+            ctx,
+            provider_id=deployment.provider,
+            model=deployment.model,
+            api_key=deployment.api_key,
+            api_key_env="",
+            base_url=deployment.base_url,
+            proxy=deployment.proxy,
+            allow_default_api_key_env=False,
+        )
+        if not result.ok and resolution.credential_source == "profile_pool":
+            _report_llm_profile_rpc_failure(
+                deployment.provider,
+                session_key,
+                result.failure_kind,
+            )
+    from opensquilla.onboarding.probe_history import record_probe
+
+    record_probe(cfg, deployment.provider, ok=result.ok, failure_kind=result.failure_kind)
+    return result.to_payload()
+
+
+@_d.method("onboarding.llmProfile.draft.probe", scope="operator.admin")
+async def _llm_profile_draft_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Probe the editor's current profile draft without saving any field."""
+    model = str(_require(params, "model") or "").strip()
+    with _validation_error("onboarding.llmProfile.invalid"):
+        provider_id, draft = _draft_llm_profile_config(params, ctx)
+        session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+        resolution = _resolved_llm_profile_config(
+            draft,
+            provider_id,
+            model,
+            session_key=session_key,
+        )
+        deployment = resolution.provider_config
+        result = await _usage_accounted_provider_probe(
+            ctx,
+            provider_id=deployment.provider,
+            model=deployment.model,
+            api_key=deployment.api_key,
+            api_key_env="",
+            base_url=deployment.base_url,
+            proxy=deployment.proxy,
+            allow_default_api_key_env=False,
+        )
+        if not result.ok and resolution.credential_source == "profile_pool":
+            _report_llm_profile_rpc_failure(
+                deployment.provider,
+                session_key,
+                result.failure_kind,
+            )
+    # Do not return request fields or the cloned config: both may contain keys.
+    return result.to_payload()
+
+
+@_d.method("onboarding.llmProfile.models.discover", scope="operator.admin")
+async def _llm_profile_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Discover picker-safe models through one stored profile deployment."""
+    from opensquilla.onboarding.probe import discover_selectable_provider_models
+
+    provider_id = str(_require(params, "providerId"))
+    cfg = _active_config(ctx)
+    placeholder_model = str(getattr(cfg.llm, "model", "") or "profile-discovery")
+    session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+    with _validation_error("onboarding.llmProfile.invalid"):
+        resolution = _resolved_llm_profile_config(
+            cfg,
+            provider_id,
+            placeholder_model,
+            session_key=session_key,
+        )
+        deployment = resolution.provider_config
+        result = await discover_selectable_provider_models(
+            provider_id=deployment.provider,
+            api_key=deployment.api_key,
+            api_key_env="",
+            base_url=deployment.base_url,
+            proxy=deployment.proxy,
+            allow_default_api_key_env=False,
+            force_refresh=_bool_param(params, "forceRefresh"),
+            persist_catalog=True,
+            catalog_config=cfg,
+        )
+        if not result.ok and resolution.credential_source == "profile_pool":
+            _report_llm_profile_rpc_failure(
+                deployment.provider,
+                session_key,
+                result.failure_kind,
+            )
+    return result.to_payload()
+
+
+@_d.method("onboarding.llmProfile.draft.models.discover", scope="operator.admin")
+async def _llm_profile_draft_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Discover models through the editor's unsaved profile deployment."""
+    from opensquilla.onboarding.probe import discover_selectable_provider_models
+
+    with _validation_error("onboarding.llmProfile.invalid"):
+        provider_id, draft = _draft_llm_profile_config(params, ctx)
+        placeholder_model = str(getattr(draft.llm, "model", "") or "profile-discovery")
+        session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+        resolution = _resolved_llm_profile_config(
+            draft,
+            provider_id,
+            placeholder_model,
+            session_key=session_key,
+        )
+        deployment = resolution.provider_config
+        result = await discover_selectable_provider_models(
+            provider_id=deployment.provider,
+            api_key=deployment.api_key,
+            api_key_env="",
+            base_url=deployment.base_url,
+            proxy=deployment.proxy,
+            allow_default_api_key_env=False,
+            force_refresh=_bool_param(params, "forceRefresh"),
+            persist_catalog=False,
+            catalog_config=draft,
+        )
+        if not result.ok and resolution.credential_source == "profile_pool":
+            _report_llm_profile_rpc_failure(
+                deployment.provider,
+                session_key,
+                result.failure_kind,
+            )
+    return result.to_payload()
+
+
 @_d.method("onboarding.provider.probe", scope="operator.admin")
 async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Live one-token probe of a candidate provider config (nothing is saved)."""
-    from opensquilla.onboarding.probe import probe_llm_provider
-
     provider_id = _require(params, "providerId")
     p = params if isinstance(params, dict) else {}
     cfg = _active_config(ctx)
     api_key = str(p.get("apiKey", "") or "")
+    if is_redacted_secret_sentinel(api_key):
+        # A round-tripped redaction mask is a display value, not a
+        # credential: fall through to the stored-credential reuse below
+        # instead of probing with a literal '***' bearer token.
+        api_key = ""
     api_key_env = str(p.get("apiKeyEnv", "") or "")
     base_url = str(p.get("baseUrl", "") or "")
     proxy = str(p.get("proxy", "") or "")
+    # Draft probes carry explicit fields; only a bare providerId(+model)
+    # request verifies the saved deployment and may update probe history.
+    request_overrides = _request_changes_active_provider_connection(p, cfg)
     # A provider id is not an endpoint identity for configurable providers.
     # Stored credentials may follow an omitted URL or a same-origin path
     # change, but never a scheme/host/effective-port change.
@@ -458,10 +1218,12 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
             base_url = str(getattr(cfg.llm, "base_url", "") or "")
         if not proxy:
             proxy = str(getattr(cfg.llm, "proxy", "") or "")
+    model = str(p.get("model", "") or "")
     with _validation_error("onboarding.provider.invalid"):
-        result = await probe_llm_provider(
-            provider_id=provider_id,
-            model=str(p.get("model", "") or ""),
+        result = await _usage_accounted_provider_probe(
+            ctx,
+            provider_id=str(provider_id),
+            model=model,
             api_key=api_key,
             api_key_env=api_key_env,
             base_url=base_url,
@@ -470,6 +1232,21 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
                 not same_provider or reuse_stored_credentials
             ),
         )
+    saved_model = str(getattr(cfg.llm, "model", "") or "").strip()
+    if (
+        same_provider
+        and reuse_stored_credentials
+        and not request_overrides
+        and (not model.strip() or model.strip() == saved_model)
+    ):
+        from opensquilla.onboarding.probe_history import record_probe
+
+        record_probe(
+            cfg,
+            str(provider_id),
+            ok=bool(getattr(result, "ok", False)),
+            failure_kind=str(getattr(result, "failure_kind", "") or ""),
+        )
     return result.to_payload()
 
 
@@ -477,6 +1254,54 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
 async def _provider_credential_reveal(params: Any, ctx: RpcContext) -> dict[str, Any]:
     provider_id = _require(params, "providerId")
     return _active_llm_credential_reveal_payload(ctx, provider_id)
+
+
+@_d.method("onboarding.provider.credential.clear", scope="operator.admin")
+async def _provider_credential_clear(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Clear stored credentials for the active provider, preserving its setup."""
+    from opensquilla.onboarding.mutations import clear_llm_provider_credentials
+
+    provider_id = str(_require(params, "providerId"))
+    cfg = _active_config(ctx)
+    backup_redaction = _provider_backup_credential_redaction(provider_id)
+    with _validation_error("onboarding.provider.invalid"):
+        res = clear_llm_provider_credentials(cfg, provider_id=provider_id)
+    # Keep the same transaction boundary as provider.configure: no runtime
+    # consumer sees the cleared value until the durable write succeeds.
+    config_path = _persist(
+        ctx,
+        res.config,
+        restart_required=res.restart_required,
+        backup_credential_redaction=backup_redaction,
+    )
+    _apply_inplace(ctx, res.config)
+    _sync_provider_selector(ctx, res.config.llm)
+    live_config = ctx.config if ctx.config is not None else res.config
+    # Selector sync may resolve the provider's registry-default environment
+    # key on a scratch config. The selector may keep using that external key,
+    # but the cleared live config itself holds no cached secret and therefore
+    # must not retain stale runtime-secret provenance.
+    if not str(getattr(live_config.llm, "api_key", "") or ""):
+        live_config._runtime_secret_paths.discard("llm.api_key")
+    _sync_image_generation(res.config)
+    from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
+
+    await refresh_live_model_catalog(live_config)
+    entry = {
+        **res.public_payload,
+        **_credential_clear_effective_payload(
+            live_config,
+            provider_id,
+            active=True,
+        ),
+    }
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": entry,
+        "warnings": res.warnings,
+    }
 
 
 @_d.method("onboarding.models.discover", scope="operator.admin")
@@ -502,9 +1327,15 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     cfg = _active_config(ctx)
     api_key = str(p.get("apiKey", "") or "")
+    if is_redacted_secret_sentinel(api_key):
+        # Same keep-current boundary as onboarding.provider.probe: never
+        # send a round-tripped '***' mask upstream as a bearer token.
+        api_key = ""
     api_key_env = str(p.get("apiKeyEnv", "") or "")
     base_url = str(p.get("baseUrl", "") or "")
     proxy = str(p.get("proxy", "") or "")
+    force_refresh = _bool_param(params, "forceRefresh")
+    request_overrides = _request_changes_active_provider_connection(p, cfg)
     same_provider, reuse_stored_credentials = _provider_candidate_identity(
         cfg,
         str(provider_id),
@@ -528,8 +1359,34 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
             allow_default_api_key_env=(
                 not same_provider or reuse_stored_credentials
             ),
+            force_refresh=force_refresh,
+            persist_catalog=(
+                same_provider and reuse_stored_credentials and not request_overrides
+            ),
+            catalog_config=cfg,
         )
     return result.to_payload()
+
+
+@_d.method("onboarding.imageGeneration.models.discover", scope="operator.admin")
+async def _image_generation_models_discover(
+    params: Any,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """List image-output-capable models without persisting configuration.
+
+    Unlike the general LLM picker, this endpoint only uses provider image
+    catalogs.  The live request, when supported, is fixed to the provider's
+    official image-model endpoint and never accepts an operator-supplied URL or
+    credential.  Curated setup-catalog rows provide an offline-safe fallback.
+    """
+    from opensquilla.onboarding.image_generation_model_discovery import (
+        discover_image_generation_models,
+    )
+
+    provider_id = _require(params, "providerId")
+    with _validation_error("onboarding.imageGeneration.invalid"):
+        return await discover_image_generation_models(str(provider_id))
 
 
 @_d.method("onboarding.router.catalog", scope="operator.read")
@@ -639,11 +1496,14 @@ async def _channel_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         normalized = validate_channel_entry(merge_channel_entry_secrets(cfg, entry))
     type_name = str(normalized.get("type") or "")
     return {
-        "status": "ready",
+        "status": "validated",
         "connected": False,
+        "probeKind": "local_validation",
         "restartRequired": True,
         "entry": redact_channel_entry(type_name, normalized),
-        "warnings": [],
+        "warnings": [
+            "Configuration is locally valid; no provider connection was attempted."
+        ],
     }
 
 
@@ -689,17 +1549,25 @@ async def _image_generation_configure(params: Any, ctx: RpcContext) -> dict[str,
     cfg = _active_config(ctx)
     fallbacks = params.get("fallbacks") if isinstance(params, dict) else None
     with _validation_error("onboarding.imageGeneration.invalid"):
+        if fallbacks is not None and not isinstance(fallbacks, list):
+            raise ValueError("fallbacks must be a list of provider/model references")
         res = upsert_image_generation_provider(
             cfg,
             provider_id=provider_id,
             primary=params.get("primary", "") if isinstance(params, dict) else "",
             api_key=params.get("apiKey", "") if isinstance(params, dict) else "",
             api_key_env=params.get("apiKeyEnv", "") if isinstance(params, dict) else "",
-            base_url=params.get("baseUrl", "") if isinstance(params, dict) else "",
+            base_url=params.get("baseUrl") if isinstance(params, dict) else None,
             enabled=params.get("enabled", True) if isinstance(params, dict) else True,
             size=params.get("size", "") if isinstance(params, dict) else "",
             output_format=params.get("outputFormat", "") if isinstance(params, dict) else "",
-            fallbacks=list(fallbacks) if isinstance(fallbacks, list) else None,
+            fallbacks=list(fallbacks) if fallbacks is not None else None,
+            clear_fallbacks=(
+                params.get("clearFallbacks", False) if isinstance(params, dict) else False
+            ),
+            credential_mode=(
+                params.get("credentialMode") if isinstance(params, dict) else None
+            ),
         )
     # Persist first: if the write fails, the live config is untouched and
     # memory/disk stay consistent. Tool syncs run only on applied state.
@@ -743,27 +1611,46 @@ async def _memory_embedding_configure(params: Any, ctx: RpcContext) -> dict[str,
     }
 
 
-@_d.method("onboarding.audio.configure", scope="operator.admin")
-async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
+def apply_audio_provider_configuration(
+    config_holder: Any,
+    *,
+    provider_id: str,
+    api_key: str = "",
+    api_key_env: str = "",
+    base_url: str = "",
+    enabled: bool = True,
+    tts_voice: str = "",
+    tts_model: str = "",
+    language_code: str = "",
+) -> dict[str, Any]:
+    """Validate, persist, and hot-apply one audio provider configuration.
+
+    The single safe write path for audio config, shared by the
+    ``onboarding.audio.configure`` RPC and the agent-facing ``audio_config``
+    builtin tool. ``config_holder`` only needs a ``config`` attribute carrying
+    the live ``GatewayConfig`` (an ``RpcContext``, or a shim for tools).
+
+    The returned mapping is secret-safe: ``entry`` is the mutation's redacted
+    public payload and never carries the API key.
+    """
     from opensquilla.onboarding.mutations import upsert_audio_provider
 
-    provider_id = _require(params, "providerId")
-    cfg = _active_config(ctx)
+    cfg = _active_config(config_holder)
     res = upsert_audio_provider(
         cfg,
         provider_id=provider_id,
-        api_key=params.get("apiKey", "") if isinstance(params, dict) else "",
-        api_key_env=params.get("apiKeyEnv", "") if isinstance(params, dict) else "",
-        base_url=params.get("baseUrl", "") if isinstance(params, dict) else "",
-        enabled=params.get("enabled", True) if isinstance(params, dict) else True,
-        tts_voice=params.get("ttsVoice", "") if isinstance(params, dict) else "",
-        tts_model=params.get("ttsModel", "") if isinstance(params, dict) else "",
-        language_code=params.get("languageCode", "") if isinstance(params, dict) else "",
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=base_url,
+        enabled=enabled,
+        tts_voice=tts_voice,
+        tts_model=tts_model,
+        language_code=language_code,
     )
     # Persist first: if the write fails, the live config is untouched and
     # memory/disk stay consistent. Tool syncs run only on applied state.
-    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
-    _apply_inplace(ctx, res.config)
+    config_path = _persist(config_holder, res.config, restart_required=res.restart_required)
+    _apply_inplace(config_holder, res.config)
     _sync_image_generation(res.config)
     return {
         "changed": res.changed,
@@ -772,6 +1659,144 @@ async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
         "entry": res.public_payload,
         "warnings": res.warnings,
     }
+
+
+def apply_agent_audio_provider_configuration(
+    config_holder: Any,
+    *,
+    provider_id: str,
+    api_key: str = "",
+    api_key_env: str = "",
+    enabled: bool = True,
+    tts_voice: str = "",
+    tts_model: str = "",
+    language_code: str = "",
+) -> dict[str, Any]:
+    """Apply the constrained audio configuration exposed to agents.
+
+    Operator-facing RPCs may configure compatible endpoints and custom
+    credential environment variables. The agent tool is deliberately pinned
+    to the provider registry so it cannot redirect an unrelated environment
+    credential to a model-selected endpoint.
+    """
+    from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
+
+    spec = get_audio_provider_setup_spec(provider_id)
+    if api_key_env and api_key_env != spec.env_key:
+        raise ValueError(
+            f"audio provider {provider_id!r} only accepts api_key_env={spec.env_key!r} "
+            "through this tool"
+        )
+    return apply_audio_provider_configuration(
+        config_holder,
+        provider_id=provider_id,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=spec.default_base_url,
+        enabled=enabled,
+        tts_voice=tts_voice,
+        tts_model=tts_model,
+        language_code=language_code,
+    )
+
+
+@_d.method("onboarding.audio.configure", scope="operator.admin")
+async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    provider_id = _require(params, "providerId")
+    p = params if isinstance(params, dict) else {}
+    return apply_audio_provider_configuration(
+        ctx,
+        provider_id=provider_id,
+        api_key=p.get("apiKey", ""),
+        api_key_env=p.get("apiKeyEnv", ""),
+        base_url=p.get("baseUrl", ""),
+        enabled=p.get("enabled", True),
+        tts_voice=p.get("ttsVoice", ""),
+        tts_model=p.get("ttsModel", ""),
+        language_code=p.get("languageCode", ""),
+    )
+
+
+@_d.method("onboarding.capability.reset", scope="operator.admin")
+async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.onboarding.mutations import reset_capability
+
+    with _validation_error("onboarding.capability.invalid"):
+        res = reset_capability(
+            _active_config(ctx),
+            capability_id=str(_require(params, "capabilityId")),
+        )
+    # Scrub the current config and all managed backups before swapping the
+    # running config. Any persistence failure therefore leaves runtime intact.
+    config_path = _persist(
+        ctx,
+        res.config,
+        restart_required=res.restart_required,
+        remove_paths=res.remove_paths,
+    )
+    _apply_inplace(ctx, res.config)
+    canonical_capability_id = str(res.public_payload["capabilityId"])
+    restart_required = res.restart_required
+    warnings = list(res.warnings)
+    try:
+        if canonical_capability_id == "search":
+            _sync_search_provider(res.config)
+        elif canonical_capability_id in {"image_generation", "audio"}:
+            _sync_image_generation(res.config)
+    except Exception as exc:  # noqa: BLE001 - persisted reset degrades to restart
+        restart_required = True
+        warnings.append(
+            "Capability reset was saved, but the live runtime could not be "
+            "updated. Restart the gateway to apply it."
+        )
+        log.warning(
+            "onboarding.capability_reset_live_sync_failed",
+            capability_id=canonical_capability_id,
+            error_type=type(exc).__name__,
+        )
+    return {
+        "changed": res.changed,
+        "restartRequired": restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": warnings,
+    }
+
+
+async def _reconcile_channels_live() -> dict[str, str] | None:
+    """Run the boot-registered channel reconciler against the live config.
+
+    ``None`` means no reconciler is registered (standalone/config-only
+    contexts) — everything stays restart-gated. A reconciler failure also
+    degrades to restart-gated: the config is already persisted and applied
+    in place, so the honest fallback is the pre-reconcile contract.
+    """
+    from opensquilla.gateway.channels_bridge import get_channels_reconciler
+
+    reconciler = get_channels_reconciler()
+    if reconciler is None:
+        return None
+    try:
+        return await reconciler()
+    except Exception as exc:  # noqa: BLE001 - config stays valid either way
+        log.warning("onboarding.channel_reconcile_failed", error=str(exc))
+        return None
+
+
+def _live_apply_fields(live: dict[str, str] | None, names: list[str]) -> dict[str, Any]:
+    """Response fields describing what the reconciler actually did.
+
+    ``restartRequired`` stays the compatibility signal older clients read; it
+    is scoped to the channel(s) THIS call mutated — an unrelated channel's
+    outstanding restart must not relabel a live-applied save. ``failed`` does
+    NOT flag a restart — restarting won't fix a bad entry; the channel
+    carries its error in channels.status and channels.restart retries it.
+    ``liveApply`` keeps the full per-name outcome map for observability.
+    """
+    if live is None:
+        return {"restartRequired": True, "liveApply": None}
+    pending = any(live.get(name) == "pending_restart" for name in names)
+    return {"restartRequired": pending, "liveApply": live}
 
 
 @_d.method("onboarding.channel.upsert", scope="operator.admin")
@@ -788,9 +1813,11 @@ async def _channel_upsert(params: Any, ctx: RpcContext) -> dict[str, Any]:
     # memory/disk stay consistent. Tool syncs run only on applied state.
     config_path = _persist(ctx, res.config, restart_required=True)
     _apply_inplace(ctx, res.config)
+    live = await _reconcile_channels_live()
+    entry_name = str(res.public_payload.get("name") or entry.get("name") or "")
     return {
         "changed": res.changed,
-        "restartRequired": True,
+        **_live_apply_fields(live, [entry_name]),
         "configPath": config_path,
         "entry": res.public_payload,
         "warnings": res.warnings,
@@ -809,9 +1836,10 @@ async def _channel_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
     # memory/disk stay consistent. Tool syncs run only on applied state.
     config_path = _persist(ctx, res.config, restart_required=True)
     _apply_inplace(ctx, res.config)
+    live = await _reconcile_channels_live()
     return {
         "changed": res.changed,
-        "restartRequired": True,
+        **_live_apply_fields(live, [name]),
         "configPath": config_path,
         "removed": name,
     }
@@ -828,9 +1856,10 @@ async def _toggle(ctx: RpcContext, params: Any, enabled: bool) -> dict[str, Any]
     # memory/disk stay consistent. Tool syncs run only on applied state.
     config_path = _persist(ctx, res.config, restart_required=True)
     _apply_inplace(ctx, res.config)
+    live = await _reconcile_channels_live()
     return {
         "changed": res.changed,
-        "restartRequired": True,
+        **_live_apply_fields(live, [name]),
         "configPath": config_path,
         "name": name,
         "enabled": enabled,

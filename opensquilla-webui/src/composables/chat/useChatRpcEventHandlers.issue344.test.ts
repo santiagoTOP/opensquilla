@@ -11,6 +11,7 @@
 // task-B's own events (and legacy untagged events) still flow.
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, ref, type Ref } from 'vue'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
 import type { ToolUsePayload } from '@/types/rpc'
 import {
@@ -80,12 +81,12 @@ function makeHarness(activeStreamTaskId = '') {
     clearPendingRouterDecision: vi.fn(),
     handleRouterControlReplay: vi.fn(),
     showCompactionToast: vi.fn(),
+    showWarningToast: vi.fn(),
     scheduleHistorySync: vi.fn(),
     schedulePendingDrainAfterTerminal: vi.fn(),
     popAllPendingIntoComposer: vi.fn(() => false),
     saveWidgetState: vi.fn(),
-    subscribeSession: vi.fn(),
-    loadHistory: vi.fn(),
+    handleSessionConnectionState: vi.fn(),
     loadCurrentSessionUsage: vi.fn(),
   }
   const scope = effectScope()
@@ -218,6 +219,27 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
     expect(stream.endStreaming).toHaveBeenCalled()
     expect(messages.value.some((m) => m.role === 'error')).toBe(true)
+  })
+
+  it('localizes the stable Ensemble image error code and keeps the code attached', async () => {
+    await loadLocaleMessages('zh-Hans')
+    i18n.global.locale.value = 'zh-Hans'
+    const { api, messages, scope } = makeHarness('task-B')
+
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'ensemble_multimodal_unsupported',
+      terminal_message: 'server fallback text',
+    })
+
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'ensemble_multimodal_unsupported',
+      text: 'Ensemble 暂不支持图片输入，请切换到单模型路由后重试。',
+    })
+    scope.stop()
+    i18n.global.locale.value = 'en'
   })
 
   it('binds activeStreamTaskId from task.running, then filters the prior task', () => {
@@ -440,7 +462,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     )
   })
 
-  it('keeps the stopped-output notice as a local turn result when the next user message is added', () => {
+  it('does not synthesize a stopped-output bubble before the next user message', () => {
     const { api, options, stream, messages } = makeHarness('__opensquilla_stopped_stream_task__')
     stream.isStreaming.value = true
     messages.value = [
@@ -462,10 +484,9 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'stop immediately'],
-      ['assistant', 'Stopped after 1s'],
       ['user', 'next question'],
     ])
-    expect(messages.value[1]?.stopNotice).toBe(true)
+    expect(messages.value.some(message => message.stopNotice)).toBe(false)
   })
 
   it('does not insert a stopped-output notice before a cancelled partial assistant output is finalized', () => {

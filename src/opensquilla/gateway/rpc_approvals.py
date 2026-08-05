@@ -9,6 +9,7 @@ from opensquilla.application.approval_queue import get_approval_queue
 from opensquilla.application.approval_rpc import (
     approval_extend_rpc_payload,
     approval_forget_rpc_payload,
+    approval_lookup_status_rpc_payload,
     approval_request_rpc_payload,
     approval_resolve_rpc_payload,
     approval_settings_rpc_payload,
@@ -17,9 +18,11 @@ from opensquilla.application.approval_rpc import (
     approval_wait_decision_rpc_payload,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.escalation import (
     apply_sandbox_approval_choice,
     deny_matching_pending_sandbox_approvals,
+    discard_approval_run_context_authority,
     is_sandbox_approval_kind,
     remember_sandbox_approval_denial,
     validate_sandbox_approval_choice,
@@ -177,6 +180,17 @@ async def _handle_exec_approval_wait_decision(
     )
 
 
+@_d.method("exec.approval.status", scope="operator.approvals")
+async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict) or not str(params.get("id") or "").strip():
+        raise ValueError("params.id is required")
+    return approval_lookup_status_rpc_payload(
+        get_approval_queue(),
+        str(params["id"]).strip(),
+        namespace="exec",
+    )
+
+
 @_d.method("exec.approval.snapshot", scope="operator.approvals")
 async def _handle_exec_approval_snapshot(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Return a diagnostic snapshot for approval state."""
@@ -262,10 +276,21 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=params["id"],
                 choice=normalized_choice,
                 approved=True,
                 session_manager=ctx.session_manager,
                 config=ctx.config,
+            )
+        except ProjectWorkspaceStateError:
+            # This exact execution/session/workspace authority is gone.
+            # Reopening can never make the card actionable again.
+            discard_approval_run_context_authority(params["id"])
+            queue.expire_claimed_resolution(params["id"], claim_token)
+            return approval_status_rpc_payload(
+                queue,
+                params["id"],
+                queue.get_settings().mode,
             )
         except Exception:
             queue.reopen_resolved_approval(params["id"], expected_approved=True)
@@ -353,6 +378,17 @@ async def _handle_plugin_approval_wait_decision(
         queue,
         params["id"],
         timeout_seconds=params.get("timeoutSeconds"),
+    )
+
+
+@_d.method("plugin.approval.status", scope="operator.approvals")
+async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict) or not str(params.get("id") or "").strip():
+        raise ValueError("params.id is required")
+    return approval_lookup_status_rpc_payload(
+        get_approval_queue(),
+        str(params["id"]).strip(),
+        namespace="plugin",
     )
 
 

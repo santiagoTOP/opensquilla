@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useChatFeatureToggles } from './useChatFeatureToggles'
 import source from './useChatFeatureToggles.ts?raw'
+import type { RpcCallOptions } from '@/lib/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
@@ -17,6 +18,7 @@ function createHarness(options: {
   configGetResults?: RpcResult[]
   routingGetResults?: RpcResult[]
   patchResults?: RpcResult[]
+  readCallOptions?: RpcCallOptions
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
@@ -55,6 +57,7 @@ function createHarness(options: {
   }
   const api = useChatFeatureToggles({
     rpc,
+    readCallOptions: options.readCallOptions,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
@@ -82,13 +85,32 @@ afterEach(() => {
 
 describe('useChatFeatureToggles coding mode', () => {
   it('reads enabled coding mode from backend config', async () => {
-    const { api } = createHarness({
+    const readCallOptions: RpcCallOptions = {
+      timeoutMs: 2_000,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    }
+    const { api, rpc } = createHarness({
       configGetResults: [{ skills: { coding_mode: true } }],
+      readCallOptions,
     })
 
     await api.loadFeatureToggles()
 
     expect(api.codingModeEnabled.value).toBe(true)
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      2_000,
+      undefined,
+      {
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      },
+    )
+    expect(rpc.call).toHaveBeenCalledWith(
+      'config.get',
+      undefined,
+      readCallOptions,
+    )
   })
 
   it.each([
@@ -238,6 +260,26 @@ describe('useChatFeatureToggles coding mode', () => {
 
     expect(setterSource).toContain('skills.coding_mode')
     expect(setterSource).not.toMatch(/localStorage|sessionStorage/)
+  })
+})
+
+describe('useChatFeatureToggles router visual effects', () => {
+  it('persists router visual effects without a legacy browser global', () => {
+    const setItem = vi.fn()
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn(() => null),
+      setItem,
+    })
+    const { api } = createHarness()
+
+    api.setRouterVisualEffectsEnabled(false)
+
+    expect(api.routerVisualEffectsEnabled.value).toBe(false)
+    expect(setItem).toHaveBeenCalledWith('opensquilla.routerFx', JSON.stringify({
+      enabled: false,
+      variant: 'default',
+    }))
+    expect(source).not.toContain('SavingsFX')
   })
 })
 

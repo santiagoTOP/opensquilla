@@ -50,6 +50,23 @@ def test_companion_version_and_bun_are_exactly_pinned() -> None:
     assert "com.apple.security.cs.disable-library-validation" in entitlements
 
 
+def test_bun_native_tests_run_in_isolated_processes() -> None:
+    package = json.loads(
+        (REPO_ROOT / "src/opensquilla/cli/tui/opentui/package/package.json").read_text()
+    )
+    runner = (
+        REPO_ROOT
+        / "src/opensquilla/cli/tui/opentui/package/scripts/run-bun-tests.mjs"
+    ).read_text()
+
+    assert package["scripts"]["test:bun"] == "node scripts/run-bun-tests.mjs"
+    assert 'entry.name.endsWith(".bun.test.mjs")' in runner
+    assert "for (const testFile of testFiles)" in runner
+    assert '"--max-concurrency=1"' in runner
+    assert 'OPENSQUILLA_TUI_COLOR: "truecolor"' in runner
+    assert "spawnSync(" in runner
+
+
 def test_core_wheel_excludes_generated_tui_host_directories() -> None:
     data = tomllib.loads(CORE_PYPROJECT.read_text(encoding="utf-8"))
     excluded = set(data["tool"]["hatch"]["build"]["targets"]["wheel"]["exclude"])
@@ -280,24 +297,18 @@ def test_staged_companion_targets_keep_linux_and_windows_artifacts_isolated(
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
-def test_core_wheel_stays_universal_and_excludes_host_artifacts(tmp_path: Path) -> None:
-    result = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stderr
-    wheels = list(tmp_path.glob("opensquilla-*-py3-none-any.whl"))
-    assert len(wheels) == 1, list(tmp_path.iterdir())
+def test_core_wheel_stays_universal_and_excludes_host_artifacts(
+    isolated_core_wheel: Path,
+) -> None:
+    assert isolated_core_wheel.name.endswith("-py3-none-any.whl")
 
-    with zipfile.ZipFile(wheels[0]) as archive:
+    with zipfile.ZipFile(isolated_core_wheel) as archive:
         names = archive.namelist()
         wheel_metadata = next(name for name in names if name.endswith(".dist-info/WHEEL"))
         wheel_text = archive.read(wheel_metadata).decode()
     assert "Root-Is-Purelib: true" in wheel_text
     assert "Tag: py3-none-any" in wheel_text
+    assert "opensquilla/dist/workspace_state.py" in names
     forbidden_parts = {"node_modules", "bin", "build", "dist"}
     leaked = [
         name

@@ -237,10 +237,11 @@ class SlashCommandRegistry:
 
 # ---------------------------------------------------------------------------
 # Canonical registry: every slash command shipped today across the three
-# surfaces. Sourced from:
-#   - cli/repl/commands.py REGISTRY (TUI, 17)
-#   - channels/command_registry.py DEFAULT_COMMAND_REGISTRY (channel, 9)
-#   - gateway/static/js/views/chat.js slash-command list (web, 3)
+# surfaces. Its surface adapters are:
+#   - cli/repl/commands.py (TUI)
+#   - channels/command_registry.py (channel)
+#   - opensquilla-webui/src/composables/chat/useChatSlashCommands.ts (web,
+#     loaded through the commands.list_for_surface RPC)
 # Where canonical name diverges (TUI's /clear vs web/channel's /reset),
 # we pick the cross-surface name and demote the other to alias.
 # ---------------------------------------------------------------------------
@@ -342,6 +343,16 @@ _COMMANDS: tuple[CommandDef, ...] = (
         presentation=CommandPresentation.NOTICE,
         order=70,
     ),
+    CommandDef(
+        name="/coding",
+        usage="/coding [on|off|status]",
+        description="Turn Coding mode on or off.",
+        execution={_W: _local("coding.mode")},
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=75,
+    ),
     # ---- TUI + Channel ----------------------------------------------------
     CommandDef(
         name="/help",
@@ -352,6 +363,17 @@ _COMMANDS: tuple[CommandDef, ...] = (
         busy_policy=CommandBusyPolicy.IMMEDIATE,
         presentation=CommandPresentation.PANEL,
         order=100,
+    ),
+    CommandDef(
+        name="/keys",
+        usage="/keys",
+        description="Show keyboard shortcuts.",
+        execution={_T: _local("keys.show"), _S: _local("keys.show")},
+        aliases=("/shortcuts",),
+        category=CommandCategory.QUERY,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.PANEL,
+        order=101,
     ),
     CommandDef(
         name="/theme",

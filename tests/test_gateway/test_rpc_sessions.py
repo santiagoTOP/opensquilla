@@ -6,14 +6,19 @@ import asyncio
 import base64
 import hashlib
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
+from starlette.websockets import WebSocketState
 
 from opensquilla.agents.registry import AgentRegistry
+from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.engine.types import DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
@@ -23,19 +28,33 @@ from opensquilla.gateway.attachment_ingest import (
     MAX_TOTAL_ATTACHMENT_BYTES,
 )
 from opensquilla.gateway.auth import Principal
-from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
+from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, LlmProviderProfile
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
+from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
-from opensquilla.gateway.websocket import SubscriptionManager, get_registry
+from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
+from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
 
 _DEFAULT_PRINCIPAL = Principal(
     role="operator", scopes=frozenset(["operator.admin"]), is_owner=True, authenticated=True
 )
+
+
+def test_sessions_messages_hydrate_scope_contract() -> None:
+    assert METHOD_SCOPES["sessions.messages.hydrate"] == READ_SCOPE
+
+
+def test_sessions_steer_v2_scope_contract() -> None:
+    assert METHOD_SCOPES["sessions.steer.v2"] == WRITE_SCOPE
 
 
 @dataclass
@@ -61,8 +80,119 @@ class FakeSession:
     spawned_by: str | None = None
     origin: dict | None = None
     model: str | None = None
+    model_provider: str | None = None
+    provider_override: str | None = None
     model_override: str | None = None
+    auth_profile_override: str | None = None
+    auth_profile_override_source: str | None = None
     epoch: int = 0
+    workspace_id: str | None = None
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_code"),
+    [
+        ("not_found", "WORKSPACE_NOT_FOUND"),
+        ("removed", "WORKSPACE_NOT_FOUND"),
+        ("untrusted", "WORKSPACE_NOT_FOUND"),
+        ("unavailable", "WORKSPACE_UNAVAILABLE"),
+        ("canonical_changed", "WORKSPACE_UNAVAILABLE"),
+        ("guard_required", "WORKSPACE_UNAVAILABLE"),
+        ("binding_changed", "WORKSPACE_UNAVAILABLE"),
+    ],
+)
+def test_project_workspace_error_mapping_is_stable(
+    reason: str,
+    expected_code: str,
+) -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        map_project_workspace_error,
+    )
+
+    mapped = map_project_workspace_error(
+        ProjectWorkspaceStateError(reason),  # type: ignore[arg-type]
+        owner=True,
+    )
+
+    assert mapped.code == expected_code
+    assert mapped.details == {"reason": reason}
+
+
+def test_project_workspace_error_mapping_does_not_leak_path_to_non_owner() -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        map_project_workspace_error,
+    )
+
+    secret_path = "/private/owner/project"
+    low_level = "permission denied while opening inode 42"
+    source = OSError(f"{low_level}: {secret_path}")
+    error = ProjectWorkspaceStateError("unavailable")
+    error.__cause__ = source
+
+    mapped = map_project_workspace_error(error, owner=False)
+    rendered = f"{mapped.message} {mapped.details}"
+
+    assert secret_path not in rendered
+    assert low_level not in rendered
+    assert mapped.details == {"reason": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_project_workspace_snapshot_retains_missing_binding_id() -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        project_workspace_snapshot,
+    )
+
+    class MissingStorage:
+        async def get_project_workspace(self, workspace_id: str) -> None:
+            return None
+
+    snapshot = await project_workspace_snapshot(
+        MissingStorage(),  # type: ignore[arg-type]
+        FakeSession(workspace_id="missing-project"),
+    )
+
+    assert snapshot == {
+        "id": "missing-project",
+        "name": None,
+        "path": None,
+        "available": False,
+        "removed": False,
+        "availabilityReason": "not_found",
+    }
+
+
+@pytest.mark.asyncio
+async def test_project_workspace_snapshot_retains_removed_name_and_path() -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        project_workspace_snapshot,
+    )
+
+    removed = SimpleNamespace(
+        workspace_id="removed-project",
+        display_name="Removed project",
+        path="/retained/project/path",
+        removed_at=123,
+        trusted_at=1,
+    )
+
+    class RemovedStorage:
+        async def get_project_workspace(self, workspace_id: str) -> Any:
+            return removed
+
+    snapshot = await project_workspace_snapshot(
+        RemovedStorage(),  # type: ignore[arg-type]
+        FakeSession(workspace_id=removed.workspace_id),
+    )
+
+    assert snapshot == {
+        "id": removed.workspace_id,
+        "name": removed.display_name,
+        "path": removed.path,
+        "available": False,
+        "removed": True,
+        "availabilityReason": "removed",
+    }
 
 
 class FakeStorage:
@@ -229,6 +359,11 @@ class FakeSessionManager:
         agent_id: str = "main",
         display_name: str | None = None,
         model: str | None = None,
+        model_provider: str | None = None,
+        provider_override: str | None = None,
+        model_override: str | None = None,
+        auth_profile_override: str | None = None,
+        auth_profile_override_source: str | None = None,
     ):
         session = FakeSession(
             session_key=session_key,
@@ -236,6 +371,11 @@ class FakeSessionManager:
             agent_id=agent_id,
             display_name=display_name,
             model=model,
+            model_provider=model_provider,
+            provider_override=provider_override,
+            model_override=model_override,
+            auth_profile_override=auth_profile_override,
+            auth_profile_override_source=auth_profile_override_source,
         )
         self._storage._sessions[session_key] = session
         return session
@@ -357,7 +497,7 @@ def _capture_compaction_emits(
     ) -> None:
         emitted.append((session_key, event_name, payload))
 
-    monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", _record_emit)
+    monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", _record_emit)
     return emitted
 
 
@@ -609,6 +749,112 @@ class TestSessionsCreate:
         assert session.model == "explicit/model"
 
     @pytest.mark.asyncio
+    async def test_create_provider_does_not_inherit_agent_registry_model(self, dispatcher):
+        cfg = GatewayConfig(agents=[AgentEntryConfig(id="ops", model="claude/default")])
+        registry = AgentRegistry(cfg, persist_changes=False)
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "ops", "provider": "openai"},
+            make_ctx(
+                session_manager=session_manager,
+                config=cfg,
+                agent_registry=registry,
+            ),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "session_deployment_requires_explicit_model"
+        }
+        assert session_manager._storage._sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_create_persists_complete_named_profile_deployment(self, dispatcher):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "provider": "OpenAI",
+                "model": "gpt-session",
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=session_manager, config=cfg),
+        )
+
+        assert res.ok is True
+        session = session_manager._storage._sessions[res.payload["key"]]
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-session"
+        assert session.auth_profile_override == "openai:work"
+        assert session.auth_profile_override_source == "rpc"
+        assert session.model_provider is None
+        assert "synthetic-named-secret" not in repr(res.payload)
+        assert "openai:work" not in repr(res.payload)
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_incomplete_named_profile_deployment(self, dispatcher):
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "model": "gpt-session",
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "named_auth_profile_requires_provider"
+        }
+        assert session_manager._storage._sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_named_profile_provider_mismatch(self, dispatcher):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["anthropic:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.anthropic.com",
+        )
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "provider": "openai",
+                "model": "gpt-session",
+                "authProfile": "anthropic:work",
+            },
+            make_ctx(session_manager=session_manager, config=cfg),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "named_auth_profile_provider_mismatch"
+        }
+        assert "synthetic-named-secret" not in repr(res.error)
+        assert session_manager._storage._sessions == {}
+
+    @pytest.mark.asyncio
     async def test_create_rejects_missing_agent_when_registry_present(self, dispatcher):
         cfg = GatewayConfig(agents=[AgentEntryConfig(id="ops", model="agent/default")])
         registry = AgentRegistry(cfg, persist_changes=False)
@@ -733,6 +979,76 @@ class TestSessionsList:
         assert row["interactive"] is True
 
     @pytest.mark.asyncio
+    async def test_list_includes_workspace_from_run_context(self, dispatcher, tmp_path):
+        workspace = tmp_path / "project-alpha"
+        workspace.mkdir()
+        session = FakeSession(
+            session_key="agent:main:webchat:workspace",
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "workspace": str(workspace),
+                    "run_mode": "trusted",
+                }
+            },
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["workspace"] == str(workspace)
+        assert row["workspaceLabel"] == "project-alpha"
+        assert row["workspaceDisplayPath"] == str(workspace)
+
+    @pytest.mark.asyncio
+    async def test_list_uses_explicit_config_workspace(self, dispatcher, tmp_path):
+        workspace = tmp_path / "project-beta"
+        workspace.mkdir()
+        session = FakeSession(session_key="agent:main:webchat:workspace-config")
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            config=GatewayConfig(workspace_dir=str(workspace), memory={"flush_enabled": False}),
+        )
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["workspace"] == str(workspace)
+        assert row["workspaceLabel"] == "project-beta"
+        assert row["workspaceDisplayPath"] == str(workspace)
+
+    @pytest.mark.asyncio
+    async def test_list_keeps_default_opensquilla_workspace_flat(
+        self, dispatcher, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "opensquilla-home"))
+        workspace = default_workspace_dir()
+        workspace.mkdir(parents=True)
+        session = FakeSession(
+            session_key="agent:main:webchat:default-workspace",
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "workspace": str(workspace),
+                    "run_mode": "trusted",
+                }
+            },
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            config=GatewayConfig(memory={"flush_enabled": False}),
+        )
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert "workspace" not in row
+        assert "workspaceLabel" not in row
+        assert "workspaceDisplayPath" not in row
+
+    @pytest.mark.asyncio
     async def test_list_returns_each_session_once(self, dispatcher):
         sessions = [
             FakeSession(session_key="agent:main:webchat:first"),
@@ -837,6 +1153,40 @@ class TestSessionsList:
         assert row["conversationKind"] == "direct"
         assert row["groupLabel"] == "Chats"
         assert row["interactive"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_classifies_custom_named_channel_sessions(self, dispatcher):
+        # Operators name channels freely ("飞书", "slack-eng"); the session key
+        # and last_channel carry that NAME, not the platform type. The view must
+        # resolve it through the configured name->type map or every custom-named
+        # channel's sessions land in the sidebar as unclassifiable "unknown".
+        session = FakeSession(
+            session_key="agent:main:飞书:direct:ou_demo_user",
+            last_channel="飞书",
+            last_to="ou_demo_user",
+        )
+        config = GatewayConfig(
+            memory={"flush_enabled": False},
+            channels={
+                "channels": [
+                    {
+                        "type": "feishu",
+                        "name": "飞书",
+                        "app_id": "cli_dummy",
+                        "app_secret": "dummy",
+                    }
+                ]
+            },
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), config=config)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["sessionKind"] == "channel"
+        assert row["surface"] == "feishu"
+        assert row["conversationKind"] == "direct"
 
     @pytest.mark.asyncio
     async def test_list_contract_slack_channel_thread_row(self, dispatcher):
@@ -1260,6 +1610,84 @@ class TestSessionsSend:
         ]
 
     @pytest.mark.asyncio
+    async def test_legacy_direct_send_holds_registry_admission_through_register(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session = FakeSession(session_key="agent:main:webchat:legacy-direct-admission")
+        manager = FakeSessionManager([session])
+        runner = _RecordingTurnRunner()
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=None,
+            turn_runner=runner,
+        )
+        registry = get_agent_task_registry()
+        admission_attempted = asyncio.Event()
+        append_called = asyncio.Event()
+        original_admission = registry.admission
+        original_append = manager.append_message
+        original_register = registry.register
+        admission_active = False
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            nonlocal admission_active
+            admission_attempted.set()
+            async with original_admission(session_key):
+                admission_active = True
+                try:
+                    yield
+                finally:
+                    admission_active = False
+
+        async def observed_append(*args: Any, **kwargs: Any) -> Any:
+            append_called.set()
+            return await original_append(*args, **kwargs)
+
+        def observed_register(session_key: str, task: asyncio.Task) -> None:
+            assert admission_active is True
+            original_register(session_key, task)
+
+        monkeypatch.setattr(registry, "admission", observed_admission)
+        monkeypatch.setattr(registry, "register", observed_register)
+        monkeypatch.setattr(manager, "append_message", observed_append)
+        admission_lock = registry._admission_locks.setdefault(
+            session.session_key,
+            asyncio.Lock(),
+        )
+
+        async with admission_lock:
+            sending = asyncio.create_task(
+                dispatcher.dispatch(
+                    "r-legacy-direct-admission",
+                    "sessions.send",
+                    {"key": session.session_key, "message": "hello"},
+                    ctx,
+                )
+            )
+            admission_wait = asyncio.create_task(admission_attempted.wait())
+            append_wait = asyncio.create_task(append_called.wait())
+            done, _pending = await asyncio.wait(
+                {admission_wait, append_wait},
+                timeout=2.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert admission_wait in done
+            assert append_wait not in done
+            assert sending.done() is False
+
+        response = await asyncio.wait_for(sending, timeout=2.0)
+        background = registry.get(session.session_key)
+        if background is not None:
+            await background
+        admission_wait.cancel()
+        append_wait.cancel()
+
+        assert response.ok is True
+
+    @pytest.mark.asyncio
     async def test_send_apply_intent_waits_for_session_lock(self, dispatcher, session):
         manager = FakeSessionManager([session])
         turn_runner = _RecordingTurnRunner()
@@ -1432,9 +1860,7 @@ class TestSessionsSend:
                 message_id: str,
                 context: dict[str, Any],
             ) -> bool:
-                self.turn_context_updates.append(
-                    (session_key, message_id, dict(context))
-                )
+                self.turn_context_updates.append((session_key, message_id, dict(context)))
                 return True
 
         blocker_started = asyncio.Event()
@@ -1572,7 +1998,7 @@ class TestSessionsSend:
         assert runtime.enqueue_calls[0]["fresh_user_session"] is False
 
     @pytest.mark.asyncio
-    async def test_send_uses_source_run_mode_without_persisting_to_session(self, dispatcher):
+    async def test_send_persists_source_run_mode_to_session(self, dispatcher):
         class RecordingTaskRuntime:
             def __init__(self) -> None:
                 self.enqueue_calls: list[dict[str, Any]] = []
@@ -1632,8 +2058,15 @@ class TestSessionsSend:
         assert envelope.metadata["run_mode"] == "full"
         assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
         assert envelope.metadata["elevated"] == "full"
-        assert session.origin["sandbox_run_context"]["run_mode"] == "standard"
-        assert manager.updates == []
+        assert session.origin["sandbox_run_context"]["run_mode"] == "full"
+        assert session.origin["sandbox_run_context"]["run_mode_source"] == "user"
+        assert session.origin["sandbox_run_context"]["workspace"] == "/workspace"
+        assert manager.updates == [
+            (
+                session.session_key,
+                {"origin": session.origin},
+            )
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2911,6 +3344,148 @@ class TestSessionsSend:
 
 class TestSessionsSteer:
     @pytest.mark.asyncio
+    async def test_steer_v2_is_expected_turn_bound_and_idempotent(
+        self,
+        dispatcher,
+        tmp_path,
+    ) -> None:
+        from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+        from opensquilla.gateway.task_runtime import TaskRuntime
+        from opensquilla.session.manager import SessionManager
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        key = "agent:main:webchat:steer-v2"
+        store = SessionStorage(str(tmp_path / "steer-v2.db"))
+        await store.connect()
+        await store.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="session-steer-v2",
+                agent_id="main",
+                created_at=100,
+                updated_at=100,
+            )
+        )
+        manager = SessionManager(store, inject_time_prefix=False)
+        started = asyncio.Event()
+        blocker = asyncio.Event()
+
+        async def _handler(_run: Any) -> None:
+            started.set()
+            await blocker.wait()
+
+        runtime = TaskRuntime(storage=store, turn_handler=_handler)
+        handle = await runtime.enqueue(
+            RouteEnvelope(
+                source_kind=SourceKind.WEB,
+                source_name="test",
+                agent_id="main",
+                session_key=key,
+                input_provenance={"kind": "test"},
+            ),
+            "first",
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+        params = {
+            "key": key,
+            "message": "change direction",
+            "expected_turn_id": handle.task_id,
+            "client_request_id": "request-steer-v2",
+            "client_message_id": "client-steer-v2",
+            "surface_id": "webui",
+        }
+        try:
+            accepted = await dispatcher.dispatch(
+                "r-steer-v2",
+                "sessions.steer.v2",
+                params,
+                ctx,
+            )
+            replayed = await dispatcher.dispatch(
+                "r-steer-v2-replay",
+                "sessions.steer.v2",
+                params,
+                ctx,
+            )
+            mismatch = await dispatcher.dispatch(
+                "r-steer-v2-mismatch",
+                "sessions.steer.v2",
+                {
+                    **params,
+                    "client_request_id": "request-steer-v2-mismatch",
+                    "client_message_id": "client-steer-v2-mismatch",
+                    "expected_turn_id": "another-turn",
+                },
+                ctx,
+            )
+
+            assert accepted.ok is True
+            assert accepted.payload["accepted"] is True
+            assert accepted.payload["replayed"] is False
+            assert accepted.payload["turn_id"] == handle.task_id
+            assert accepted.payload["disposition"] == "steering"
+            assert accepted.payload["revision"] == 1
+            assert replayed.ok is True
+            assert replayed.payload["accepted"] is True
+            assert replayed.payload["replayed"] is True
+            assert replayed.payload["revision"] == 1
+            assert replayed.payload["user_message_id"] == accepted.payload["user_message_id"]
+            assert mismatch.ok is True
+            assert mismatch.payload["accepted"] is False
+            assert mismatch.payload["failure_code"] == "EXPECTED_TURN_MISMATCH"
+            assert mismatch.payload["fallback_safe"] is True
+
+            transcript = await store.get_transcript("session-steer-v2")
+            assert len(transcript) == 1
+            assert transcript[0].content == "change direction"
+            assert transcript[0].turn_context == {
+                "turn_id": handle.task_id,
+                "target_turn_id": handle.task_id,
+                "client_request_id": "request-steer-v2",
+                "client_message_id": "client-steer-v2",
+                "surface_id": "webui",
+                "intent": "steer",
+                "disposition": "steering",
+                "revision": 1,
+            }
+        finally:
+            await runtime.cancel(task_id=handle.task_id, source="test_cleanup")
+            await runtime.wait(handle.task_id, timeout=2.0)
+            await store.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("message", ["/compact", "!model openai/test"])
+    async def test_steer_v2_routes_control_text_to_visible_fallback(
+        self,
+        dispatcher,
+        session,
+        message: str,
+    ) -> None:
+        manager = FakeSessionManager([session])
+        ctx = make_ctx(session_manager=manager, task_runtime=SimpleNamespace())
+
+        response = await dispatcher.dispatch(
+            "r-steer-v2-control",
+            "sessions.steer.v2",
+            {
+                "key": session.session_key,
+                "message": message,
+                "expected_turn_id": "turn-running",
+                "client_request_id": f"request-{message}",
+                "client_message_id": f"client-{message}",
+            },
+            ctx,
+        )
+
+        assert response.ok is True
+        assert response.payload["accepted"] is False
+        assert response.payload["failure_code"] == "STEER_UNSUPPORTED_INPUT"
+        assert response.payload["fallback_safe"] is True
+        assert manager.created_messages == []
+
+    @pytest.mark.asyncio
     async def test_steer_persists_and_injects_into_active_task(
         self,
         dispatcher,
@@ -2946,9 +3521,7 @@ class TestSessionsSteer:
         assert res.ok is True
         assert res.payload["accepted"] is True
         assert res.payload["turn_id"] == "turn-running"
-        assert manager.created_messages == [
-            (session.session_key, "user", "change direction")
-        ]
+        assert manager.created_messages == [(session.session_key, "user", "change direction")]
         assert calls[0]["persisted_user_message_id"] == "msg-1"
         assert calls[0]["client_message_id"] == "client-steer"
         assert manager.updated_turn_contexts[0][2]["disposition"] == "steering"
@@ -3021,14 +3594,10 @@ class TestSessionsSteer:
         assert res.error.retryable is False
         assert res.error.details["fallback_safe"] is False
         assert res.error.details["orphan_message_id"] == "msg-1"
-        assert manager.created_messages == [
-            (session.session_key, "user", "late but durable")
-        ]
+        assert manager.created_messages == [(session.session_key, "user", "late but durable")]
         assert manager.removed_messages == [(session.session_key, "msg-1")]
         assert manager.updated_turn_contexts[-1][2]["disposition"] == "rejected"
-        assert manager.updated_turn_contexts[-1][2]["client_message_id"] == (
-            "client-dirty-steer"
-        )
+        assert manager.updated_turn_contexts[-1][2]["client_message_id"] == ("client-dirty-steer")
 
 
 class TestSessionsAbort:
@@ -3130,14 +3699,16 @@ class TestSessionsAbort:
         assert runtime.wait_calls == ["task-old"]
 
     @pytest.mark.asyncio
-    async def test_chat_abort_forwards_task_id_to_runtime(self, dispatcher, session):
+    async def test_chat_user_stop_cancels_the_whole_session_even_with_a_stale_task_id(
+        self, dispatcher, session
+    ):
         class Runtime:
             def __init__(self) -> None:
                 self.cancel_calls: list[dict[str, Any]] = []
 
             async def list(self, session_key: str | None = None):
                 assert session_key == session.session_key
-                return [SimpleNamespace(task_id="task-old", status="running")]
+                return [SimpleNamespace(task_id="task-new", status="running")]
 
             async def cancel(
                 self,
@@ -3176,11 +3747,172 @@ class TestSessionsAbort:
         assert res.ok is True
         assert runtime.cancel_calls == [
             {
-                "task_id": "task-old",
-                "session_key": None,
+                "task_id": None,
+                "session_key": session.session_key,
                 "source": "webui_stop",
                 "reason": "user_abort",
             }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_chat_user_stop_cancels_all_descendant_subagent_sessions(
+        self, dispatcher, session, monkeypatch
+    ):
+        child_key = "agent:worker:subagent:child"
+        grandchild_key = "agent:reviewer:subagent:grandchild"
+        unrelated_key = "agent:worker:subagent:unrelated"
+        sessions = [
+            session,
+            FakeSession(
+                session_key=child_key,
+                spawned_by=session.session_key,
+                parent_session_key=session.session_key,
+            ),
+            FakeSession(
+                session_key=grandchild_key,
+                spawned_by=child_key,
+                parent_session_key=child_key,
+            ),
+            FakeSession(session_key=unrelated_key, spawned_by="agent:main:webchat:other"),
+        ]
+
+        class TreeSessionManager(FakeSessionManager):
+            async def list_sessions(
+                self,
+                *,
+                spawned_by: str | None = None,
+                limit: int = 100,
+                offset: int = 0,
+            ) -> list[dict[str, Any]]:
+                rows = list(self._storage._sessions.values())
+                if spawned_by is not None:
+                    rows = [row for row in rows if row.spawned_by == spawned_by]
+                return [row.__dict__ for row in rows[offset : offset + limit]]
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[str] = []
+                self.successful_cancel_calls: list[str] = []
+                self.wait_calls: list[str] = []
+                self.active_tasks = {
+                    session.session_key: "task-parent",
+                    grandchild_key: "task-grandchild",
+                }
+                self.cancelled_tasks: dict[str, str] = {}
+
+            async def list(self, session_key: str | None = None):
+                task_id = self.active_tasks.get(session_key or "")
+                if task_id is None:
+                    return []
+                status = "queued" if session_key == grandchild_key else "running"
+                return [SimpleNamespace(task_id=task_id, status=status)]
+
+            async def cancel(
+                self,
+                session_key: str | None = None,
+                source: str | None = None,
+                reason: str | None = None,
+            ) -> int:
+                assert source == "webui_stop"
+                assert reason == "user_abort"
+                assert session_key is not None
+                self.cancel_calls.append(session_key)
+                task_id = self.active_tasks.get(session_key)
+                if task_id is None:
+                    return 0
+                self.successful_cancel_calls.append(session_key)
+                self.cancelled_tasks[task_id] = session_key
+                return 1
+
+            async def wait(self, task_id: str):
+                self.wait_calls.append(task_id)
+                session_key = self.cancelled_tasks.pop(task_id)
+                self.active_tasks.pop(session_key, None)
+                if task_id == "task-parent":
+                    # Reproduce the spawn race: the child session row existed
+                    # during the first scan, but its runtime task appears only
+                    # while the parent cancellation is draining.
+                    self.active_tasks[child_key] = "task-child"
+                return SimpleNamespace(task_id=task_id, status="cancelled")
+
+        background_cancel_calls: list[str] = []
+        approval_cancel_calls: list[str] = []
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+        async def cancel_background(session_key: str) -> int:
+            background_cancel_calls.append(session_key)
+            return 1
+
+        class ApprovalQueue:
+            def resolve_pending_for_session(self, session_key: str, *, approved: bool) -> int:
+                assert approved is False
+                approval_cancel_calls.append(session_key)
+                return 1
+
+        async def emit(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
+            cancel_background,
+        )
+        monkeypatch.setattr(
+            "opensquilla.gateway.approval_queue.get_approval_queue",
+            lambda: ApprovalQueue(),
+        )
+        monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
+
+        runtime = Runtime()
+        manager = TreeSessionManager(sessions)
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "chat.abort",
+            {"sessionKey": session.session_key, "source": "webui_stop"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["aborted"] is True
+        assert res.payload["cancelled_tasks"] == 3
+        assert res.payload["cancelled_sessions"] == 3
+        assert runtime.cancel_calls == [
+            session.session_key,
+            child_key,
+            grandchild_key,
+            child_key,
+        ]
+        assert runtime.successful_cancel_calls == [session.session_key, grandchild_key, child_key]
+        assert runtime.wait_calls == ["task-parent", "task-grandchild", "task-child"]
+        assert background_cancel_calls == [session.session_key, child_key, grandchild_key]
+        assert approval_cancel_calls == [
+            session.session_key,
+            child_key,
+            grandchild_key,
+            child_key,
+        ]
+        assert unrelated_key not in runtime.cancel_calls
+        assert emitted == [
+            (
+                session.session_key,
+                "sessions.changed",
+                {
+                    "schema_version": 1,
+                    "key": session.session_key,
+                    "reason": "task_terminal",
+                    "run_status": "cancelled",
+                    "last_task": {
+                        "status": "cancelled",
+                        "terminal_reason": "user_abort",
+                    },
+                },
+            )
         ]
 
     @pytest.mark.asyncio
@@ -3230,6 +3962,192 @@ class TestSessionsAbort:
             }
         ]
         assert runtime.wait_calls == ["task-live"]
+
+    @pytest.mark.asyncio
+    async def test_abort_runtime_drain_waits_concurrently_under_one_deadline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        class Runtime:
+            def __init__(self) -> None:
+                self.entered: set[str] = set()
+                self.cancelled: set[str] = set()
+                self.active_waits = 0
+                self.peak_active_waits = 0
+                self.never_release = asyncio.Event()
+
+            async def wait(self, task_id: str):
+                self.entered.add(task_id)
+                self.active_waits += 1
+                self.peak_active_waits = max(self.peak_active_waits, self.active_waits)
+                try:
+                    await self.never_release.wait()
+                finally:
+                    self.active_waits -= 1
+                    self.cancelled.add(task_id)
+
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.25)
+        runtime = Runtime()
+        started_at = rpc_sessions.time.monotonic()
+        deadline = started_at + 0.05
+
+        await asyncio.wait_for(
+            rpc_sessions._drain_cancelled_task_runtime(
+                runtime,
+                session_key="agent:main:shared-drain",
+                task_ids=("task-one", "task-two"),
+                deadline_at_monotonic=deadline,
+            ),
+            timeout=0.5,
+        )
+        elapsed = rpc_sessions.time.monotonic() - started_at
+
+        assert runtime.entered == {"task-one", "task-two"}
+        assert runtime.peak_active_waits == 2
+        assert runtime.cancelled == {"task-one", "task-two"}
+        assert runtime.active_waits == 0
+        assert elapsed < 0.15
+
+    @pytest.mark.asyncio
+    async def test_abort_runtime_drain_does_not_join_stubborn_cancelled_waiter(
+        self,
+    ):
+        release = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        finished = asyncio.Event()
+
+        class Runtime:
+            async def wait(self, _task_id: str):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+                    await release.wait()
+                finally:
+                    finished.set()
+
+        started_at = rpc_sessions.time.monotonic()
+        await asyncio.wait_for(
+            rpc_sessions._drain_cancelled_task_runtime(
+                Runtime(),
+                session_key="agent:main:stubborn-drain",
+                task_ids=("task-stubborn",),
+                deadline_at_monotonic=started_at + 0.02,
+            ),
+            timeout=0.15,
+        )
+        elapsed = rpc_sessions.time.monotonic() - started_at
+
+        assert cancellation_seen.is_set()
+        assert finished.is_set() is False
+        assert elapsed < 0.1
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=0.2)
+
+    @pytest.mark.asyncio
+    async def test_abort_slow_session_lookup_does_not_delay_compaction_cancel(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session_key = "agent:main:abort-slow-lookup"
+        owner_release = asyncio.Event()
+        lookup_cancelled = asyncio.Event()
+
+        async def compaction_owner() -> None:
+            await owner_release.wait()
+
+        class SlowStorage:
+            async def get_session(self, key: str):
+                assert key == session_key
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    lookup_cancelled.set()
+
+        class Manager:
+            storage = SlowStorage()
+
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
+        monkeypatch.setattr(rpc_sessions, "_ABORT_SESSION_LOOKUP_SECONDS", 0.01)
+        owner = asyncio.create_task(compaction_owner())
+        rpc_sessions.register_active_compaction(
+            session_key,
+            "cmp-slow-lookup",
+            owner,
+        )
+        started_at = rpc_sessions.time.monotonic()
+        try:
+            res = await dispatcher.dispatch(
+                "r1",
+                "sessions.abort",
+                {"key": session_key},
+                make_ctx(session_manager=Manager()),
+            )
+            elapsed = rpc_sessions.time.monotonic() - started_at
+            await asyncio.gather(owner, return_exceptions=True)
+            await asyncio.wait_for(lookup_cancelled.wait(), timeout=0.2)
+        finally:
+            if not owner.done():
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+
+        assert res.ok is True
+        assert res.payload["aborted"] is True
+        assert res.payload["cancelled_compactions"] == 1
+        assert owner.cancelled() is True
+        assert elapsed < 0.15
+
+    @pytest.mark.asyncio
+    async def test_abort_slow_runtime_cancel_cannot_extend_shared_stop_budget(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        cancel_entered = asyncio.Event()
+        cancel_cancelled = asyncio.Event()
+
+        class Runtime:
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return [SimpleNamespace(task_id="task-stuck", status="running")]
+
+            async def cancel(self, **_kwargs: Any) -> int:
+                cancel_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancel_cancelled.set()
+                return 1
+
+        async def cancel_background(_session_key: str) -> int:
+            return 0
+
+        async def emit(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
+            cancel_background,
+        )
+        monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
+        started_at = rpc_sessions.time.monotonic()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.abort",
+            {"key": session.session_key},
+            make_ctx(session_manager=FakeSessionManager([session]), task_runtime=Runtime()),
+        )
+        elapsed = rpc_sessions.time.monotonic() - started_at
+        await asyncio.wait_for(cancel_entered.wait(), timeout=0.2)
+        await asyncio.wait_for(cancel_cancelled.wait(), timeout=0.2)
+
+        assert res.ok is True
+        assert elapsed < 0.15
 
     @pytest.mark.asyncio
     async def test_abort_no_manager(self, dispatcher, ctx_no_manager):
@@ -3284,6 +4202,250 @@ class TestSessionsPatch:
         assert "model" in patched.payload["updated"]
         assert resolved.ok is True
         assert resolved.payload["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_patch_rebinds_complete_named_profile_and_clears_stale_actual_pair(
+        self,
+        dispatcher,
+    ):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session = FakeSession(
+            provider_override="anthropic",
+            model="claude-pin",
+            model_provider="anthropic",
+            model_override="claude-actual",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": "openai",
+                "model": "gpt-pin",
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=manager, config=cfg),
+        )
+
+        assert res.ok is True
+        assert res.payload["updated"] == ["model", "provider", "authProfile"]
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-pin"
+        assert session.auth_profile_override == "openai:work"
+        assert session.auth_profile_override_source == "rpc"
+        assert session.model_provider is None
+        assert session.model_override is None
+        assert "synthetic-named-secret" not in repr(res.payload)
+        assert "openai:work" not in repr(res.payload)
+
+    @pytest.mark.asyncio
+    async def test_patch_provider_change_requires_model_in_same_request(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(
+            provider_override="anthropic",
+            model="claude-old",
+            model_provider="anthropic",
+            model_override="claude-actual",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": "openai",
+            },
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "session_deployment_requires_explicit_model"
+        }
+        assert session.provider_override == "anthropic"
+        assert session.model == "claude-old"
+        assert session.model_provider == "anthropic"
+        assert session.model_override == "claude-actual"
+
+    @pytest.mark.asyncio
+    async def test_patch_auth_profile_change_requires_model_in_same_request(
+        self,
+        dispatcher,
+    ):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session = FakeSession(
+            provider_override="openai",
+            model="gpt-old",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=manager, config=cfg),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "session_deployment_requires_explicit_model"
+        }
+        assert session.auth_profile_override is None
+
+    @pytest.mark.asyncio
+    async def test_patch_can_atomically_clear_complete_deployment(self, dispatcher):
+        session = FakeSession(
+            provider_override="openai",
+            model="gpt-old",
+            model_provider="openai",
+            model_override="gpt-actual",
+            auth_profile_override="openai:work",
+            auth_profile_override_source="rpc",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": None,
+                "model": None,
+                "authProfile": None,
+            },
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert session.provider_override is None
+        assert session.model is None
+        assert session.auth_profile_override is None
+        assert session.auth_profile_override_source is None
+        assert session.model_provider is None
+        assert session.model_override is None
+
+    @pytest.mark.asyncio
+    async def test_model_only_patch_clears_stale_physical_provenance(self, dispatcher):
+        session = FakeSession(
+            model="gpt-old",
+            model_provider="openai",
+            model_override="gpt-actual",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "model": "gpt-new",
+            },
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert session.model == "gpt-new"
+        assert session.model_provider is None
+        assert session.model_override is None
+
+    @pytest.mark.asyncio
+    async def test_deployment_patch_waits_for_turn_lock_before_read_and_update(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(
+            provider_override="anthropic",
+            model="claude-old",
+        )
+        manager = FakeSessionManager([session])
+        turn_runner = _RecordingTurnRunner()
+        lock = turn_runner._get_session_lock(session.session_key)
+        await lock.acquire()
+
+        patch_task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.patch",
+                {
+                    "key": session.session_key,
+                    "provider": "openai",
+                    "model": "gpt-new",
+                },
+                make_ctx(session_manager=manager, turn_runner=turn_runner),
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert patch_task.done() is False
+        # Simulate the active turn finalizer persisting its old physical pair
+        # while it still owns the same per-session turn lock.
+        session.model_provider = "anthropic"
+        session.model_override = "claude-actual"
+        lock.release()
+
+        res = await patch_task
+
+        assert res.ok is True
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-new"
+        assert session.model_provider is None
+        assert session.model_override is None
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_profile_mismatch_without_partial_mutation(
+        self,
+        dispatcher,
+    ):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session = FakeSession(
+            provider_override="openai",
+            model="gpt-old",
+            auth_profile_override="openai:work",
+            auth_profile_override_source="rpc",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": "anthropic",
+                "model": "claude-new",
+            },
+            make_ctx(session_manager=manager, config=cfg),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "named_auth_profile_provider_mismatch"
+        }
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-old"
+        assert session.auth_profile_override == "openai:work"
 
     @pytest.mark.asyncio
     async def test_patch_not_found(self, dispatcher, ctx_with_sessions):
@@ -3362,6 +4524,7 @@ class TestSessionsReset:
     async def test_reset_allows_checkpoint_receipt_when_flush_receipt_is_degraded(
         self, dispatcher, session
     ):
+        previous_session_id = session.session_id
         manager = FakeSessionManager([session])
         manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
         manager._storage.memory_durable_receipts.append(
@@ -3401,6 +4564,12 @@ class TestSessionsReset:
         assert res.ok is True
         assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
         assert manager.applied_intents == [(session.session_key, "reset_same_key")]
+        flush_kwargs = flush_service.execute.await_args.kwargs
+        correlation = flush_kwargs["provider_request_correlation"]
+        assert correlation.session_id == previous_session_id
+        assert correlation.turn_id == flush_kwargs["turn_id"]
+        assert correlation.execution_id != correlation.turn_id
+        assert correlation.call_kind == "auxiliary.session_flush"
 
     @pytest.mark.asyncio
     async def test_reset_refuses_stale_checkpoint_receipt_for_later_transcript(
@@ -3537,6 +4706,24 @@ class TestSessionsReset:
 
 
 class TestSessionsDelete:
+    @pytest.fixture(autouse=True)
+    def _isolated_approval_queue(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ):
+        from opensquilla.application.approval_queue import ApprovalQueue
+
+        queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
+        monkeypatch.setattr(
+            "opensquilla.gateway.approval_queue.get_approval_queue",
+            lambda: queue,
+        )
+        try:
+            yield queue
+        finally:
+            queue.close()
+
     @pytest.mark.asyncio
     async def test_delete_valid(self, dispatcher, ctx_with_sessions, session):
         res = await dispatcher.dispatch(
@@ -3545,14 +4732,25 @@ class TestSessionsDelete:
         assert res.ok is True
 
     @pytest.mark.asyncio
-    async def test_delete_not_found(self, dispatcher, ctx_with_sessions):
+    async def test_delete_not_found(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        _isolated_approval_queue,
+    ):
+        missing_key = "agent:main:webchat:nonexistent"
+        approval_id = _isolated_approval_queue.request(
+            "exec",
+            {"sessionKey": missing_key, "toolName": "orphaned-shell"},
+        )
         res = await dispatcher.dispatch(
-            "r1", "sessions.delete", {"key": "nonexistent"}, ctx_with_sessions
+            "r1", "sessions.delete", {"key": missing_key}, ctx_with_sessions
         )
         # Bulk-delete returns ok=True but populates errors list for missing keys
         assert res.ok is True
         assert res.payload["deleted"] == []
         assert len(res.payload["errors"]) == 1
+        assert _isolated_approval_queue.get(approval_id).resolution == "expired"
 
     @pytest.mark.asyncio
     async def test_delete_waits_for_session_lock(self, dispatcher, session):
@@ -3609,6 +4807,322 @@ class TestSessionsDelete:
         assert res.ok is True
         assert res.payload["deleted"] == ["webchat:default"]
         assert await manager._storage.get_session(session.session_key) is None
+
+    @pytest.mark.asyncio
+    async def test_delete_legacy_alias_expires_canonical_session_approval(
+        self,
+        dispatcher,
+        _isolated_approval_queue,
+    ):
+        session = FakeSession(session_key="agent:main:webchat:default")
+        manager = FakeSessionManager([session])
+        approval_id = _isolated_approval_queue.request(
+            "exec",
+            {"sessionKey": session.session_key, "toolName": "synthetic-shell"},
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": "webchat:default"},
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert res.payload == {"deleted": ["webchat:default"], "errors": []}
+        assert _isolated_approval_queue.get(approval_id).resolution == "expired"
+
+    @pytest.mark.asyncio
+    async def test_delete_expires_owned_approvals_and_evicts_runtime_state(
+        self,
+        dispatcher,
+        session,
+        _isolated_approval_queue,
+    ):
+        queue = _isolated_approval_queue
+        events: list[tuple[str, dict[str, Any]]] = []
+        queue.add_event_listener(lambda event, info: events.append((event, info)))
+        matching_ids = [
+            queue.request(
+                "exec",
+                {"sessionKey": session.session_key, "toolName": "synthetic-shell"},
+            ),
+            queue.request(
+                "plugin",
+                {"session_key": session.session_key, "pluginId": "synthetic-plugin"},
+            ),
+        ]
+        queue.claim_resolution(matching_ids[-1])
+        unrelated_id = queue.request(
+            "exec",
+            {"sessionKey": "agent:main:webchat:unrelated", "toolName": "other-shell"},
+        )
+        unscoped_id = queue.request("plugin", {"pluginId": "unscoped-plugin"})
+
+        manager = FakeSessionManager([session])
+        evicted: list[tuple[str, str | None]] = []
+
+        def evict_runtime_state(
+            session_key: str,
+            *,
+            session_id: str | None = None,
+        ) -> None:
+            evicted.append((session_key, session_id))
+
+        manager.evict_session_runtime_state = evict_runtime_state  # type: ignore[attr-defined]
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": session.session_key},
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert res.payload == {"deleted": [session.session_key], "errors": []}
+        assert await manager._storage.get_session(session.session_key) is None
+        assert evicted == [(session.session_key, session.session_id)]
+        for approval_id in matching_ids:
+            entry = queue.get(approval_id)
+            assert entry.resolved is True
+            assert entry.approved is False
+            assert entry.resolution == "expired"
+        assert queue.get(unrelated_id).resolved is False
+        assert queue.get(unscoped_id).resolved is False
+        assert {
+            info["id"]
+            for event, info in events
+            if event == "resolved"
+        } == set(matching_ids)
+
+    @pytest.mark.asyncio
+    async def test_delete_holds_lifecycle_fences_through_cleanup(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        session,
+        _isolated_approval_queue,
+    ):
+        order: list[str] = []
+        active_fences: set[str] = set()
+
+        @asynccontextmanager
+        async def fence(name: str, keys: list[str]):
+            assert keys == [session.session_key]
+            order.append(f"{name}:enter")
+            active_fences.add(name)
+            try:
+                yield
+            finally:
+                active_fences.remove(name)
+                order.append(f"{name}:exit")
+
+        class WriteLock:
+            async def __aenter__(self):
+                order.append("write:enter")
+                active_fences.add("write")
+
+            async def __aexit__(self, *_args):
+                active_fences.remove("write")
+                order.append("write:exit")
+
+        manager = FakeSessionManager([session])
+        original_delete = manager._storage.delete_session
+
+        async def observed_delete(key: str) -> None:
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("delete")
+            await original_delete(key)
+
+        manager._storage.delete_session = observed_delete  # type: ignore[method-assign]
+
+        def evict_runtime_state(
+            session_key: str,
+            *,
+            session_id: str | None = None,
+        ) -> None:
+            assert session_key == session.session_key
+            assert session_id == session.session_id
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("evict")
+
+        manager.evict_session_runtime_state = evict_runtime_state  # type: ignore[attr-defined]
+
+        async def drain_router(keys: list[str]) -> None:
+            assert keys == [session.session_key]
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("router-drain")
+
+        async def drain_turn(keys: list[str]) -> None:
+            assert keys == [session.session_key]
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("turn-drain")
+
+        original_expire = _isolated_approval_queue.expire_pending_for_session
+
+        def observed_expire(key: str) -> int:
+            assert key == session.session_key
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("expire")
+            return original_expire(key)
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "quiesce_background_completion_sessions",
+            lambda keys: fence("background", keys),
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "get_agent_task_registry",
+            lambda: SimpleNamespace(
+                quiesce_sessions=lambda keys: fence("direct", keys),
+            ),
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "drain_pending_flushes_for_sessions",
+            drain_router,
+        )
+        monkeypatch.setattr(
+            _isolated_approval_queue,
+            "expire_pending_for_session",
+            observed_expire,
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=SimpleNamespace(
+                quiesce_sessions=lambda keys: fence("runtime", keys),
+            ),
+            turn_runner=SimpleNamespace(
+                get_session_lock=lambda _key: WriteLock(),
+                drain_session_background_writes=drain_turn,
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert order == [
+            "background:enter",
+            "runtime:enter",
+            "direct:enter",
+            "write:enter",
+            "router-drain",
+            "turn-drain",
+            "expire",
+            "delete",
+            "evict",
+            "write:exit",
+            "direct:exit",
+            "runtime:exit",
+            "background:exit",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_finishes_after_rpc_cancellation(
+        self,
+        dispatcher,
+        session,
+        _isolated_approval_queue,
+    ):
+        manager = FakeSessionManager([session])
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        original_delete = manager._storage.delete_session
+        evicted: list[tuple[str, str | None]] = []
+
+        async def paused_delete(key: str) -> None:
+            delete_started.set()
+            await release_delete.wait()
+            await original_delete(key)
+
+        manager._storage.delete_session = paused_delete  # type: ignore[method-assign]
+        manager.evict_session_runtime_state = (  # type: ignore[attr-defined]
+            lambda key, *, session_id=None: evicted.append((key, session_id))
+        )
+        approval_id = _isolated_approval_queue.request(
+            "plugin",
+            {"session_key": session.session_key, "pluginId": "synthetic-plugin"},
+        )
+
+        deleting = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.delete",
+                {"key": session.session_key},
+                make_ctx(session_manager=manager),
+            )
+        )
+        await asyncio.wait_for(delete_started.wait(), timeout=1)
+        deleting.cancel()
+        await asyncio.sleep(0)
+        assert deleting.done() is False
+
+        release_delete.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deleting
+
+        assert await manager._storage.get_session(session.session_key) is None
+        assert _isolated_approval_queue.get(approval_id).resolution == "expired"
+        assert evicted == [(session.session_key, session.session_id)]
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_isolates_failures_and_repeated_cleanup_is_idempotent(
+        self,
+        dispatcher,
+        session,
+        _isolated_approval_queue,
+    ):
+        missing_key = "agent:main:webchat:missing-bulk"
+        manager = FakeSessionManager([session])
+        matching_ids = [
+            _isolated_approval_queue.request(
+                "exec",
+                {"sessionKey": session.session_key, "toolName": "existing-shell"},
+            ),
+            _isolated_approval_queue.request(
+                "plugin",
+                {"session_key": missing_key, "pluginId": "orphaned-plugin"},
+            ),
+        ]
+        resolved_events: list[str] = []
+        _isolated_approval_queue.add_event_listener(
+            lambda event, info: (
+                resolved_events.append(str(info["id"]))
+                if event == "resolved"
+                else None
+            )
+        )
+        ctx = make_ctx(session_manager=manager)
+
+        first = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"keys": [session.session_key, missing_key]},
+            ctx,
+        )
+        second = await dispatcher.dispatch(
+            "r2",
+            "sessions.delete",
+            {"keys": [session.session_key, missing_key]},
+            ctx,
+        )
+
+        assert first.ok is True
+        assert first.payload["deleted"] == [session.session_key]
+        assert len(first.payload["errors"]) == 1
+        assert second.ok is True
+        assert second.payload["deleted"] == []
+        assert len(second.payload["errors"]) == 2
+        assert {
+            _isolated_approval_queue.get(approval_id).resolution
+            for approval_id in matching_ids
+        } == {"expired"}
+        assert resolved_events == matching_ids
 
 
 class TestSessionsCompact:
@@ -3697,6 +5211,7 @@ class TestSessionsTruncate:
     async def test_truncate_allows_checkpoint_receipt_when_flush_receipt_is_degraded(
         self, dispatcher, session
     ):
+        previous_session_id = session.session_id
         manager = FakeSessionManager([session])
         manager.transcript = [
             SimpleNamespace(id=1, content="message to remove"),
@@ -3748,6 +5263,12 @@ class TestSessionsTruncate:
         assert res.ok is True
         assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
         assert manager.truncate_calls == [(session.session_key, 1)]
+        flush_kwargs = flush_service.execute.await_args.kwargs
+        correlation = flush_kwargs["provider_request_correlation"]
+        assert correlation.session_id == previous_session_id
+        assert correlation.turn_id == flush_kwargs["turn_id"]
+        assert correlation.execution_id != correlation.turn_id
+        assert correlation.call_kind == "auxiliary.session_flush"
 
     @pytest.mark.asyncio
     async def test_truncate_refuses_stale_checkpoint_for_later_removed_messages(
@@ -3946,6 +5467,66 @@ class TestSessionsContextCompact:
         assert res.payload["remaining_budget_tokens"] == 834
         assert res.payload["removed_count"] == 1
         assert res.payload["kept_count"] == 0
+        correlation = ctx_with_sessions.session_manager.compact_kwargs[0][
+            "provider_request_correlation"
+        ]
+        assert correlation.session_id == session.session_id
+        assert correlation.turn_id.startswith("cmp_")
+        assert correlation.execution_id
+        assert correlation.call_kind == "auxiliary.compaction"
+
+    @pytest.mark.asyncio
+    async def test_context_compact_client_window_cannot_expand_stable_consumer(
+        self,
+        dispatcher,
+        session,
+    ):
+        manager = FakeSessionManager([session])
+        config = GatewayConfig(
+            llm={
+                "provider": "openai",
+                "model": "gpt-stable",
+                "api_key": "dummy-key",
+                "base_url": "https://api.openai.com/v1",
+                "context_window_tokens": 4096,
+                "max_tokens": 512,
+            },
+            context_budget_tokens=100_000,
+            memory={"flush_enabled": False},
+        )
+        current = ProviderConfig(
+            provider="openai",
+            model="gpt-stable",
+            api_key="dummy-key",
+            base_url="https://api.openai.com/v1",
+        )
+        selector = SimpleNamespace(
+            current_config=current,
+            remaining_chain=lambda: [current],
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            provider_selector=selector,
+            config=config,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 999_999,
+            },
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["context_window_tokens"] == 4096
+        assert manager.compact_calls[0][:2] == (session.session_key, 4096)
+        compact_kwargs = manager.compact_kwargs[0]
+        assert compact_kwargs["context_window_chars"] > 0
+        assert callable(compact_kwargs["consumer_admission"])
+        assert len(compact_kwargs["consumer_admission_fingerprint"]) == 64
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_started_and_completed_events(
@@ -4080,6 +5661,339 @@ class TestSessionsContextCompact:
         assert manager.compact_calls == []
 
     @pytest.mark.asyncio
+    async def test_context_compact_background_is_cancelled_by_session_abort(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = SlowCompactionSessionManager([session])
+        ctx = make_ctx(session_manager=manager)
+        emitted = _capture_compaction_emits(monkeypatch)
+
+        compact_response = await dispatcher.dispatch(
+            "r-compact",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 1234,
+                "wait": False,
+            },
+            ctx,
+        )
+
+        assert compact_response.ok is True
+        assert compact_response.payload["status"] == "started"
+        compaction_id = compact_response.payload["compaction_id"]
+        await asyncio.wait_for(manager.started.wait(), timeout=1.0)
+
+        loop = asyncio.get_running_loop()
+        abort_started = loop.time()
+        abort_response = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r-abort",
+                "sessions.abort",
+                {"key": session.session_key, "source": "webui_stop"},
+                ctx,
+            ),
+            timeout=2.1,
+        )
+        abort_elapsed = loop.time() - abort_started
+
+        assert abort_response.ok is True
+        assert abort_response.payload["aborted"] is True
+        assert abort_response.payload["cancelled_compactions"] == 1
+        assert abort_elapsed < 2.1
+        compaction_events = [
+            payload
+            for key, event_name, payload in emitted
+            if key == session.session_key and event_name == "session.event.compaction"
+        ]
+        assert [payload["status"] for payload in compaction_events] == [
+            "started",
+            "cancelled",
+        ]
+        assert {payload["compaction_id"] for payload in compaction_events} == {
+            compaction_id
+        }
+        assert all(payload["status"] != "completed" for payload in compaction_events)
+        assert manager.compact_calls == []
+
+    @pytest.mark.asyncio
+    async def test_context_compact_stop_during_started_broadcast_emits_one_terminal(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = SlowCompactionSessionManager([session])
+        ctx = make_ctx(session_manager=manager)
+        started_broadcast_entered = asyncio.Event()
+        release_started_broadcast = asyncio.Event()
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+        stream_cursor = get_session_streams().current_seq(session.session_key)
+
+        async def _block_started_broadcast(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+            if payload["status"] == "started":
+                started_broadcast_entered.set()
+                await release_started_broadcast.wait()
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_send_prepared_to_subscribers",
+            _block_started_broadcast,
+        )
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.1)
+        compact_task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r-compact-started-broadcast",
+                "sessions.contextCompact",
+                {
+                    "key": session.session_key,
+                    "contextWindowTokens": 1234,
+                    "wait": False,
+                },
+                ctx,
+            )
+        )
+        try:
+            await asyncio.wait_for(started_broadcast_entered.wait(), timeout=1.0)
+            compaction_id = emitted[0][2]["compaction_id"]
+
+            abort_response = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "r-abort-started-broadcast",
+                    "sessions.abort",
+                    {"key": session.session_key, "source": "webui_stop"},
+                    ctx,
+                ),
+                timeout=0.5,
+            )
+            release_started_broadcast.set()
+            compact_response = await asyncio.wait_for(compact_task, timeout=0.5)
+
+            assert abort_response.ok is True
+            assert abort_response.payload["aborted"] is True
+            assert abort_response.payload["cancelled_compactions"] == 1
+            assert compact_response.ok is True
+            assert compact_response.payload["status"] == "started"
+
+            operation_events = [
+                payload
+                for key, event_name, payload in emitted
+                if key == session.session_key
+                and event_name == "session.event.compaction"
+                and payload["compaction_id"] == compaction_id
+            ]
+            terminal_events = [
+                payload
+                for payload in operation_events
+                if payload["status"]
+                in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+            ]
+            assert [payload["status"] for payload in operation_events] == [
+                "started",
+                "cancelled",
+            ]
+            assert [payload["status"] for payload in terminal_events] == ["cancelled"]
+            assert manager.started.is_set() is False
+            assert manager.compact_calls == []
+
+            replay = get_session_streams().replay(session.session_key, stream_cursor)
+            replayed_terminals = [
+                event.payload
+                for event in replay.events
+                if event.event_name == "session.event.compaction"
+                and event.payload.get("compaction_id") == compaction_id
+                and event.payload.get("status")
+                in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+            ]
+            assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+        finally:
+            release_started_broadcast.set()
+            manager.release.set()
+            if not compact_task.done():
+                compact_task.cancel()
+            await asyncio.gather(compact_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_context_compact_cancelled_during_observed_emit_reconciles_durable_commit(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        class DurableResultManager(FakeSessionManager):
+            def __init__(self, sessions: list[FakeSession]) -> None:
+                super().__init__(sessions)
+                self.durable_result_returned = asyncio.Event()
+
+            async def compact_with_result(
+                self,
+                session_key: str,
+                context_window_tokens: int,
+                config=None,
+                custom_instructions: str | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                result = await super().compact_with_result(
+                    session_key,
+                    context_window_tokens,
+                    config,
+                    custom_instructions=custom_instructions,
+                    **kwargs,
+                )
+                self.durable_result_returned.set()
+                return result
+
+        manager = DurableResultManager([session])
+        ctx = make_ctx(session_manager=manager)
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+        observed_emit_started = asyncio.Event()
+        hold_observed_emit = asyncio.Event()
+        stream_cursor = get_session_streams().current_seq(session.session_key)
+
+        async def _block_first_observed_emit(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+            if payload["status"] == "observed" and not observed_emit_started.is_set():
+                observed_emit_started.set()
+                await hold_observed_emit.wait()
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_send_prepared_to_subscribers",
+            _block_first_observed_emit,
+        )
+
+        task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r-compact-post-commit-cancel",
+                "sessions.contextCompact",
+                {"key": session.session_key, "contextWindowTokens": 1234},
+                ctx,
+            )
+        )
+        await asyncio.wait_for(observed_emit_started.wait(), timeout=1.0)
+        assert manager.durable_result_returned.is_set()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        compaction_id = emitted[0][2]["compaction_id"]
+        terminal_events = [
+            payload
+            for key, event_name, payload in emitted
+            if key == session.session_key
+            and event_name == "session.event.compaction"
+            and payload["compaction_id"] == compaction_id
+            and payload["status"]
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+        ]
+        assert len(terminal_events) == 1
+        assert terminal_events[0]["status"] == "completed"
+        assert terminal_events[0]["reason"] == "cancelled_after_commit"
+        assert terminal_events[0]["cancellation_reconciled"] is True
+
+        replay = get_session_streams().replay(session.session_key, stream_cursor)
+        replayed_terminals = [
+            event.payload
+            for event in replay.events
+            if event.event_name == "session.event.compaction"
+            and event.payload.get("compaction_id") == compaction_id
+            and event.payload.get("status")
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+        ]
+        assert [payload["status"] for payload in replayed_terminals] == ["completed"]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_cancelled_during_terminal_epoch_resolve_retries_terminal(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session = FakeSession(
+            session_key="agent:main:terminal-epoch-cancel",
+            session_id="terminal-epoch-cancel",
+        )
+        manager = FakeSessionManager([session])
+        manager.compact_summary = ""
+        ctx = make_ctx(session_manager=manager)
+        terminal_epoch_resolve_started = asyncio.Event()
+        hold_terminal_epoch_resolve = asyncio.Event()
+        epoch_calls = 0
+
+        async def _resolve_epoch(session_key: str) -> int:
+            nonlocal epoch_calls
+            assert session_key == session.session_key
+            epoch_calls += 1
+            if epoch_calls == 2:
+                terminal_epoch_resolve_started.set()
+                await hold_terminal_epoch_resolve.wait()
+            return session.epoch
+
+        monkeypatch.setattr(manager._storage, "get_epoch", _resolve_epoch, raising=False)
+        stream_cursor = get_session_streams().current_seq(session.session_key)
+
+        compact_response = await dispatcher.dispatch(
+            "r-compact-terminal-epoch",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 1234,
+                "wait": False,
+            },
+            ctx,
+        )
+        compaction_id = compact_response.payload["compaction_id"]
+        await asyncio.wait_for(terminal_epoch_resolve_started.wait(), timeout=1.0)
+
+        assert rpc_sessions.compaction_terminal_status(compaction_id) is None
+        replay_before_cancel = get_session_streams().replay(session.session_key, stream_cursor)
+        assert not any(
+            event.payload.get("compaction_id") == compaction_id
+            and event.payload.get("status")
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+            for event in replay_before_cancel.events
+        )
+
+        abort_response = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r-abort-terminal-epoch",
+                "sessions.abort",
+                {"key": session.session_key, "source": "webui_stop"},
+                ctx,
+            ),
+            timeout=2.1,
+        )
+
+        assert abort_response.ok is True
+        assert abort_response.payload["cancelled_compactions"] == 1
+        assert epoch_calls >= 3
+        replay = get_session_streams().replay(session.session_key, stream_cursor)
+        replayed_terminals = [
+            event.payload
+            for event in replay.events
+            if event.event_name == "session.event.compaction"
+            and event.payload.get("compaction_id") == compaction_id
+            and event.payload.get("status")
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+        ]
+        assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+        assert rpc_sessions.compaction_terminal_status(compaction_id) == "cancelled"
+
+    @pytest.mark.asyncio
     async def test_context_compact_emits_skipped_when_nothing_removed(
         self,
         dispatcher,
@@ -4114,6 +6028,105 @@ class TestSessionsContextCompact:
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
             "skipped",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stale_reason",
+        [
+            "stale_preimage",
+            "stale_context_state",
+            "consumer_admission_stale_or_failed",
+        ],
+    )
+    async def test_context_compact_maps_stale_noop_to_one_stale_terminal(
+        self,
+        dispatcher,
+        session,
+        stale_reason: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+
+        async def _stale(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                summary="",
+                removed_count=0,
+                kept_entries=[],
+                summary_source="skipped",
+                tokens_before=1200,
+                tokens_after=1200,
+                remaining_budget_tokens=0,
+                chunks_processed=0,
+                coverage_status="unknown",
+                skip_reason=stale_reason,
+            )
+
+        manager.compact_with_result = _stale  # type: ignore[method-assign]
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["status"] == "stale"
+        assert res.payload["reason"] == stale_reason
+        assert [payload["status"] for _, payload in events] == [
+            "started",
+            "stale",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_timeout_emits_exactly_one_terminal(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+        blocked = asyncio.Event()
+
+        async def _blocked(*_args: Any, **_kwargs: Any) -> Any:
+            await blocked.wait()
+
+        manager.compact_with_result = _blocked  # type: ignore[method-assign]
+        config = GatewayConfig(
+            memory={"flush_enabled": False},
+            compaction={
+                "total_timeout_seconds": 0.02,
+                "heartbeat_interval_seconds": 1.0,
+            },
+        )
+        ctx = make_ctx(session_manager=manager, config=config)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "COMPACTION_TIMEOUT"
+        assert [payload["status"] for _, payload in events] == [
+            "started",
+            "timed_out",
         ]
 
     @pytest.mark.asyncio
@@ -4233,6 +6246,19 @@ class TestSessionsContextCompact:
         assert manager.compact_calls[0][:2] == (session.session_key, 100000)
         assert manager.compact_kwargs[0]["flush_receipt_status"] == "degraded_forensic"
         assert res.payload["flush_receipt_status"] == "degraded_forensic"
+        flush_correlation = flush_service.execute.await_args.kwargs[
+            "provider_request_correlation"
+        ]
+        compact_correlation = manager.compact_kwargs[0][
+            "provider_request_correlation"
+        ]
+        assert isinstance(flush_correlation, ProviderRequestCorrelation)
+        assert isinstance(compact_correlation, ProviderRequestCorrelation)
+        assert flush_correlation.session_id == compact_correlation.session_id
+        assert flush_correlation.turn_id == compact_correlation.turn_id
+        assert flush_correlation.execution_id != compact_correlation.execution_id
+        assert flush_correlation.call_kind == "auxiliary.session_flush"
+        assert compact_correlation.call_kind == "auxiliary.compaction"
 
     @pytest.mark.asyncio
     async def test_context_compact_block_mode_allows_checkpoint_receipt(self, dispatcher, session):
@@ -4567,7 +6593,87 @@ class TestSessionsSubscribe:
 
 class TestSessionsMessagesSubscribe:
     @pytest.mark.asyncio
+    async def test_messages_hydrate_uses_bounded_interactive_storage_scope(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        observed_bounded_scope = False
+
+        async def _observe_scope(_ctx, key: str, **_kwargs):
+            nonlocal observed_bounded_scope
+            observed_bounded_scope = session_storage._BOUNDED_INTERACTIVE_READS.get()
+            return {
+                "key": key,
+                "hydration_complete": True,
+                "deferred_fields": [],
+            }
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_hydrate_sessions_messages_metadata",
+            _observe_scope,
+        )
+
+        response = await dispatcher.dispatch(
+            "hydrate-bounded",
+            "sessions.messages.hydrate",
+            {"key": "agent:main:webchat:hydrate-bounded"},
+            ctx_with_sessions,
+        )
+
+        assert response.ok is True
+        assert observed_bounded_scope is True
+
+    @pytest.mark.asyncio
+    async def test_messages_snapshot_returns_compact_live_turn_and_cursor(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+    ):
+        key = "agent:main:live-snapshot-rpc"
+        stream_registry = get_session_streams()
+        stream_registry.record(
+            key,
+            "session.event.thinking",
+            {"task_id": "task-live-snapshot", "text": "Inspect"},
+        )
+        stream_registry.record(
+            key,
+            "session.event.thinking",
+            {"task_id": "task-live-snapshot", "text": "ing"},
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.snapshot",
+            {"key": key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload == {
+            "key": key,
+            "task_id": "task-live-snapshot",
+            "current_stream_seq": 2,
+            "events": [
+                {
+                    "event": "session.event.thinking",
+                    "payload": {
+                        "task_id": "task-live-snapshot",
+                        "text": "Inspecting",
+                        "session_key": key,
+                        "stream_seq": 1,
+                        "emitted_at": ANY,
+                    },
+                }
+            ],
+        }
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe(self, dispatcher, ctx_with_sessions, session):
+        session.epoch = 4
         res = await dispatcher.dispatch(
             "r1",
             "sessions.messages.subscribe",
@@ -4580,6 +6686,388 @@ class TestSessionsMessagesSubscribe:
         assert isinstance(res.payload["current_stream_seq"], int)
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 0
+        assert res.payload["epoch"] == 4
+        assert res.payload["run_mode_lock"] == {"locked": False}
+        assert res.payload["hydration_complete"] is True
+        assert res.payload["projectWorkspaceDeferred"] is False
+        assert res.payload["deferred_fields"] == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_messages_subscribe_bounds_storage_wait_and_recovers(
+        self,
+        dispatcher,
+        tmp_path: Path,
+    ):
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        key = "agent:main:webchat:legacy-subscribe-busy"
+        store = SessionStorage(str(tmp_path / "legacy-subscribe-busy.db"))
+        await store.connect()
+        await store.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="legacy-subscribe-busy",
+                agent_id="main",
+                status="idle",
+                created_at=1,
+                updated_at=1,
+            )
+        )
+        store._busy_budget_seconds = 0.05
+        subscriptions = SubscriptionManager()
+        conn_id = "legacy-subscribe-busy-conn"
+        context = make_ctx(
+            session_manager=SimpleNamespace(_storage=store),
+            conn_id=conn_id,
+            subscription_manager=subscriptions,
+        )
+
+        await store._operation_lock.acquire()
+        try:
+            response = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "legacy-busy",
+                    "sessions.messages.subscribe",
+                    {"key": key},
+                    context,
+                ),
+                timeout=0.5,
+            )
+            assert response.ok is False
+            assert response.error.code == "STORAGE_BUSY"
+            assert response.error.retryable is True
+            assert response.error.details["resource"] == "session_storage_operation_lock"
+            assert subscriptions.get_message_subscribers(key) == set()
+        finally:
+            store._operation_lock.release()
+
+        try:
+            recovered = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "legacy-retry",
+                    "sessions.messages.subscribe",
+                    {"key": key},
+                    context,
+                ),
+                timeout=0.5,
+            )
+            assert recovered.ok is True
+            assert recovered.payload["hydration_complete"] is True
+            assert subscriptions.get_message_subscribers(key) == {conn_id}
+        finally:
+            subscriptions.unsubscribe_messages(conn_id, key)
+            await store.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("preexisting", [False, True])
+    async def test_messages_subscribe_rolls_back_only_new_registration_on_failure(
+        self,
+        dispatcher,
+        preexisting: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:webchat:subscribe-registration-rollback"
+        manager = FakeSessionManager([FakeSession(session_key=key)])
+        subscriptions = SubscriptionManager()
+        conn_id = "subscribe-registration-conn"
+        if preexisting:
+            subscriptions.subscribe_messages(conn_id, key)
+
+        class _BrokenStreams:
+            def replay(self, _key: str, _cursor: int | None):
+                raise RuntimeError("synthetic replay failure")
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "get_session_streams",
+            lambda: _BrokenStreams(),
+        )
+
+        ctx = make_ctx(
+            session_manager=manager,
+            conn_id=conn_id,
+            subscription_manager=subscriptions,
+        )
+
+        response = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": key},
+            ctx,
+        )
+
+        assert response.ok is False
+        assert subscriptions.get_message_subscribers(key) == (
+            {conn_id} if preexisting else set()
+        )
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_skips_hanging_metadata_and_allows_next_rpc(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:webchat:subscribe-slow-workspace"
+        session = FakeSession(session_key=key, workspace_id="workspace-slow")
+        manager = FakeSessionManager([session])
+        metadata_called = False
+
+        async def _hanging_metadata(*_args, **_kwargs):
+            nonlocal metadata_called
+            metadata_called = True
+            await asyncio.Event().wait()
+
+        manager._storage.get_session = _hanging_metadata
+        manager._storage.list_agent_tasks = _hanging_metadata
+        monkeypatch.setattr(
+            rpc_sessions,
+            "project_workspace_snapshot",
+            _hanging_metadata,
+        )
+
+        context = make_ctx(
+            session_manager=manager,
+            task_runtime=SimpleNamespace(
+                list=_hanging_metadata,
+                pending_user_inputs=_hanging_metadata,
+            ),
+        )
+        response = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.messages.subscribe",
+                {"key": key, "fast_ack": True},
+                context,
+            ),
+            timeout=0.1,
+        )
+        snapshot = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r2",
+                "sessions.messages.snapshot",
+                {"key": key},
+                context,
+            ),
+            timeout=0.1,
+        )
+
+        assert response.ok is True
+        assert response.payload["workspaceId"] is None
+        assert response.payload["projectWorkspace"] is None
+        assert response.payload["hydration_complete"] is False
+        assert snapshot.ok is True
+        assert metadata_called is False
+
+    @pytest.mark.asyncio
+    async def test_messages_hydrate_returns_authoritative_enrichment_without_subscribing(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:webchat:hydrate-authoritative"
+        session = FakeSession(
+            session_key=key,
+            workspace_id="workspace-authoritative",
+            epoch=7,
+        )
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-hydrate",
+                status="running",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=110,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            )
+        ]
+        subscriptions = SubscriptionManager()
+        pending = [{"kind": "user_input", "request_id": "request-hydrate"}]
+        steer_capability = {
+            "mode": "same_turn",
+            "expected_turn_id": "task-hydrate",
+            "input_kinds": ["text"],
+            "reason": None,
+        }
+        context = make_ctx(
+            session_manager=manager,
+            subscription_manager=subscriptions,
+            task_runtime=SimpleNamespace(
+                pending_user_inputs=lambda candidate: pending if candidate == key else [],
+                steer_capability=lambda candidate: (
+                    steer_capability if candidate == key else None
+                ),
+            ),
+        )
+
+        response = await dispatcher.dispatch(
+            "hydrate",
+            "sessions.messages.hydrate",
+            {"key": key},
+            context,
+        )
+
+        assert response.ok is True
+        assert response.payload["key"] == key
+        assert response.payload["workspaceId"] == "workspace-authoritative"
+        assert response.payload["projectWorkspace"] is None
+        assert response.payload["projectWorkspaceDeferred"] is True
+        assert response.payload["active_task"]["task_id"] == "task-hydrate"
+        assert (
+            response.payload["active_task"]["steer_capability"]
+            == steer_capability
+        )
+        assert response.payload["tasks"][0]["steer_capability"] == steer_capability
+        assert response.payload["run_status"] == "running"
+        assert response.payload["pendingUserInputs"] == pending
+        assert response.payload["epoch"] == 7
+        assert response.payload["hydration_complete"] is True
+        assert response.payload["deferred_fields"] == ["projectWorkspace"]
+        assert subscriptions.get_message_subscribers(key) == set()
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_reports_persisted_task_run_mode_lock(
+        self, dispatcher
+    ):
+        key = "agent:main:webchat:active-mode"
+        session = FakeSession(session_key=key)
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-active-mode",
+                status="running",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=110,
+                finished_at=None,
+                terminal_reason=None,
+                details={
+                    "accepted_run_mode": {
+                        "run_mode": "standard",
+                        "run_mode_source": "user",
+                    }
+                },
+            )
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["run_mode_lock"] == {
+            "locked": True,
+            "runMode": "standard",
+            "source": "task",
+        }
+        assert manager._storage.list_agent_tasks_calls == [key]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_reports_background_run_mode_lock(
+        self, dispatcher, ctx_with_sessions, session, monkeypatch
+    ):
+        background_called = False
+
+        async def _active_group_ids(_key: str) -> list[str]:
+            nonlocal background_called
+            background_called = True
+            return ["group-live"]
+
+        async def _active_override(_key: str):
+            nonlocal background_called
+            background_called = True
+            return SimpleNamespace(run_mode=SimpleNamespace(value="trusted"))
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.active_background_completion_group_ids",
+            _active_group_ids,
+        )
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce."
+            "active_background_completion_run_mode_override",
+            _active_override,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": session.session_key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload["run_mode_lock"] == {
+            "locked": True,
+            "runMode": "trusted",
+            "source": "background",
+        }
+        assert background_called is True
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_reports_authoritative_active_task_groups(
+        self, dispatcher, ctx_with_sessions, session, monkeypatch
+    ):
+        async def _active_group_ids(key: str) -> list[str]:
+            assert key == session.session_key
+            return ["group-live"]
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.active_background_completion_group_ids",
+            _active_group_ids,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": session.session_key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload["active_task_group_ids"] == ["group-live"]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_hydrates_pending_user_input(
+        self, dispatcher, ctx_with_sessions, session
+    ):
+        payload = {
+            "kind": "user_input",
+            "status": "input_required",
+            "paused": True,
+            "request_id": "request-1",
+            "clarify_schema": {"fields": [{"name": "scope", "type": "string"}]},
+        }
+        pending_called = False
+
+        def _pending_user_inputs(key):
+            nonlocal pending_called
+            pending_called = True
+            return [payload] if key == session.session_key else []
+
+        ctx_with_sessions.task_runtime = SimpleNamespace(
+            pending_user_inputs=_pending_user_inputs
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": session.session_key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload["pendingUserInputs"] == [payload]
+        assert pending_called is True
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_replays_buffered_events_after_cursor(self, dispatcher):
@@ -4614,6 +7102,70 @@ class TestSessionsMessagesSubscribe:
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 1
         assert conn.events == [("session.event.done", second, {"replayed": True})]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_ack_is_not_blocked_by_writer_queue_socket(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:webchat:writer-queue-subscribe"
+        stream_registry = get_session_streams()
+        stream_registry.record(key, "session.event.text_delta", {"text": "queued"})
+
+        class _BlockingSocket:
+            client_state = WebSocketState.CONNECTED
+
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send_text(self, _text: str) -> None:
+                self.started.set()
+                await self.release.wait()
+
+            async def close(self, code: int = 1000, reason: str = "") -> None:
+                self.client_state = WebSocketState.DISCONNECTED
+                self.release.set()
+
+        socket = _BlockingSocket()
+        conn_id = "writer-queue-subscribe-conn"
+        conn = WsConnection(conn_id=conn_id, ws=socket)  # type: ignore[arg-type]
+        conn._start_writer(maxsize=8, enabled=True)
+        registry = get_registry()
+        registry.register(conn)
+        context = make_ctx(
+            session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+            conn_id=conn_id,
+            subscription_manager=SubscriptionManager(),
+        )
+        try:
+            subscribed = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "r1",
+                    "sessions.messages.subscribe",
+                    {"key": key, "since_stream_seq": 0, "fast_ack": True},
+                    context,
+                ),
+                timeout=0.1,
+            )
+            snapshot = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "r2",
+                    "sessions.messages.snapshot",
+                    {"key": key},
+                    context,
+                ),
+                timeout=0.1,
+            )
+
+            assert subscribed.ok is True
+            assert subscribed.payload["replayed_count"] == 1
+            assert subscribed.payload["hydration_complete"] is False
+            assert snapshot.ok is True
+        finally:
+            socket.release.set()
+            registry.unregister(conn_id)
+            await conn._stop_writer()
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_replays_task_group_events(self, dispatcher):
@@ -4660,7 +7212,10 @@ class TestSessionsMessagesSubscribe:
         assert conn.events == [("session.event.task_group.done", done, {"replayed": True})]
 
     @pytest.mark.asyncio
-    async def test_messages_subscribe_reports_persisted_task_state_and_replay_gap(self, dispatcher):
+    async def test_messages_subscribe_reports_task_state_and_replay_gap(
+        self,
+        dispatcher,
+    ):
         key = "agent:main:webchat:restarted"
         session = FakeSession(session_key=key)
         manager = FakeSessionManager([session])
@@ -4691,6 +7246,8 @@ class TestSessionsMessagesSubscribe:
         assert res.payload["replay_gap_reason"] == "stream_buffer_reset"
         assert res.payload["last_task"]["task_id"] == "task-abandoned"
         assert res.payload["run_status"] == "interrupted"
+        assert res.payload["hydration_complete"] is True
+        assert manager._storage.list_agent_tasks_calls == [key]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_missing_key(self, dispatcher, ctx_with_sessions):
@@ -5169,6 +7726,30 @@ class TestSessionsResolve:
         )
         assert res.ok is True
         assert res.payload["session_key"] == session.session_key
+        assert res.payload["workspaceId"] is None
+        assert res.payload["projectWorkspaceDeferred"] is False
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_bound_workspace_without_path_validation(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(
+            session_key="agent:main:webchat:resolve-project",
+            workspace_id="project-bound",
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.resolve",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["workspaceId"] == "project-bound"
+        assert res.payload["projectWorkspaceDeferred"] is True
 
     @pytest.mark.asyncio
     async def test_resolve_by_session_id(self, dispatcher):
@@ -5286,10 +7867,20 @@ class TestSessionsBootstrap:
             "session.event.text_delta",
             {"text": "partial"},
         )
+        steer_capability = {
+            "mode": "same_turn",
+            "expected_turn_id": "task-1",
+            "input_kinds": ["text"],
+            "reason": None,
+        }
         workspace = tmp_path / "workspace"
         ctx = make_ctx(
             session_manager=manager,
-            task_runtime=None,
+            task_runtime=SimpleNamespace(
+                steer_capability=lambda candidate: (
+                    steer_capability if candidate == key else None
+                ),
+            ),
             config=GatewayConfig(workspace_dir=str(workspace)),
         )
 
@@ -5316,6 +7907,8 @@ class TestSessionsBootstrap:
         assert res.payload["history"]["history_scope"] == "complete"
         assert res.payload["active_task"]["turn_id"] == "task-1"
         assert res.payload["active_task"]["user_message_id"] == "durable-msg-1"
+        assert res.payload["active_task"]["steer_capability"] == steer_capability
+        assert res.payload["tasks"][0]["steer_capability"] == steer_capability
         assert res.payload["queue"] == {
             "mode": "followup",
             "queued_count": 1,
@@ -5324,6 +7917,45 @@ class TestSessionsBootstrap:
         assert res.payload["runtime"]["model_routing"]["mode"] == "router"
         assert res.payload["epoch"] == 3
         assert res.payload["stream_cursor"] == stream["stream_seq"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_bootstrap_preserves_transcript_larger_than_one_mib(
+        self, dispatcher
+    ):
+        key = "agent:main:webchat:synthetic-large-bootstrap"
+        session = FakeSession(
+            session_key=key,
+            session_id="synthetic-large-bootstrap",
+            status="running",
+        )
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            TranscriptEntry(
+                id=index + 1,
+                session_id=session.session_id,
+                session_key=key,
+                role="user",
+                content=f"{index:02d}:" + "x" * 17_997,
+                created_at=100 + index,
+                message_id=f"synthetic-message-{index:02d}",
+            )
+            for index in range(64)
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch(
+            "large-bootstrap",
+            "sessions.bootstrap",
+            {"key": key, "limit": 64},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert len(res.model_dump_json().encode("utf-8")) > 1024 * 1024
+        assert res.payload["history"]["loaded_count"] == 64
+        messages = res.payload["history"]["messages"]
+        assert messages[0]["message_id"] == "synthetic-message-00"
+        assert messages[-1]["message_id"] == "synthetic-message-63"
 
     @pytest.mark.asyncio
     async def test_bootstrap_includes_only_sanitized_agent_identity_display_fields(
@@ -5384,3 +8016,76 @@ class TestSessionsBootstrap:
 
         assert res.ok is False
         assert res.error.code == "UNAUTHORIZED"
+
+
+def test_session_view_plugin_channel_type_degrades_to_unknown_surface():
+    # docs/session-view-contract.md pins `surface` as a closed union: a
+    # configured name mapping to an out-of-enum plugin type (entry-point
+    # adapters) must degrade to "unknown", never widen the contract.
+    from opensquilla.gateway.session_view import build_session_view_item
+
+    session = FakeSession(
+        session_key="agent:main:whats-bot:direct:u-1",
+        last_channel="whats-bot",
+        last_to="u-1",
+    )
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=0,
+        channel_types={"whats-bot": "whatsapp"},
+    )
+    assert view["surface"] == "unknown"
+
+    # A configured builtin type keeps resolving through the same map.
+    feishu_session = FakeSession(
+        session_key="agent:main:飞书:direct:u-1",
+        last_channel="飞书",
+        last_to="u-1",
+    )
+    feishu_view = build_session_view_item(
+        feishu_session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=0,
+        channel_types={"飞书": "feishu"},
+    )
+    assert feishu_view["surface"] == "feishu"
+    assert feishu_view["sessionKind"] == "channel"
+
+
+@pytest.mark.asyncio
+async def test_search_classifies_custom_named_channel_sessions(dispatcher):
+    # sessions.search must thread the configured name->type map exactly like
+    # sessions.list: a custom-named channel session's title hit carries the
+    # platform surface, not "unknown".
+    session = FakeSession(
+        session_key="agent:main:飞书:direct:ou_demo_user",
+        session_id="s-feishu",
+        display_name="Deploy planning",
+        last_channel="飞书",
+        last_to="ou_demo_user",
+        updated_at=2000,
+    )
+    config = GatewayConfig(
+        memory={"flush_enabled": False},
+        channels={
+            "channels": [
+                {
+                    "type": "feishu",
+                    "name": "飞书",
+                    "app_id": "cli_dummy",
+                    "app_secret": "dummy",
+                }
+            ]
+        },
+    )
+    ctx = make_ctx(session_manager=_SearchManager([session]), config=config)
+
+    res = await dispatcher.dispatch("r1", "sessions.search", {"query": "deploy"}, ctx)
+
+    assert res.ok is True
+    hits = res.payload["sessions"]
+    assert [row["key"] for row in hits] == ["agent:main:飞书:direct:ou_demo_user"]
+    assert hits[0]["surface"] == "feishu"

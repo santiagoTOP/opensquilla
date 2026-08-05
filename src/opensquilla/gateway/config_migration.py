@@ -17,13 +17,26 @@ from typing import Any
 
 import tomli_w
 
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
 # Schema version stamped into every migrated payload. Bump this together with
 # a new ``_MIGRATIONS`` entry whenever a one-time value migration is added.
 # ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
 LATEST_CONFIG_VERSION = 1
+
+
+class ConfigParseError(ValueError):
+    """A user config file holds invalid TOML.
+
+    Loaders raise this instead of a bare ``tomllib.TOMLDecodeError`` so CLI
+    surfaces can name the offending file and point at the offline repair
+    instead of printing a traceback.
+    """
+
+    def __init__(self, path: str | Path, error: Exception) -> None:
+        self.path = Path(path)
+        super().__init__(f"invalid TOML in {self.path}: {error}")
 
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
@@ -312,6 +325,7 @@ def migrate_config_payload(
     )
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
+    _disable_unverifiable_feishu_webhook_entries(builder)
     _clear_mismatched_router_tier_profile(builder)
 
     stamped_version = _payload_config_version(builder.payload)
@@ -522,15 +536,60 @@ def _park_unknown_channel_entries(
         _write_legacy_field_log(parked_log_fields, "config_migration")
 
 
+def _disable_unverifiable_feishu_webhook_entries(builder: _MigrationBuilder) -> None:
+    """Always-run: park feishu webhook entries with no ingress credential.
+
+    Feishu webhook entries now require ``verification_token`` or
+    ``encrypt_key`` — with neither, every inbound request would be rejected,
+    so the shape was legal-but-dead in earlier releases. The strict schema
+    rejects it outright, which must not brick an upgraded config file: coerce
+    such entries to ``enabled = false`` (validation skips disabled entries)
+    with a warning telling the operator what to add before re-enabling.
+    """
+    channels_section = builder.payload.get("channels")
+    if not isinstance(channels_section, dict):
+        return
+    entries = channels_section.get("channels")
+    if not isinstance(entries, list):
+        return
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "feishu":
+            continue
+        if entry.get("connection_mode") != "webhook":
+            continue
+        if not bool(entry.get("enabled", True)):
+            continue
+        verification_token = str(entry.get("verification_token") or "").strip()
+        encrypt_key = str(entry.get("encrypt_key") or "").strip()
+        if verification_token or encrypt_key:
+            continue
+        entry["enabled"] = False
+        name = entry.get("name")
+        label = "channels.channels[type=feishu"
+        label += f", name={name}]" if isinstance(name, str) and name else "]"
+        builder.changes.append(f"{label}: enabled -> false (no webhook credential)")
+        builder.warnings.append(
+            f"{label} uses webhook mode without verification_token or "
+            "encrypt_key and was disabled; add one of them and re-enable the "
+            "channel"
+        )
+
+
 def _clear_mismatched_router_tier_profile(builder: _MigrationBuilder) -> None:
     """Always-run: clear ``squilla_router.tier_profile`` on provider mismatch.
 
     Validation hard-fails when ``tier_profile`` no longer matches
     ``llm.provider`` — the classic hand-edit trap of switching providers
-    without clearing the profile pointer. Clear the profile instead: the
-    inline ``tiers`` table (full dumps always carry one) keeps governing.
-    Only fires when the payload states both values explicitly, so an
-    env-provided provider can never trigger a spurious clear.
+    without clearing the profile pointer. An atomic primary/profile activation
+    is the intentional exception: it leaves the router preset untouched and
+    demotes the preset's provider into ``llm_profiles``. Preserve that shape so
+    a persist/reload cycle keeps the same effective ladder. Otherwise clear the
+    profile and let the inline ``tiers`` table govern. Only fires when the
+    payload states both values explicitly, so an env-provided provider can
+    never trigger a spurious clear.
     """
     router = builder.payload.get("squilla_router")
     if not isinstance(router, dict):
@@ -545,6 +604,12 @@ def _clear_mismatched_router_tier_profile(builder: _MigrationBuilder) -> None:
     if not isinstance(provider, str) or not provider.strip():
         return
     if profile.strip().lower() == provider.strip().lower():
+        return
+    normalized_profile = profile.strip().lower()
+    profiles = builder.payload.get("llm_profiles")
+    if isinstance(profiles, dict) and any(
+        str(key or "").strip().lower() == normalized_profile for key in profiles
+    ):
         return
 
     router.pop("tier_profile", None)
@@ -593,6 +658,37 @@ _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
 ]
 
 
+def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically replace one TOML config file (same-dir temp, fsync, 0600).
+
+    Every writer that replaces ``config.toml`` converges on this helper so the
+    crash-durability contract lives in exactly one place. The recovery module
+    is the one intentional exception: it creates the repaired file with
+    ``O_EXCL`` after parking the corrupt original, so a replace would be wrong
+    there.
+    """
+
+    target = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=os.fspath(native_io_path(target.parent)),
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            tomli_w.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, native_io_path(target))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def backup_and_write_migrated_config(
     path: str | Path,
     payload: dict[str, Any],
@@ -601,25 +697,8 @@ def backup_and_write_migrated_config(
     """Back up and atomically replace a migrated user config file."""
     target = Path(path)
     backup = make_config_backup(target)
-
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=str(target.parent),
-    )
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            tomli_w.dump(payload, fh)
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, target)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-    os.chmod(target, 0o600)
+    atomic_write_config(target, payload)
+    os.chmod(native_io_path(target), 0o600)
     logging.getLogger(__name__).warning(
         "OpenSquilla config migrated for 0.2.0 schema",
         extra={
@@ -633,17 +712,46 @@ def backup_and_write_migrated_config(
     return backup
 
 
+_CONFIG_BACKUP_KEEP = 10
+
+
+def _prune_config_backups(source: Path, *, keep: int = _CONFIG_BACKUP_KEEP) -> None:
+    """Delete the oldest sibling backups beyond the newest ``keep`` files.
+
+    Backup names embed a lexically sortable timestamp, so name order is age
+    order. Only plain files are removed; anything link-shaped is left for the
+    inspector to flag rather than followed.
+    """
+
+    prefix = f"{source.name}.backup."
+    try:
+        siblings = sorted(
+            entry.name
+            for entry in os.scandir(native_io_path(source.parent))
+            if entry.name.startswith(prefix) and entry.is_file(follow_symlinks=False)
+        )
+    except OSError:
+        return
+    for name in siblings[: max(len(siblings) - keep, 0)]:
+        try:
+            os.unlink(native_io_path(source.parent / name))
+        except OSError:
+            continue
+
+
 def make_config_backup(target: str | Path) -> Path:
     """Create a collision-safe 0600 backup next to a config file."""
     source = Path(target)
     stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
-    data = source.read_bytes()
+    data = native_io_path(source).read_bytes()
 
     for attempt in range(1000):
         suffix = "" if attempt == 0 else f".{attempt}"
         backup = source.with_name(f"{source.name}.backup.{stamp}{suffix}")
         try:
-            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(
+                native_io_path(backup), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
         except FileExistsError:
             continue
         try:
@@ -651,11 +759,12 @@ def make_config_backup(target: str | Path) -> Path:
                 fh.write(data)
         except Exception:
             try:
-                os.unlink(backup)
+                os.unlink(native_io_path(backup))
             except OSError:
                 pass
             raise
-        backup.chmod(0o600)
+        native_io_path(backup).chmod(0o600)
+        _prune_config_backups(source)
         return backup
 
     raise FileExistsError(f"Could not create unique backup for {source}")

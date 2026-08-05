@@ -18,9 +18,25 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.secrets import clean_header_secret
 
+from .candidate_artifact import (
+    CandidateArtifactBuilder,
+    CandidateArtifactLimitError,
+    strip_candidate_tool_identity,
+)
+from .error_redaction import (
+    redact_upstream_error_code,
+    redact_upstream_error_text,
+    redacted_httpx_error,
+)
 from .failures import retry_after_from_headers
-from .openai import _VERSIONED_BASE_URL_RE, _http_error_body_text, _resolve_llm_proxy
+from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .request_proof import (
+    RESPONSES_REQUEST_ENVELOPE,
+    ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    prove_provider_payload_from_env,
+)
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
 from .trace_recorder import LLMTraceRecorder
 from .types import (
@@ -33,6 +49,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -66,9 +83,16 @@ def _responses_message_item(role: str, content: list[dict[str, Any]]) -> dict[st
     return {"type": "message", "role": role, "content": content}
 
 
-def _responses_input(messages: list[Message]) -> list[dict[str, Any]]:
+def _responses_input(
+    messages: list[Message],
+    *,
+    logical_index_map: dict[int, int] | None = None,
+    emit_warnings: bool = True,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for message in messages:
+    for message_index, message in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[message_index] = len(items)
         if isinstance(message.content, str):
             items.append({"role": message.role, "content": message.content})
             continue
@@ -89,10 +113,11 @@ def _responses_input(messages: list[Message]) -> list[dict[str, Any]]:
                 # output. Drop (with a warning) on assistant turns rather than
                 # emit an invalid part.
                 if message.role == "assistant":
-                    log.warning(
-                        "openai_responses.dropped_assistant_image",
-                        note="input_image is not valid on assistant output",
-                    )
+                    if emit_warnings:
+                        log.warning(
+                            "openai_responses.dropped_assistant_image",
+                            note="input_image is not valid on assistant output",
+                        )
                     continue
                 if block.source_type == "url":
                     image_url = block.data
@@ -138,6 +163,32 @@ def _usage_fields(usage: Any) -> tuple[int, int, int, int]:
     return input_tokens, output_tokens, reasoning_tokens, cached_tokens
 
 
+def _candidate_field_has_content(value: object | None) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict | list | tuple):
+        return bool(value)
+    return True
+
+
+def _candidate_malformed_function_call(
+    item: dict[str, Any],
+) -> dict[str, object] | None:
+    """Retain malformed function-call data only when non-structural content remains."""
+
+    sanitized = strip_candidate_tool_identity(item)
+    if not isinstance(sanitized, dict):
+        return None
+    residual = dict(sanitized)
+    for field in ("type", "status", "name", "arguments"):
+        residual.pop(field, None)
+    if not residual:
+        return None
+    return {"malformed_function_call": sanitized}
+
+
 class OpenAIResponsesProvider:
     """OpenAI native Responses API provider.
 
@@ -146,6 +197,7 @@ class OpenAIResponsesProvider:
     replay is added in later continuity work.
     """
 
+    final_request_admission_guaranteed = True
     provider_name = "openai_responses"
 
     def __init__(
@@ -155,16 +207,25 @@ class OpenAIResponsesProvider:
         base_url: str = _OPENAI_RESPONSES_BASE,
         org_id: str | None = None,
         proxy: str | None = None,
+        provider_id: str | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._org_id = org_id
         self._proxy = _resolve_llm_proxy(proxy)
+        self.provider_id = (provider_id or self.provider_name).strip()
 
     @property
     def model(self) -> str:
         return self._model
+
+    def disable_provider_state_replay(self) -> None:
+        """Keep the cross-provider replay contract explicit for this adapter.
+
+        Responses requests are already stateless (``store: false``) and do not
+        replay provider-native response ids, so no mutable state is required.
+        """
 
     def provider_metadata(self) -> ProviderMetadata:
         return ProviderMetadata(
@@ -172,6 +233,7 @@ class OpenAIResponsesProvider:
             provider_kind="openai_responses",
             model=self._model,
             base_url=self._base_url,
+            provider_id=self.provider_id,
         )
 
     def provider_connection_config(self) -> ProviderConnectionConfig:
@@ -183,9 +245,72 @@ class OpenAIResponsesProvider:
         )
 
     def _api_url(self, path: str) -> str:
-        if path.startswith("/v1/") and _VERSIONED_BASE_URL_RE.search(self._base_url):
-            return f"{self._base_url}{path[3:]}"
-        return f"{self._base_url}{path}"
+        return _versioned_api_url(self._base_url, path)
+
+    def _build_payload(
+        self,
+        input_items: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "input": input_items,
+            "max_output_tokens": config.max_tokens,
+            "store": False,
+        }
+        if config.output_json_schema is not None:
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "strict": config.output_json_schema_strict,
+                    "schema": config.output_json_schema,
+                }
+            }
+        if config.system:
+            payload["instructions"] = config.system
+        if config.temperature is not None:
+            payload["temperature"] = config.temperature
+        if config.stop_sequences:
+            payload["stop"] = config.stop_sequences
+        if tools:
+            payload["tools"] = [_responses_tool(tool) for tool in tools]
+            payload["tool_choice"] = config.tool_choice or "auto"
+        return payload
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Responses payload without transport or shaping."""
+
+        cfg = config or ChatConfig()
+        logical_index_map: dict[int, int] = {}
+        input_items = _responses_input(
+            messages,
+            logical_index_map=logical_index_map,
+            emit_warnings=False,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        payload = self._build_payload(input_items, tools, cfg)
+        return project_final_request_payload(
+            payload,
+            projection_adapter="openai_responses",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+        )
 
     def chat(
         self,
@@ -193,10 +318,25 @@ class OpenAIResponsesProvider:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        cfg = config or ChatConfig()
+        logical_index_map: dict[int, int] = {}
+        input_items = _responses_input(
+            messages,
+            logical_index_map=logical_index_map,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        if wire_active_user_index != cfg.active_user_message_index:
+            cfg = cfg.model_copy(
+                update={"active_user_message_index": wire_active_user_index}
+            )
         return self.chat_items(
-            _responses_input(messages),
+            input_items,
             tools=tools,
-            config=config or ChatConfig(),
+            config=cfg,
         )
 
     def chat_items(
@@ -224,21 +364,52 @@ class OpenAIResponsesProvider:
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "input": input_items,
-            "max_output_tokens": config.max_tokens,
-            "store": False,
-        }
-        if config.system:
-            payload["instructions"] = config.system
-        if config.temperature is not None:
-            payload["temperature"] = config.temperature
-        if config.stop_sequences:
-            payload["stop"] = config.stop_sequences
-        if tools:
-            payload["tools"] = [_responses_tool(tool) for tool in tools]
-            payload["tool_choice"] = config.tool_choice or "auto"
+        payload = self._build_payload(input_items, tools, config)
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="openai_responses",
+            proof_budget=config.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=config.active_user_message_index,
+        )
+        if budget_decision.action == "budget_limited":
+            proof = budget_decision.proof or {}
+            log.warning("provider.request_budget_exhausted", **proof)
+            yield ErrorEvent(
+                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
+            )
+            return
+        payload = budget_decision.payload or payload
+        if budget_decision.proof is not None:
+            log.info("provider.request_proof", **budget_decision.proof)
+        try:
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter="openai_responses",
+                status_projection_mode="content_envelope",
+                envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+                active_user_message_index=config.active_user_message_index,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+
         endpoint = self._api_url("/v1/responses")
         trace = LLMTraceRecorder(
             provider="openai_responses",
@@ -250,7 +421,11 @@ class OpenAIResponsesProvider:
         trace.record_request(
             payload=payload,
             headers=headers,
-            metadata={"timeout_seconds": config.timeout, "tools_count": len(tools or [])},
+            metadata={
+                "timeout_seconds": config.timeout,
+                "tools_count": len(tools or []),
+                "request_proof": budget_decision.proof,
+            },
         )
 
         try:
@@ -265,12 +440,22 @@ class OpenAIResponsesProvider:
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
-            trace.record_error(code="timeout", message=f"Request timed out: {exc}")
-            yield ErrorEvent(message=f"Request timed out: {exc}", code="timeout")
+            message = redact_upstream_error_text(
+                f"Request timed out: {str(exc) or repr(exc)}",
+                api_key=self._api_key,
+                max_len=2000,
+            )
+            trace.record_error(code="timeout", message=message)
+            yield ErrorEvent(message=message, code="timeout")
             return
         except httpx.RequestError as exc:
-            trace.record_error(code="request_error", message=f"Request error: {exc}")
-            yield ErrorEvent(message=f"Request error: {exc}", code="request_error")
+            message = redact_upstream_error_text(
+                f"Request error: {str(exc) or repr(exc)}",
+                api_key=self._api_key,
+                max_len=2000,
+            )
+            trace.record_error(code="request_error", message=message)
+            yield ErrorEvent(message=message, code="request_error")
             return
 
         if response.status_code != 200:
@@ -278,11 +463,21 @@ class OpenAIResponsesProvider:
             message = f"OpenAI Responses API error {response.status_code}"
             if detail:
                 message = f"{message}: {detail}"
+            message = redact_upstream_error_text(
+                message,
+                api_key=self._api_key,
+                max_len=2000,
+            )
+            response_body = redact_upstream_error_text(
+                response.text,
+                api_key=self._api_key,
+                max_len=4000,
+            )
             trace.record_error(
                 code=str(response.status_code),
                 message=message,
                 status_code=response.status_code,
-                response_body=response.text,
+                response_body=response_body,
             )
             yield ErrorEvent(
                 message=message,
@@ -297,10 +492,15 @@ class OpenAIResponsesProvider:
         try:
             data = response.json()
         except json.JSONDecodeError:
+            response_body = redact_upstream_error_text(
+                response.text,
+                api_key=self._api_key,
+                max_len=4000,
+            )
             trace.record_error(
                 code="invalid_json",
                 message="Invalid JSON response from OpenAI Responses API",
-                response_body=response.text,
+                response_body=response_body,
             )
             yield ErrorEvent(
                 message="Invalid JSON response from OpenAI Responses API",
@@ -313,7 +513,11 @@ class OpenAIResponsesProvider:
             trace.record_error(
                 code="invalid_response",
                 message=message,
-                response_body=response.text,
+                response_body=redact_upstream_error_text(
+                    response.text,
+                    api_key=self._api_key,
+                    max_len=4000,
+                ),
             )
             yield ErrorEvent(message=message, code="invalid_response")
             return
@@ -333,12 +537,21 @@ class OpenAIResponsesProvider:
             trace.record_error(
                 code="invalid_response",
                 message=message,
-                response_body=response.text,
+                response_body=redact_upstream_error_text(
+                    response.text,
+                    api_key=self._api_key,
+                    max_len=4000,
+                ),
                 metadata={"response_status": response_status},
             )
             yield ErrorEvent(message=message, code="invalid_response")
             return
         output_items = raw_output_items if isinstance(raw_output_items, list) else []
+        candidate_artifact = (
+            CandidateArtifactBuilder()
+            if config.candidate_output_mode == "inert_artifact"
+            else None
+        )
         parsed_tool_arguments: dict[
             int,
             tuple[str, str, str, str, dict[str, Any]],
@@ -379,68 +592,119 @@ class OpenAIResponsesProvider:
                         invalid_output_shape = True
                 validated_message_text[item_index] = rendered_parts
                 continue
-            if item_type != "function_call" or not response_completed:
+            if item_type != "function_call":
                 # Unknown but well-shaped output item types are provider state
                 # that this adapter does not need to surface.
                 continue
-            if response_completed:
-                raw_call_id = item.get("call_id")
-                raw_item_id = item.get("id")
+            if candidate_artifact is not None and (
+                response_completed or truncated_by_length
+            ):
+                candidate_name = item.get("name")
+                candidate_arguments = item.get("arguments")
                 if (
-                    raw_call_id is not None
-                    and (not isinstance(raw_call_id, str) or not raw_call_id.strip())
-                ) or (
-                    raw_item_id is not None
-                    and (not isinstance(raw_item_id, str) or not raw_item_id.strip())
+                    not _candidate_field_has_content(candidate_name)
+                    and not _candidate_field_has_content(candidate_arguments)
                 ):
-                    invalid_tool_call_count += 1
-                    continue
-                tool_name = item.get("name")
-                if not isinstance(tool_name, str) or not tool_name.strip():
-                    invalid_tool_call_count += 1
-                    continue
-                raw_arguments = item.get("arguments")
-                if raw_arguments is None:
-                    raw_arguments = ""
-                if not isinstance(raw_arguments, str):
-                    invalid_tool_call_count += 1
-                    continue
+                    candidate_arguments = _candidate_malformed_function_call(item)
                 try:
-                    arguments = (
-                        json.loads(
-                            raw_arguments,
-                            parse_constant=lambda value: (_ for _ in ()).throw(
-                                ValueError(value)
-                            ),
+                    if truncated_by_length:
+                        candidate_artifact.append_or_start(
+                            item_index,
+                            name_fragment=candidate_name,
+                            arguments_fragment=candidate_arguments,
                         )
-                        if raw_arguments.strip()
-                        else {}
+                    else:
+                        candidate_artifact.observe_call(
+                            item_index,
+                            name_text=candidate_name,
+                            arguments=candidate_arguments,
+                        )
+                except CandidateArtifactLimitError as exc:
+                    message = "OpenAI Responses candidate artifact exceeded safety limits"
+                    trace.record_error(
+                        code="candidate_artifact_limit_exceeded",
+                        message=message,
+                        metadata={
+                            "operation": exc.operation,
+                            "reason": exc.reason,
+                            "limit": exc.limit,
+                            "observed": exc.observed,
+                        },
                     )
-                except (
-                    json.JSONDecodeError,
-                    RecursionError,
-                    TypeError,
-                    ValueError,
-                ):
-                    invalid_tool_call_count += 1
-                    continue
-                if not isinstance(arguments, dict):
-                    invalid_tool_call_count += 1
-                    continue
-                try:
-                    json.dumps(arguments, allow_nan=False)
-                except (RecursionError, TypeError, ValueError):
-                    invalid_tool_call_count += 1
-                    continue
-                call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
-                key = raw_item_id or call_id
-                parsed_tool_arguments[item_index] = (
-                    call_id,
-                    key,
-                    tool_name,
-                    raw_arguments,
-                    arguments,
+                    log.warning(
+                        "provider.candidate_artifact_limit",
+                        provider=self.provider_name,
+                        model=self._model,
+                        operation=exc.operation,
+                        reason=exc.reason,
+                        limit=exc.limit,
+                        observed=exc.observed,
+                    )
+                    yield ErrorEvent(
+                        message=message,
+                        code="candidate_artifact_limit_exceeded",
+                    )
+                    return
+                continue
+            if not response_completed:
+                continue
+            raw_call_id = item.get("call_id")
+            raw_item_id = item.get("id")
+            if (
+                raw_call_id is not None
+                and (not isinstance(raw_call_id, str) or not raw_call_id.strip())
+            ) or (
+                raw_item_id is not None
+                and (not isinstance(raw_item_id, str) or not raw_item_id.strip())
+            ):
+                invalid_tool_call_count += 1
+                continue
+            tool_name = item.get("name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                invalid_tool_call_count += 1
+                continue
+            raw_arguments = item.get("arguments")
+            if raw_arguments is None:
+                raw_arguments = ""
+            if not isinstance(raw_arguments, str):
+                invalid_tool_call_count += 1
+                continue
+            try:
+                arguments = (
+                    json.loads(
+                        raw_arguments,
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(value)
+                        ),
+                    )
+                    if raw_arguments.strip()
+                    else {}
                 )
+            except (
+                json.JSONDecodeError,
+                RecursionError,
+                TypeError,
+                ValueError,
+            ):
+                invalid_tool_call_count += 1
+                continue
+            if not isinstance(arguments, dict):
+                invalid_tool_call_count += 1
+                continue
+            try:
+                json.dumps(arguments, allow_nan=False)
+            except (RecursionError, TypeError, ValueError):
+                invalid_tool_call_count += 1
+                continue
+            call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
+            key = raw_item_id or call_id
+            parsed_tool_arguments[item_index] = (
+                call_id,
+                key,
+                tool_name,
+                raw_arguments,
+                arguments,
+            )
 
         if invalid_output_shape:
             message = "OpenAI Responses API response has malformed output items"
@@ -544,6 +808,11 @@ class OpenAIResponsesProvider:
                     if isinstance(error, dict)
                     else "OpenAI Responses API response failed"
                 )
+                message = redact_upstream_error_text(
+                    message,
+                    api_key=self._api_key,
+                    max_len=2000,
+                )
             elif response_status == "cancelled":
                 code = "response_cancelled"
                 message = "OpenAI Responses API response was cancelled"
@@ -559,10 +828,23 @@ class OpenAIResponsesProvider:
                 code = "invalid_response_status"
                 status = response_status if isinstance(response_status, str) else "missing"
                 message = f"OpenAI Responses API returned invalid status: {status}"
+            code = redact_upstream_error_code(
+                code,
+                api_key=self._api_key,
+            )
+            message = redact_upstream_error_text(
+                message,
+                api_key=self._api_key,
+                max_len=2000,
+            )
             trace.record_error(
                 code=code,
                 message=message,
-                response_body=response.text,
+                response_body=redact_upstream_error_text(
+                    response.text,
+                    api_key=self._api_key,
+                    max_len=4000,
+                ),
                 metadata={"response_status": response_status},
             )
             yield ErrorEvent(message=message, code=code)
@@ -576,10 +858,27 @@ class OpenAIResponsesProvider:
             )
             yield ErrorEvent(message=message, code="incomplete_tool_call")
             return
-        elif emitted_tool:
+        elif emitted_tool or (
+            candidate_artifact is not None and candidate_artifact.has_calls
+        ):
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
+        if candidate_artifact is not None and candidate_artifact.has_calls:
+            artifact_text = candidate_artifact.render_text()
+            if artifact_text:
+                assistant_text_parts.append(artifact_text)
+                yield TextDeltaEvent(text=artifact_text)
+            log.info(
+                "provider.candidate_artifact",
+                provider=self.provider_name,
+                model=self._model,
+                call_count=candidate_artifact.call_count,
+                event_count=candidate_artifact.event_count,
+                char_count=candidate_artifact.char_count,
+                issue_codes=list(candidate_artifact.issue_codes),
+                truncated=False,
+            )
         trace.record_response(
             response=data,
             usage={
@@ -601,6 +900,7 @@ class OpenAIResponsesProvider:
             reasoning_tokens=reasoning_tokens,
             cached_tokens=cached_tokens,
             model=actual_model,
+            provider=self.provider_id,
         )
 
     async def list_models(self, *, raise_on_error: bool = False) -> list[ModelInfo]:
@@ -620,16 +920,19 @@ class OpenAIResponsesProvider:
                 proxy=self._proxy,
             ) as client:
                 response = await client.get(self._api_url("/v1/models"), headers=headers)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             if raise_on_error:
-                raise
+                raise redacted_httpx_error(exc, api_key=self._api_key) from None
             return []
 
         if response.status_code != 200:
             if raise_on_error:
                 # 4xx/5xx raise a classifiable HTTPStatusError; an unexpected
                 # non-200 success shape still degrades to the empty list.
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise redacted_httpx_error(exc, api_key=self._api_key) from None
             return []
         try:
             data = response.json()
@@ -673,6 +976,32 @@ class OpenAIResponsesProvider:
             headers["OpenAI-Organization"] = self._org_id
         endpoint = self._api_url("/v1/responses/compact")
         payload = {"model": self._model, "input": input_items}
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="openai_responses_compact",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=cfg.active_user_message_index,
+        )
+        if budget_decision.action == "budget_limited":
+            raise ProviderRequestBudgetExceededError(budget_decision.proof or {})
+        if budget_decision.action == "invalid_request":
+            raise ValueError("provider_request_serialization_failed")
+        if cfg.provider_request_max_chars <= 0:
+            raise ValueError("provider_request_budget_unbound")
+        payload = budget_decision.payload or payload
+        prove_provider_payload_from_env(
+            payload,
+            projection_adapter="openai_responses_compact",
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=cfg.active_user_message_index,
+        )
+
         trace = LLMTraceRecorder(
             provider="openai_responses",
             model=self._model,
@@ -683,30 +1012,68 @@ class OpenAIResponsesProvider:
         trace.record_request(
             payload=payload,
             headers=headers,
-            metadata={"timeout_seconds": cfg.timeout, "operation": "compact_window"},
+            metadata={
+                "timeout_seconds": cfg.timeout,
+                "operation": "compact_window",
+                "request_proof": budget_decision.proof,
+            },
         )
 
-        async with httpx.AsyncClient(
-            timeout=cfg.timeout,
-            trust_env=_trust_env(),
-            proxy=self._proxy,
-        ) as client:
-            response = await client.post(
-                endpoint,
-                headers=headers,
-                json=payload,
+        try:
+            async with httpx.AsyncClient(
+                timeout=cfg.timeout,
+                trust_env=_trust_env(),
+                proxy=self._proxy,
+            ) as client:
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            message = redact_upstream_error_text(
+                f"Request timed out: {str(exc) or repr(exc)}",
+                api_key=self._api_key,
+                max_len=2000,
             )
+            trace.record_error(
+                code="timeout",
+                message=message,
+                metadata={"operation": "compact_window"},
+            )
+            raise redacted_httpx_error(exc, api_key=self._api_key) from None
+        except httpx.RequestError as exc:
+            message = redact_upstream_error_text(
+                f"Request error: {str(exc) or repr(exc)}",
+                api_key=self._api_key,
+                max_len=2000,
+            )
+            trace.record_error(
+                code="request_error",
+                message=message,
+                metadata={"operation": "compact_window"},
+            )
+            raise redacted_httpx_error(exc, api_key=self._api_key) from None
 
         if response.status_code != 200:
             detail = _http_error_body_text(response.text)
             message = f"OpenAI Responses compact API error {response.status_code}"
             if detail:
                 message = f"{message}: {detail}"
+            message = redact_upstream_error_text(
+                message,
+                api_key=self._api_key,
+                max_len=2000,
+            )
             trace.record_error(
                 code=str(response.status_code),
                 message=message,
                 status_code=response.status_code,
-                response_body=response.text,
+                response_body=redact_upstream_error_text(
+                    response.text,
+                    api_key=self._api_key,
+                    max_len=4000,
+                ),
                 metadata={"operation": "compact_window"},
             )
             raise RuntimeError(message)
@@ -717,7 +1084,11 @@ class OpenAIResponsesProvider:
             trace.record_error(
                 code="invalid_json",
                 message="Invalid JSON response from OpenAI Responses compact API",
-                response_body=response.text,
+                response_body=redact_upstream_error_text(
+                    response.text,
+                    api_key=self._api_key,
+                    max_len=4000,
+                ),
                 metadata={"operation": "compact_window"},
             )
             raise RuntimeError("Invalid JSON response from OpenAI Responses compact API") from exc

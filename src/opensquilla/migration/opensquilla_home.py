@@ -165,6 +165,7 @@ _SQLITE_STORES = (
     Path("state/scheduler.db"),
     Path("state/approval_queue.sqlite"),
     Path("state/sandbox_user_grants.sqlite"),
+    Path("state/channel_delivery.sqlite"),
 )
 _SQLITE_DURABLE_SIDECAR_SUFFIXES = ("-wal",)
 _SQLITE_TRANSIENT_SIDECAR_SUFFIXES = ("-shm",)
@@ -174,6 +175,7 @@ _SQLITE_ALL_SIDECAR_SUFFIXES = (
 )
 _WINDOWS_LOCK_ERROR_CODES = frozenset({32, 33})
 _REPARSE_POINT_ATTRIBUTE = 0x400
+_REPARSE_NAME_SURROGATE_BIT = 0x20000000
 _GATEWAY_AUTHORITY_MAX_BYTES = 64 * 1024
 _JOURNAL_PHASES = frozenset(
     {
@@ -279,10 +281,9 @@ def _path_is_relative_to_lexical(path: Path, root: Path) -> bool:
             result = candidate.lstat()
         except OSError:
             return None
-        attributes = int(getattr(result, "st_file_attributes", 0) or 0)
         if (
             stat.S_ISLNK(result.st_mode)
-            or attributes & _REPARSE_POINT_ATTRIBUTE
+            or _has_reparse_attribute(result)
             or not stat.S_ISDIR(result.st_mode)
         ):
             return None
@@ -978,7 +979,13 @@ def _remove_matching_staging(path: Path, expected: object) -> None:
 
 def _has_reparse_attribute(result: os.stat_result) -> bool:
     attributes = int(getattr(result, "st_file_attributes", 0) or 0)
-    return bool(attributes & _REPARSE_POINT_ATTRIBUTE)
+    if not attributes & _REPARSE_POINT_ATTRIBUTE:
+        return False
+    tag = int(getattr(result, "st_reparse_tag", 0) or 0)
+    # Data-only reparse points (cloud sync placeholders, WOF compression) do
+    # not redirect path resolution; only name surrogates - or an unreadable
+    # tag - stay blocked.
+    return tag == 0 or bool(tag & _REPARSE_NAME_SURROGATE_BIT)
 
 
 def _supported_entry_type(path: Path, result: os.stat_result) -> str:
@@ -2428,8 +2435,13 @@ def enumerate_portable_homes(
     return candidates
 
 
-def detect_desktop_home() -> Path | None:
-    """Return the platform Electron userData home for OpenSquilla, if distinct."""
+def detect_desktop_home(target: Path | None = None) -> Path | None:
+    """Return the platform Electron home when distinct from ``target``.
+
+    ``target`` defaults to the ambient active home for legacy CLI callers.
+    Gateway discovery supplies its config-derived profile home explicitly so a
+    shell environment cannot hide or misclassify the Desktop source.
+    """
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support" / "OpenSquilla"
     elif sys.platform == "win32":  # pragma: no cover - Windows-only path
@@ -2443,7 +2455,8 @@ def detect_desktop_home() -> Path | None:
     candidate = base / "opensquilla"
     if not is_valid_opensquilla_home(candidate):
         return None
-    if _same_path(candidate, default_opensquilla_home()):
+    comparison_target = target or default_opensquilla_home()
+    if _same_path(candidate, comparison_target):
         return None
     return candidate
 
@@ -3052,6 +3065,9 @@ class OpenSquillaMigrationOptions:
     overwrite: bool = False
     #: Test override for the target home; defaults to the active home.
     target: Path | str | None = None
+    #: Internal settings-preview capability. It permits a dry-run to inspect
+    #: the active target while its gateway is running; apply must never use it.
+    allow_running_target_preview: bool = False
 
 
 class OpenSquillaHomeMigrator:
@@ -3121,7 +3137,23 @@ class OpenSquillaHomeMigrator:
     # Entry point
     # ------------------------------------------------------------------
 
+    @property
+    def target_had_real_data(self) -> bool:
+        """Whether pre-flight classified the target as an established profile."""
+
+        return self._target_had_real_data
+
     def migrate(self) -> dict[str, Any]:
+        if self.options.apply and self.options.allow_running_target_preview:
+            self._record(
+                "options",
+                None,
+                self.target,
+                "error",
+                "allow_running_target_preview is valid for dry-run only",
+            )
+            self._blocked = True
+            return self._report()
         if self.kind not in OPENSQUILLA_SOURCE_KINDS:
             self._record(
                 "options",
@@ -3685,7 +3717,7 @@ class OpenSquillaHomeMigrator:
                 "a gateway is running on the source home; stop it and re-run",
             )
             self._blocked = True
-        if target_running:
+        if target_running and not self.options.allow_running_target_preview:
             self._record(
                 "preflight/gateway",
                 self.target,
@@ -3694,7 +3726,15 @@ class OpenSquillaHomeMigrator:
                 "a gateway is running on the target home; stop it and re-run",
             )
             self._blocked = True
-        if not source_running and not target_running:
+        if target_running and self.options.allow_running_target_preview:
+            self._record(
+                "preflight/gateway",
+                self.target,
+                self.target,
+                "skipped",
+                "the active target gateway is allowed for this read-only preview",
+            )
+        elif not source_running and not target_running:
             self._record(
                 "preflight/gateway",
                 source,
@@ -5467,6 +5507,7 @@ class OpenSquillaHomeMigrator:
                     "migrated",
                 )
             self._snapshot_sqlite_stores(staging)
+            self._sanitize_imported_machine_authority(staging)
             self._transform_staged_config(staging)
             self._write_staged_env(staging)
             staged_scheduler = staging / "state" / "scheduler.db"
@@ -5672,6 +5713,83 @@ class OpenSquillaHomeMigrator:
                 "consistent snapshot verified",
             )
 
+    def _sanitize_imported_machine_authority(self, staging: Path) -> None:
+        """Keep portable bookmarks while revoking source-host path authority."""
+
+        sessions_db = staging / "state" / "sessions.db"
+        grants_db = staging / "state" / "sandbox_user_grants.sqlite"
+        try:
+            if sessions_db.is_file():
+                connection = sqlite3.connect(sessions_db)
+                try:
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='project_workspaces'"
+                    ).fetchone()
+                    columns = (
+                        {
+                            str(row[1])
+                            for row in connection.execute(
+                                "PRAGMA table_info(project_workspaces)"
+                            ).fetchall()
+                        }
+                        if table is not None
+                        else set()
+                    )
+                    if "trusted_at" in columns:
+                        connection.execute("UPDATE project_workspaces SET trusted_at=NULL")
+                        connection.commit()
+                    if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                        raise sqlite3.DatabaseError("sessions.db quick_check failed")
+                finally:
+                    connection.close()
+
+            if grants_db.is_file():
+                connection = sqlite3.connect(grants_db)
+                try:
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='sandbox_user_grants'"
+                    ).fetchone()
+                    if table is not None:
+                        connection.execute(
+                            "DELETE FROM sandbox_user_grants WHERE kind='mounts'"
+                        )
+                        connection.commit()
+                    if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                        raise sqlite3.DatabaseError(
+                            "sandbox_user_grants.sqlite quick_check failed"
+                        )
+                finally:
+                    connection.close()
+        except sqlite3.Error as exc:
+            self._record(
+                "security",
+                self.source,
+                self.target,
+                "error",
+                f"could not revoke imported path authority: {exc}",
+            )
+            raise OSError("could not revoke imported path authority") from exc
+
+        legacy_grants = staging / "state" / "sandbox_user_grants.json"
+        if legacy_grants.is_file():
+            try:
+                payload = json.loads(legacy_grants.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload["mounts"] = []
+                _atomic_write_json(legacy_grants, payload)
+            except (OSError, json.JSONDecodeError, TypeError) as exc:
+                self._record(
+                    "security",
+                    self.source,
+                    self.target,
+                    "error",
+                    f"could not revoke imported legacy path authority: {exc}",
+                )
+                raise OSError("could not revoke imported legacy path authority") from exc
+
     def _transform_staged_config(self, staging: Path) -> None:
         staged_config = staging / "config.toml"
         if not staged_config.is_file():
@@ -5682,7 +5800,7 @@ class OpenSquillaHomeMigrator:
         if payload is None or original_payload is None or source_bytes is None:
             raise OSError("validated source config is unavailable")
         try:
-            from opensquilla.migration.lossless_toml import patch_import_config
+            from opensquilla.lossless_toml import patch_import_config
 
             patched = patch_import_config(source_bytes, original_payload, payload)
             staged_config.write_bytes(patched)

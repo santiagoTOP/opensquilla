@@ -80,6 +80,7 @@ class RpcContext:
     subscription_manager: Any = None  # SubscriptionManager for session-scoped events
     channel_manager: Any = None  # ChannelManager | None (injected at boot)
     usage_tracker: Any = None  # UsageTracker instance (injected at boot)
+    usage_event_sink: Any = None  # Durable per-provider-call accounting sink.
     meta_run_writer: Any = None  # MetaRunWriter instance (injected at boot)
     skill_loader: Any = None  # SkillLoader instance (injected at boot)
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
@@ -91,6 +92,7 @@ class RpcContext:
     agent_registry: Any = None  # AgentRegistry instance (injected at boot)
     diagnostics_state: Any = None  # DiagnosticsState instance (injected at boot)
     provider_stats: Any = None  # ProviderStatsStore instance (injected at boot)
+    profile_import_service: Any = None  # Optional injected service/factory for profile import.
     memory_managers: dict[str, Any] = field(default_factory=dict)
     memory_stores: dict[str, Any] = field(default_factory=dict)
     memory_retrievers: dict[str, Any] = field(default_factory=dict)
@@ -259,16 +261,21 @@ class RpcRegistry:
         except RpcUnavailableError as exc:
             return make_error_res(req_id, ERROR_UNAVAILABLE, str(exc), retryable=True)
         except StorageBusyError as exc:
+            details: dict[str, Any] = {
+                "operation": exc.operation,
+                "waited_ms": exc.waited_ms,
+            }
+            if exc.stage is not None:
+                details["stage"] = exc.stage
+            if exc.resource is not None:
+                details["resource"] = exc.resource
             return make_error_res(
                 req_id,
                 "STORAGE_BUSY",
                 "Session storage is temporarily busy. Retry this operation.",
                 retryable=True,
                 retry_after_ms=exc.retry_after_ms,
-                details={
-                    "operation": exc.operation,
-                    "waited_ms": exc.waited_ms,
-                },
+                details=details,
             )
         except ValueError as exc:
             return make_error_res(req_id, "INVALID_REQUEST", str(exc))

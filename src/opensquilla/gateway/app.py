@@ -17,6 +17,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from opensquilla import __version__
+from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.control_ui import create_control_ui_routes
@@ -25,6 +26,7 @@ from opensquilla.gateway.middleware import (
     ErrorHandlingMiddleware,
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
+    UnsafeOriginGuardMiddleware,
 )
 from opensquilla.gateway.origin_guard import (
     extract_http_token,
@@ -40,14 +42,31 @@ log = structlog.get_logger(__name__)
 _start_time = time.time()
 
 
+def _human_actionable_approvals(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exclude internal automatic reviews from operator approval surfaces."""
+
+    return [
+        item
+        for item in pending
+        if not (
+            isinstance(item.get("params"), dict)
+            and item["params"].get("humanActionable") is False
+        )
+    ]
+
+
 def create_gateway_app(
     config: GatewayConfig,
     session_manager: Any = None,
     provider_selector: Any = None,
     tool_registry: Any = None,
     subscription_manager: Any = None,
+    # May be a manager instance OR a zero-arg callable resolving to one:
+    # live channel reconcile can create the manager after boot, so contexts
+    # must re-resolve it per request instead of freezing the boot-time value.
     channel_manager: Any = None,
     usage_tracker: Any = None,
+    usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
     cron_scheduler: Any = None,
@@ -71,6 +90,9 @@ def create_gateway_app(
         diagnostics_state = DiagnosticsState.from_config(config)
 
     dispatcher = get_dispatcher()
+
+    def _resolve_channel_manager() -> Any:
+        return channel_manager() if callable(channel_manager) else channel_manager
 
     def _rpc_status_code(result: Any, default: int = 500) -> int:
         if result.error is None:
@@ -367,8 +389,9 @@ def create_gateway_app(
             provider_selector=provider_selector,
             tool_registry=tool_registry,
             subscription_manager=subscription_manager,
-            channel_manager=channel_manager,
+            channel_manager=_resolve_channel_manager(),
             usage_tracker=usage_tracker,
+            usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
             cron_scheduler=cron_scheduler,
@@ -405,6 +428,46 @@ def create_gateway_app(
         msg = result.error.message if result.error else "error"
         return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
 
+    async def api_channel_pairings(request: Request) -> JSONResponse:
+        ctx = _make_ctx(request)
+        result = await dispatcher.dispatch(
+            "_http",
+            "channels.pairings",
+            {"channelName": request.query_params.get("channelName", "")},
+            ctx,
+        )
+        if result.ok:
+            return JSONResponse(result.payload or {"pairings": []})
+        msg = result.error.message if result.error else "error"
+        return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
+
+    async def _api_channel_pairing_mutation(
+        request: Request,
+        method: str,
+    ) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        ctx = _make_ctx(request)
+        result = await dispatcher.dispatch("_http", method, body, ctx)
+        if result.ok:
+            return JSONResponse(result.payload or {"ok": True})
+        msg = result.error.message if result.error else "error"
+        return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
+
+    async def api_channel_pairing_approve(request: Request) -> JSONResponse:
+        return await _api_channel_pairing_mutation(
+            request,
+            "channels.pairing.approve",
+        )
+
+    async def api_channel_pairing_revoke(request: Request) -> JSONResponse:
+        return await _api_channel_pairing_mutation(
+            request,
+            "channels.pairing.revoke",
+        )
+
     async def api_approvals(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "exec.approvals.get", None, ctx)
@@ -416,35 +479,8 @@ def create_gateway_app(
         settings = result.payload or {}
         mode = settings.get("mode", "prompt")
         queue = get_approval_queue()
-        pending = queue.list_pending()
-        # Enrich pending items with params fields for UI display
-        items = []
-        for p in pending:
-            item = {
-                "id": p["id"],
-                "namespace": p["namespace"],
-                "created_at": p.get("created_at"),
-                "deadline": p.get("deadline"),
-            }
-            params = p.get("params", {})
-            argv = params.get("argv")
-            command = params.get("command")
-            if not command and isinstance(argv, list):
-                command = " ".join(str(part) for part in argv)
-            item["toolName"] = params.get(
-                "toolName",
-                params.get("pluginId", params.get("action_kind", "Unknown")),
-            )
-            item["sessionKey"] = params.get("sessionKey", params.get("session_id", ""))
-            item["agent"] = params.get("agent", "")
-            item["args"] = params.get("args", params.get("permissions"))
-            item["command"] = command or ""
-            item["warning"] = params.get("warning", params.get("reason", ""))
-            item["actionKind"] = params.get("action_kind", "")
-            item["argv"] = argv if isinstance(argv, list) else []
-            item["mode"] = params.get("mode", mode)
-            item["params"] = params
-            items.append(item)
+        pending = _human_actionable_approvals(queue.list_pending())
+        items = [build_approval_snapshot_item(item, default_mode=mode) for item in pending]
         return JSONResponse(
             {
                 "pending": items,
@@ -609,8 +645,9 @@ def create_gateway_app(
             provider_selector=provider_selector,
             tool_registry=tool_registry,
             subscription_manager=subscription_manager,
-            channel_manager=channel_manager,
+            channel_manager=_resolve_channel_manager,
             usage_tracker=usage_tracker,
+            usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
             cron_scheduler=cron_scheduler,
@@ -629,8 +666,13 @@ def create_gateway_app(
 
     # ── Routes ───────────────────────────────────────────────────────────────
 
+    root_routes = (
+        []
+        if config.control_ui.enabled and config.control_ui.base_path == "/"
+        else [Route("/", root, methods=["GET"])]
+    )
     routes = [
-        Route("/", root, methods=["GET"]),
+        *root_routes,
         Route("/health", health, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/ready", ready, methods=["GET"]),
@@ -649,6 +691,17 @@ def create_gateway_app(
         Route("/api/usage", api_usage, methods=["GET"]),
         Route("/api/channels/status", api_channels_status, methods=["GET"]),
         Route("/api/channels/logout", _same_origin(api_channels_logout), methods=["POST"]),
+        Route("/api/channels/pairings", api_channel_pairings, methods=["GET"]),
+        Route(
+            "/api/channels/pairings/approve",
+            _same_origin(api_channel_pairing_approve),
+            methods=["POST"],
+        ),
+        Route(
+            "/api/channels/pairings/revoke",
+            _same_origin(api_channel_pairing_revoke),
+            methods=["POST"],
+        ),
         Route("/api/approvals", api_approvals, methods=["GET"]),
         Route("/api/approvals/settings", _same_origin(api_approvals_settings), methods=["POST"]),
         Route("/api/approvals/resolve", _same_origin(api_approvals_resolve), methods=["POST"]),
@@ -660,30 +713,28 @@ def create_gateway_app(
     if extra_routes:
         routes.extend(extra_routes)
 
-    # ── Control UI routes ────────────────────────────────────────────────
-    routes.extend(create_control_ui_routes(config))
-
     # ── Middleware ───────────────────────────────────────────────────────────
 
-    middleware = [Middleware(ErrorHandlingMiddleware)]
-    if config.cors.allowed_origins:
+    middleware = [
+        Middleware(ErrorHandlingMiddleware),
+        Middleware(UnsafeOriginGuardMiddleware, config=config),
+    ]
+    exact_cors_origins = [
+        origin for origin in config.cors.allowed_origins if origin != "*"
+    ]
+    if "*" in config.cors.allowed_origins:
+        log.warning(
+            "gateway.cors_wildcard_ignored",
+            category="cors_wildcard_not_permitted",
+        )
+    if exact_cors_origins:
         # CORS headers are opt-in: the default empty list installs no CORS
         # middleware at all, so browsers refuse cross-origin reads. The Web UI
         # is same-origin and non-browser clients never need CORS.
-        if "*" in config.cors.allowed_origins and config.cors.allow_credentials:
-            log.warning(
-                "gateway.cors_wildcard_with_credentials",
-                detail=(
-                    "cors.allowed_origins contains '*' with allow_credentials "
-                    "enabled, which lets any website the browser visits read "
-                    "authenticated gateway responses — list explicit origins "
-                    "instead."
-                ),
-            )
         middleware.append(
             Middleware(
                 CORSMiddleware,
-                allow_origins=config.cors.allowed_origins,
+                allow_origins=exact_cors_origins,
                 allow_credentials=config.cors.allow_credentials,
                 allow_methods=config.cors.allowed_methods,
                 allow_headers=config.cors.allowed_headers,
@@ -692,7 +743,11 @@ def create_gateway_app(
     middleware.extend(
         [
             Middleware(RateLimitMiddleware, config=config),
-            Middleware(SecurityHeadersMiddleware, path_prefix=config.control_ui.base_path),
+            Middleware(
+                SecurityHeadersMiddleware,
+                path_prefix=config.control_ui.base_path,
+                enabled=config.control_ui.enabled,
+            ),
             Middleware(AuthMiddleware, config=config),
         ]
     )
@@ -754,9 +809,22 @@ def create_gateway_app(
         config=config,
         session_manager=session_manager,
     )
+    from opensquilla.gateway.artifact_preview import (  # noqa: PLC0415
+        register_artifact_preview_routes,
+    )
+
+    app.state.artifact_preview_service = register_artifact_preview_routes(
+        app,
+        config=config,
+        session_manager=session_manager,
+    )
     register_audio_transcription_routes(app, config=config)
     from opensquilla.gateway.bundle_routes import register_bundle_routes  # noqa: PLC0415
 
     register_bundle_routes(app, config=config)
+
+    # Keep the SPA catch-all last.  This is required when the Control UI is
+    # mounted at "/" so dynamically registered API routes are still reachable.
+    app.router.routes.extend(create_control_ui_routes(config))
 
     return app

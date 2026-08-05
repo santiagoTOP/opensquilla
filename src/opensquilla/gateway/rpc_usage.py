@@ -6,7 +6,14 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
+from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.usage_query import UsageQueryValidationError, query_usage_ledger
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
@@ -299,10 +306,19 @@ def _usage_row(
     }
 
 
-def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
+def _tracker_rows(
+    ctx: RpcContext,
+    *,
+    now_ms: int,
+    session_key: str | None = None,
+) -> list[dict[str, Any]]:
     if ctx.usage_tracker is None:
         return []
-    all_sessions = ctx.usage_tracker.all_sessions()
+    if session_key is not None:
+        usage = ctx.usage_tracker.get(session_key)
+        all_sessions = {session_key: usage} if usage is not None else {}
+    else:
+        all_sessions = ctx.usage_tracker.all_sessions()
     if not all_sessions:
         return []
 
@@ -332,7 +348,15 @@ def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
         usage_cost_source = str(
             getattr(usage, "cost_source", "opensquilla_estimate") or "opensquilla_estimate"
         )
-        if usage_billed > 0:
+        provider_billed_entries = max(
+            0,
+            int(getattr(usage, "provider_billed_entries", 0) or 0),
+        )
+        has_billed_receipt = (
+            provider_billed_entries > 0
+            or usage_cost_source in {"provider_billed", "mixed"}
+        )
+        if has_billed_receipt:
             # Real billed available — surface the mixed total (billed +
             # estimate-fallback for any unbilled model) as the row's
             # canonical cost so it matches the breakdown sum exactly.
@@ -359,6 +383,7 @@ def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
             updated_at=now_ms,
         )
         row["modelBreakdown"] = getattr(usage, "model_breakdown", [])
+        row["deploymentBreakdown"] = getattr(usage, "deployment_breakdown", [])
         rows.append(row)
     return rows
 
@@ -559,6 +584,12 @@ def _append_tracker_only_rows(
             and not row.get("modelBreakdown")
         ):
             row["modelBreakdown"] = tracker_row["modelBreakdown"]
+        if (
+            tracker_row
+            and tracker_row.get("deploymentBreakdown")
+            and not row.get("deploymentBreakdown")
+        ):
+            row["deploymentBreakdown"] = tracker_row["deploymentBreakdown"]
         if tracker_row and _row_can_overlay_tracker_totals(row, tracker_row):
             _overlay_tracker_totals(row, tracker_row)
         _reconcile_breakdown_to_row(row)
@@ -581,7 +612,18 @@ def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int | float]:
 @_d.method("usage.status", scope="operator.read")
 async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     now_ms = _now_ms()
-    tracker_rows = _tracker_rows(ctx, now_ms=now_ms)
+    requested_session_key = None
+    if isinstance(params, Mapping):
+        raw_requested_session_key = (
+            params.get("sessionKey") or params.get("session_key") or params.get("key")
+        )
+        if isinstance(raw_requested_session_key, str) and raw_requested_session_key.strip():
+            requested_session_key = raw_requested_session_key.strip()
+    tracker_rows = _tracker_rows(
+        ctx,
+        now_ms=now_ms,
+        session_key=requested_session_key,
+    )
 
     if ctx.session_manager is None:
         totals = _usage_totals(tracker_rows)
@@ -596,13 +638,20 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
             "totalCacheWriteTokens": totals["cache_write"],
             "sessions": tracker_rows,
         }
+
     try:
-        requested_session_key = None
-        if isinstance(params, Mapping):
-            requested_session_key = (
-                params.get("sessionKey") or params.get("session_key") or params.get("key")
-            )
-        sessions = await ctx.session_manager.list_sessions()
+        get_session = getattr(ctx.session_manager, "get_session", None)
+        if requested_session_key is not None and callable(get_session):
+            requested_session = await get_session(requested_session_key)
+            sessions = [requested_session] if requested_session is not None else []
+        else:
+            sessions = await ctx.session_manager.list_sessions()
+            if requested_session_key is not None:
+                sessions = [
+                    session
+                    for session in sessions
+                    if _field(session, "session_key", "") == requested_session_key
+                ]
         rows = []
         active = sum(1 for s in sessions if _field(s, "status", "") == "running")
         for s in sessions:
@@ -673,6 +722,26 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
             "totalCacheWriteTokens": totals["cache_write"],
             "sessions": tracker_rows,
         }
+
+
+@_d.method("usage.query", scope="operator.read")
+async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Aggregate timestamped usage events for one explicit calendar range.
+
+    This is intentionally additive.  ``usage.status`` and ``usage.cost`` keep
+    their session-lifetime wire contracts for older clients while new clients
+    opt in after discovering this method in the WebSocket hello payload.
+    """
+
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Durable usage accounting is not configured")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None or not hasattr(storage, "query_usage_events"):
+        raise RpcUnavailableError("Durable usage accounting is not available")
+    try:
+        return await query_usage_ledger(storage, params)
+    except UsageQueryValidationError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
 
 
 @_d.method("usage.cost", scope="operator.read")

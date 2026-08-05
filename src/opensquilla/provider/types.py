@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opensquilla.execution_status import ExecutionStatus
@@ -70,6 +70,24 @@ class ToolUseEndEvent:
     synthetic_from_text: bool = False
 
 
+@dataclass(frozen=True)
+class ProviderBillingReceipt:
+    """Provider-native billing receipt attached to one physical request.
+
+    Amounts use integer nanos so adapters can preserve an upstream bill without
+    routing it through binary floating-point arithmetic. ``billed_cost`` on the
+    enclosing :class:`DoneEvent` remains the canonical USD-compatible value for
+    existing callers.
+    """
+
+    currency: str
+    status: Literal["confirmed", "pending"]
+    amount_nanos: int | None
+    usd_equivalent_nanos: int | None
+    fx_native_per_usd_nanos: int
+    schema_version: int = 1
+
+
 @dataclass
 class DoneEvent:
     """Stream finished successfully."""
@@ -90,6 +108,16 @@ class DoneEvent:
     cost_source: str = "none"
     model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
     ensemble_trace: dict[str, Any] | None = None
+    # Number of physical ensemble legs that ended without a usage receipt.
+    # Appended for source compatibility with positional constructors.
+    usage_missing_count: int = 0
+    # Configured registry identity serving this response.  Appended for
+    # positional-construction compatibility; generic adapters default it to
+    # their family identity when constructed outside a selector.
+    provider: str = ""
+    # Provider-native receipt for this physical request. Ensemble envelopes do
+    # not carry a synthetic receipt; their physical breakdown rows do.
+    billing_receipt: ProviderBillingReceipt | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -115,6 +143,26 @@ class ProviderMessageCountProjection:
     provider_kind: str = ""
     model: str = ""
     base_host: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderFinalRequestProjection:
+    """Pure admission evidence for one adapter's exact outbound payload.
+
+    ``payload`` is retained so tests and higher-level admission coordinators
+    can prove that projection and transport use the same envelope.  It is
+    deliberately excluded from ``repr`` because provider requests may contain
+    user content.  ``fits_message_count`` is ``None`` when the adapter has no
+    authoritative message limit; the exact wire count remains available
+    without pretending that an unknown limit was proved.
+    """
+
+    payload: dict[str, Any] = field(repr=False, compare=False)
+    proof: dict[str, Any]
+    wire_message_count: int
+    message_limit: int | None
+    fits_message_count: bool | None
+    fits: bool
 
 
 @dataclass(frozen=True)
@@ -148,6 +196,11 @@ class ErrorEvent:
     # source-compatible.  Only populated when an adapter has exact structured
     # evidence for a provider request limit.
     message_limit_proof: ProviderMessageLimitProof | None = None
+    # Ensemble wrappers may have consumed billable legs before the terminal
+    # failure.  Carry their known receipts so outer accounting can finalize a
+    # partial envelope instead of discarding it as wholly unknown.
+    model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    usage_missing_count: int = 0
 
 
 @dataclass
@@ -222,7 +275,13 @@ StreamEvent = (
 # Tool definition (Pydantic BaseModel — external API boundary)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
+from pydantic import (  # noqa: E402
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 
 class ToolParam(BaseModel):
@@ -277,11 +336,54 @@ class ModelInfo(BaseModel):
     supports_vision: bool = False
     input_cost_per_1k: float = 0.0
     output_cost_per_1k: float = 0.0
+    # Additive, normalized provider facts for discovery/RPC projection.
+    # Never contains an upstream raw row. Providers without a typed metadata
+    # contract leave it as None.
+    metadata: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_absent_metadata(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ):
+        """Preserve the pre-metadata dump shape on every supported Pydantic 2.x."""
+        serialized = cast(dict[str, Any], handler(self))
+        if self.metadata is None:
+            serialized.pop("metadata", None)
+        return serialized
 
 
 # ---------------------------------------------------------------------------
 # Chat config (Pydantic BaseModel — call-time settings)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestCorrelation:
+    """Opaque request identities exposed only to trusted provider transports."""
+
+    session_id: str
+    turn_id: str
+    execution_id: str
+    call_kind: str
+
+
+def derive_provider_request_correlation(
+    correlation: ProviderRequestCorrelation | None,
+    *,
+    execution_id: str | None = None,
+    call_kind: str | None = None,
+) -> ProviderRequestCorrelation | None:
+    """Derive one physical-call identity without changing its session or root turn."""
+
+    if correlation is None:
+        return None
+    updates: dict[str, str] = {}
+    if execution_id is not None:
+        updates["execution_id"] = execution_id
+    if call_kind is not None:
+        updates["call_kind"] = call_kind
+    return replace(correlation, **updates) if updates else correlation
 
 
 class ChatConfig(BaseModel):
@@ -299,15 +401,71 @@ class ChatConfig(BaseModel):
     # Prompt caching: when set, system prompt is split into cached/dynamic blocks
     cache_breakpoints: list[dict[str, str]] | None = None
     cache_mode: Literal["off", "auto", "on"] = "off"
+    output_json_schema: dict[str, Any] | None = None
+    output_json_schema_strict: bool = True
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    # Runtime-only provenance for an explicit global
+    # ``llm.context_window_tokens`` override. Selector fallback must resolve the
+    # new physical model with this same operator setting; zero means the active
+    # window came from per-model/catalog/default resolution and may be rebound.
+    context_window_tokens_global_override: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
+    # Preserve the operator-owned portion of ``provider_request_max_chars``
+    # separately from the cap derived for one physical deployment.  Selector
+    # fallback may replace a derived cap when it rebinds to a different
+    # context window, but it must never enlarge an explicit caller limit.
+    provider_request_max_chars_explicit_cap: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    # Index of the real active user request in the final logical ``messages``
+    # list.  Provider wrappers may append synthetic user-role context (for
+    # example an ensemble candidate bundle); carrying the anchor separately
+    # prevents request compaction from protecting the synthetic message while
+    # rewriting the user's actual prompt.
+    active_user_message_index: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
     tool_choice: Any | None = None
+    candidate_output_mode: Literal["normal", "inert_artifact"] = Field(
+        default="normal",
+        exclude=True,
+        repr=False,
+    )
+    # Runtime-only bound for adapter-internal physical transport attempts.
+    # Zero preserves each adapter's compatibility behavior; auxiliary
+    # compaction binds this to one so its operation-level two-call cap is real.
+    physical_attempt_limit: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
+    provider_request_correlation: ProviderRequestCorrelation | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
 
     def model_post_init(self, __context: Any) -> None:
         if self.thinking_budget_explicit is None:
             self.thinking_budget_explicit = (
                 "thinking_budget_tokens" in self.model_fields_set
+            )
+        if self.provider_request_max_chars_explicit_cap is None:
+            self.provider_request_max_chars_explicit_cap = (
+                max(0, int(self.provider_request_max_chars or 0))
+                if "provider_request_max_chars" in self.model_fields_set
+                else 0
             )
 
 
