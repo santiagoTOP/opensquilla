@@ -103,6 +103,7 @@ from opensquilla.engine.hooks import (
 from opensquilla.engine.outcome import outcome_from_error, turn_outcome_details
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import PriceEntry, lookup_price
+from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.route_plan import record_execution_leg
 from opensquilla.engine.router_decision import build_router_decision_event
 from opensquilla.engine.turn_policy import resolve_turn_policy
@@ -229,8 +230,8 @@ from opensquilla.router_control import (
     render_router_control_prompt_block,
 )
 from opensquilla.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
+from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
-from opensquilla.sandbox.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
@@ -270,6 +271,7 @@ from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     sanitize_agent_error,
 )
+from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 from opensquilla.token_estimation import estimate_tokens
 from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
@@ -289,7 +291,7 @@ _DEFAULT_AGENT_RUNTIME_TIMEOUT_SECONDS: float = 48 * 60 * 60
 _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS: float = 120.0
 _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
 _WEB_CHAT_META_EXEMPT_KEYS: Final[frozenset[str]] = frozenset(
-    {"meta_match", "meta_launch", "meta_resume"}
+    {"meta_match", "meta_launch", "meta_resume", "meta_replay", "meta_replay_error"}
 )
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
@@ -3011,6 +3013,10 @@ class TurnRunner:
         turn_error_writer: Any | None = None,
         provider_call_observer: Callable[..., None] | None = None,
         usage_event_sink: UsageEventSink | None = None,
+        prompt_cache_keepalive_recorder: (
+            Callable[[PromptCacheKeepaliveCandidate], None] | None
+        ) = None,
+        prompt_cache_keepalive_armed: Callable[[str], bool] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -3028,6 +3034,8 @@ class TurnRunner:
         self._meta_run_writer = meta_run_writer
         self._turn_error_writer = turn_error_writer
         self._usage_event_sink = usage_event_sink
+        self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
+        self._prompt_cache_keepalive_armed = prompt_cache_keepalive_armed
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.
         self._usage_session_epoch_by_key: dict[str, int] = {}
@@ -3451,6 +3459,17 @@ class TurnRunner:
         """Replace the lock provider at the gateway composition root."""
         self._session_lock_provider = provider
 
+    def set_prompt_cache_keepalive_recorder(
+        self,
+        recorder: Callable[[PromptCacheKeepaliveCandidate], None] | None,
+        *,
+        armed: Callable[[str], bool] | None = None,
+    ) -> None:
+        """Install the gateway's storage-free candidate recorder."""
+
+        self._prompt_cache_keepalive_recorder = recorder
+        self._prompt_cache_keepalive_armed = armed
+
     @contextlib.asynccontextmanager
     async def _session_write_context(self, session_key: str) -> AsyncIterator[None]:
         lock = self.get_session_lock(session_key)
@@ -3548,6 +3567,7 @@ class TurnRunner:
                 else None
             ),
         )
+        configured_state_dir = getattr(self._turn_config(), "state_dir", None)
         # Planning is deliberately ephemeral analysis: it may inspect durable
         # memory, but the planning conversation itself must not be harvested
         # into long-lived memory. The frozen collaboration mode is authoritative
@@ -3566,51 +3586,7 @@ class TurnRunner:
         if _caller_holds_lock:
             # Same call chain already serializes this turn.
             try:
-                async for event in self._run_turn(
-                    message,
-                    session_key,
-                    agent_id,
-                    model,
-                    attachments or [],
-                    effective_tool_context,
-                    timeout=timeout,
-                    max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
-                    request_timeout=request_timeout,
-                    max_provider_retries=max_provider_retries,
-                    length_capped_continuations=length_capped_continuations,
-                    input_mode=input_mode,
-                    persist_input=persist_input,
-                    input_provenance=normalized_input_provenance,
-                    history_has_persisted_user=history_has_persisted_user,
-                    fresh_user_session=fresh_user_session,
-                    session_intent=session_intent,
-                    semantic_message=semantic_message,
-                    pending_input_provider=pending_input_provider,
-                    run_kind=run_kind,
-                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                    bootstrap_context_mode=bootstrap_context_mode,
-                    no_memory_capture=no_memory_capture,
-                    ingress_pipeline_steps=ingress_pipeline_steps,
-                    router_control_replay_depth=router_control_replay_depth,
-                    bound_user_message_id=bound_user_message_id,
-                    assistant_message_sink=assistant_message_sink,
-                    root_turn_id=root_turn_id,
-                    provider_request_correlation=provider_request_correlation,
-                ):
-                    yield event
-            finally:
-                self.clear_compaction_turn_state(session_key)
-        else:
-            async with lock:
-                # Record this Task as the lock owner in the ContextVar so that
-                # any nested call to run() within the same Task can detect re-entry.
-                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
-                if current_task is not None:
-                    _map[id(lock)] = current_task
-                _token = _SESSION_LOCK_OWNER.set(_map)
-                try:
+                with managed_toolchain_state_scope(configured_state_dir):
                     async for event in self._run_turn(
                         message,
                         session_key,
@@ -3645,6 +3621,52 @@ class TurnRunner:
                         provider_request_correlation=provider_request_correlation,
                     ):
                         yield event
+            finally:
+                self.clear_compaction_turn_state(session_key)
+        else:
+            async with lock:
+                # Record this Task as the lock owner in the ContextVar so that
+                # any nested call to run() within the same Task can detect re-entry.
+                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
+                if current_task is not None:
+                    _map[id(lock)] = current_task
+                _token = _SESSION_LOCK_OWNER.set(_map)
+                try:
+                    with managed_toolchain_state_scope(configured_state_dir):
+                        async for event in self._run_turn(
+                            message,
+                            session_key,
+                            agent_id,
+                            model,
+                            attachments or [],
+                            effective_tool_context,
+                            timeout=timeout,
+                            max_iterations=max_iterations,
+                            iteration_timeout=iteration_timeout,
+                            tool_timeout=tool_timeout,
+                            request_timeout=request_timeout,
+                            max_provider_retries=max_provider_retries,
+                            length_capped_continuations=length_capped_continuations,
+                            input_mode=input_mode,
+                            persist_input=persist_input,
+                            input_provenance=normalized_input_provenance,
+                            history_has_persisted_user=history_has_persisted_user,
+                            fresh_user_session=fresh_user_session,
+                            session_intent=session_intent,
+                            semantic_message=semantic_message,
+                            pending_input_provider=pending_input_provider,
+                            run_kind=run_kind,
+                            heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                            bootstrap_context_mode=bootstrap_context_mode,
+                            no_memory_capture=no_memory_capture,
+                            ingress_pipeline_steps=ingress_pipeline_steps,
+                            router_control_replay_depth=router_control_replay_depth,
+                            bound_user_message_id=bound_user_message_id,
+                            assistant_message_sink=assistant_message_sink,
+                            root_turn_id=root_turn_id,
+                            provider_request_correlation=provider_request_correlation,
+                        ):
+                            yield event
                 finally:
                     self.clear_compaction_turn_state(session_key)
                     _SESSION_LOCK_OWNER.reset(_token)
@@ -3988,6 +4010,42 @@ class TurnRunner:
             )
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            keepalive_capture_enabled = False
+            if (
+                self._prompt_cache_keepalive_recorder is not None
+                and self._prompt_cache_keepalive_armed is not None
+            ):
+                try:
+                    keepalive_capture_enabled = bool(
+                        self._prompt_cache_keepalive_armed(session_key)
+                    )
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_arm_check_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+            capture_setter = getattr(
+                agent,
+                "set_prompt_cache_keepalive_capture_enabled",
+                None,
+            )
+            if callable(capture_setter):
+                try:
+                    capture_setter(keepalive_capture_enabled)
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    keepalive_capture_enabled = False
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_capture_setup_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+            elif keepalive_capture_enabled:
+                keepalive_capture_enabled = False
+                log.warning(
+                    "turn_runner.prompt_cache_keepalive_capture_unavailable",
+                    session_key=session_key,
+                )
             agent_config = ab_out.agent_config
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
@@ -4640,6 +4698,34 @@ class TurnRunner:
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
+            if (
+                fin_out.transcript_appended
+                and not error_message
+                and self._prompt_cache_keepalive_recorder is not None
+            ):
+                candidate_getter = getattr(
+                    agent,
+                    "prompt_cache_keepalive_candidate",
+                    None,
+                )
+                try:
+                    candidate = candidate_getter() if callable(candidate_getter) else None
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    candidate = None
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_candidate_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+                if candidate is not None:
+                    try:
+                        self._prompt_cache_keepalive_recorder(candidate)
+                    except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                        log.warning(
+                            "turn_runner.prompt_cache_keepalive_record_failed",
+                            session_key=session_key,
+                            exc_info=True,
+                        )
             if (
                 fin_out.transcript_appended
                 and fin_out.assistant_message_content is not None
@@ -5999,7 +6085,7 @@ class TurnRunner:
                 normalized_run_mode = None
             if normalized_run_mode is not None:
                 lines = [f"Run mode: {display_name(normalized_run_mode)}"]
-                if normalized_run_mode is RunMode.TRUSTED:
+                if normalized_run_mode is RunMode.SAFE:
                     lines.extend(
                         [
                             "Default execution target: sandbox",
@@ -6822,6 +6908,14 @@ class TurnRunner:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
+        from opensquilla.skills.meta.readiness import (
+            META_READINESS_ENV_ALIASES_METADATA_KEY,
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
+            configured_meta_readiness_env_aliases,
+            configured_meta_skill_runtime_env,
+        )
+
+        turn_config = self._turn_config()
         initial_metadata: dict[str, Any] = {
             # Agent-side skill_view coercion, meta execution, and child
             # orchestrators must resolve against the same generation used for
@@ -6859,6 +6953,31 @@ class TurnRunner:
                     )
                     if tool_context is not None
                     else ""
+                )
+            ),
+            # Opaque callable only: credential bytes never enter metadata,
+            # transcripts, persisted inputs, or manifest-rendered arguments.
+            # The Agent must supply the current parent spec and the exact plan
+            # it is about to execute; the callable fails closed for any
+            # workspace/project parent or paid-step contract drift.
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY: (
+                lambda parent_spec, plan: configured_meta_skill_runtime_env(
+                    turn_config,
+                    parent_spec=parent_spec,
+                    plan=plan,
+                    session_key=session_key,
+                    skill_resolver=agent_skill_loader,
+                )
+            ),
+            # Names only, likewise parent+plan scoped. A global alias would
+            # make an untrusted MetaSkill appear executable even though no
+            # capability lease could safely be injected into its child.
+            META_READINESS_ENV_ALIASES_METADATA_KEY: (
+                lambda parent_spec, plan: configured_meta_readiness_env_aliases(
+                    turn_config,
+                    parent_spec=parent_spec,
+                    plan=plan,
+                    skill_resolver=agent_skill_loader,
                 )
             ),
         }
@@ -6964,7 +7083,7 @@ class TurnRunner:
         turn = TurnContext(
             message=message,
             session_key=session_key,
-            config=self._turn_config(),
+            config=turn_config,
             provider=provider,
             model="",
             tool_defs=tool_defs,

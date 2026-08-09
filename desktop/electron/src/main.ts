@@ -2,7 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, prot
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
+import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
@@ -51,6 +51,7 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
   GITHUB_UPDATE_OWNER,
   GITHUB_UPDATE_REPO,
@@ -107,6 +108,13 @@ import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import {
+  buildRendererConsoleLogEntry,
+  buildRendererGoneLogEntry,
+  buildRendererStateLogEntry,
+  RendererConsoleLogLimiter,
+} from './desktop-renderer-log.js'
+import { appendDesktopLogRecord } from './desktop-log-file.js'
 import {
   ArtifactPreviewLeaseBroker,
 } from './artifact-preview-lease-broker.js'
@@ -244,17 +252,24 @@ interface DesktopPreferencesPayload {
   mainWindowCloseBehavior?: unknown
   workbenchPreviewMode?: unknown
   workbenchPreviewNoticeShown?: unknown
+  sandboxUnavailableWarningSuppressed?: unknown
 }
 
 interface DesktopPreferencesSnapshot {
-  schemaVersion: 2
+  schemaVersion: 3
   mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
   workbenchPreviewMode: DesktopWorkbenchPreviewMode
   effectiveWorkbenchPreviewMode: DesktopWorkbenchPreviewMode
   workbenchPreviewNoticeShown: boolean
+  sandboxUnavailableWarningSuppressed: boolean
   workbenchPreviewForcedOffline: boolean
   canRunInBackground: boolean
   platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
+interface SandboxUnavailablePayload {
+  state: 'failed' | 'unavailable'
+  message?: string
 }
 
 interface RuntimeLaunch {
@@ -367,6 +382,7 @@ let desktopPreferencesCache: {
   writable: boolean
 } | null = null
 let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
+let sandboxUnavailableWarningShownThisLaunch = false
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
@@ -417,14 +433,16 @@ let allowGracefulShutdownWhileQuitting = false
 // Main-process lifecycle log (distinct from the gateway child's gateway.log).
 // Records launch, single-instance-lock acquisition, and quit phases so a
 // "second launch does nothing" report (issue #446) is diagnosable from a user
-// machine. Synchronous append: these events are rare and must survive an
-// imminent app.exit().
+// machine. Synchronous append: lifecycle events are rare, renderer events are
+// rate-limited, and every record must survive an imminent app.exit(). The file
+// sink caps individual records and rotates a bounded backup set.
 function desktopLog(event: string, detail?: Record<string, unknown>): void {
   try {
-    const logDir = join(app.getPath('userData'), 'logs')
-    mkdirSync(logDir, { recursive: true })
-    const line = JSON.stringify({ at: new Date().toISOString(), event, ...detail }) + '\n'
-    appendFileSync(join(logDir, 'desktop.log'), line, 'utf-8')
+    appendDesktopLogRecord(
+      join(app.getPath('userData'), 'logs', 'desktop.log'),
+      event,
+      detail,
+    )
   } catch {
     // Logging must never break the lifecycle it observes.
   }
@@ -2034,13 +2052,15 @@ function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
   const preferences = loadDesktopPreferencesRecord().value
   const previewForcedOffline = process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mainWindowCloseBehavior: preferences.main_window_close_behavior,
     workbenchPreviewMode: preferences.workbench_preview_mode,
     effectiveWorkbenchPreviewMode: previewForcedOffline
       ? 'offline'
       : preferences.workbench_preview_mode,
     workbenchPreviewNoticeShown: preferences.workbench_preview_notice_shown,
+    sandboxUnavailableWarningSuppressed:
+      preferences.sandbox_unavailable_warning_suppressed,
     workbenchPreviewForcedOffline: previewForcedOffline,
     canRunInBackground: canRunDesktopInBackground(),
     platform: desktopPlatformName(),
@@ -2082,6 +2102,7 @@ async function saveDesktopPreferences(
   const behavior = payload?.mainWindowCloseBehavior
   const previewMode = payload?.workbenchPreviewMode
   const previewNoticeShown = payload?.workbenchPreviewNoticeShown
+  const sandboxWarningSuppressed = payload?.sandboxUnavailableWarningSuppressed
   if (
     behavior !== undefined
     && behavior !== 'background'
@@ -2099,10 +2120,14 @@ async function saveDesktopPreferences(
   if (previewNoticeShown !== undefined && typeof previewNoticeShown !== 'boolean') {
     throw new Error('The Workbench preview notice state is invalid.')
   }
+  if (sandboxWarningSuppressed !== undefined && typeof sandboxWarningSuppressed !== 'boolean') {
+    throw new Error('The sandbox availability warning preference is invalid.')
+  }
   if (
     behavior === undefined
     && previewMode === undefined
     && previewNoticeShown === undefined
+    && sandboxWarningSuppressed === undefined
   ) {
     throw new Error('No supported Desktop preference was provided.')
   }
@@ -2113,7 +2138,86 @@ async function saveDesktopPreferences(
     ...(previewNoticeShown !== undefined
       ? { workbench_preview_notice_shown: previewNoticeShown }
       : {}),
+    ...(sandboxWarningSuppressed !== undefined
+      ? { sandbox_unavailable_warning_suppressed: sandboxWarningSuppressed }
+      : {}),
   }))
+}
+
+function normalizeSandboxUnavailablePayload(raw: unknown): SandboxUnavailablePayload {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('The sandbox availability report is invalid.')
+  }
+  const payload = raw as Record<string, unknown>
+  if (payload.state !== 'failed' && payload.state !== 'unavailable') {
+    throw new Error('The sandbox availability report is invalid.')
+  }
+  if (
+    payload.message !== undefined
+    && (typeof payload.message !== 'string' || payload.message.length > 2_000)
+  ) {
+    throw new Error('The sandbox availability report is invalid.')
+  }
+  return {
+    state: payload.state,
+    ...(typeof payload.message === 'string' && payload.message.trim()
+      ? { message: payload.message.trim() }
+      : {}),
+  }
+}
+
+async function reportSandboxUnavailable(raw: unknown): Promise<{
+  shown: boolean
+  suppressed: boolean
+}> {
+  normalizeSandboxUnavailablePayload(raw)
+  const preferences = loadDesktopPreferencesRecord().value
+  if (
+    preferences.sandbox_unavailable_warning_suppressed
+    || sandboxUnavailableWarningShownThisLaunch
+  ) {
+    return {
+      shown: false,
+      suppressed: preferences.sandbox_unavailable_warning_suppressed,
+    }
+  }
+
+  // Reserve the single prompt slot before awaiting the native dialog so
+  // concurrent renderer reports cannot open duplicate prompts.
+  sandboxUnavailableWarningShownThisLaunch = true
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    title: desktopT('sandboxUnavailable.title'),
+    message: desktopT('sandboxUnavailable.message'),
+    detail: desktopT('sandboxUnavailable.detail'),
+    buttons: [
+      desktopT('sandboxUnavailable.acknowledge'),
+      desktopT('sandboxUnavailable.suppress'),
+    ],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  }
+  const window = currentMainWindow()
+  const result = window
+    ? await dialog.showMessageBox(window, options)
+    : await dialog.showMessageBox(options)
+  if (result.response !== 1) {
+    return { shown: true, suppressed: false }
+  }
+
+  try {
+    await enqueueDesktopPreferencesUpdate((current) => ({
+      ...current,
+      sandbox_unavailable_warning_suppressed: true,
+    }))
+  } catch (error) {
+    desktopLog('sandbox_unavailable_warning_persist_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return { shown: true, suppressed: false }
+  }
+  return { shown: true, suppressed: true }
 }
 
 function markBackgroundCloseNoticeShown(): void {
@@ -2468,6 +2572,7 @@ function renderDesktopConfigAfterPreflight(
     ...ensembleConfigTomlLines(credential),
     ...privacyConfigTomlLines(credential),
     '',
+    ...freshDesktopSandboxConfigLines(existingRaw, process.platform),
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
@@ -2959,6 +3064,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'closePrompt.quit': 'Quit OpenSquilla',
     'closePrompt.cancel': 'Cancel',
     'closePrompt.remember': 'Remember my choice',
+    'sandboxUnavailable.title': 'Safe mode is unavailable',
+    'sandboxUnavailable.message': 'OpenSquilla cannot start its sandbox on this device.',
+    'sandboxUnavailable.detail': 'Safe mode has been disabled. Tasks can use Full Access, which runs with host permissions and has additional security risk.',
+    'sandboxUnavailable.acknowledge': 'I understand',
+    'sandboxUnavailable.suppress': "Don't remind me again",
     'update.newVersionTitle': 'A new version is available',
     'update.newVersionDetail': 'OpenSquilla {version} is available. Download it now?',
     'update.download': 'Download',
@@ -3091,6 +3201,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'closePrompt.quit': '退出 OpenSquilla',
     'closePrompt.cancel': '取消',
     'closePrompt.remember': '记住我的选择',
+    'sandboxUnavailable.title': '安全模式当前不可用',
+    'sandboxUnavailable.message': 'OpenSquilla 无法在此设备上启动沙箱。',
+    'sandboxUnavailable.detail': '安全模式已禁用。任务只能使用完全访问，并将以宿主机权限运行，存在额外的安全风险。',
+    'sandboxUnavailable.acknowledge': '我知道了',
+    'sandboxUnavailable.suppress': '不再提醒',
     'update.newVersionTitle': '有新版本可用',
     'update.newVersionDetail': 'OpenSquilla {version} 已发布，现在下载吗？',
     'update.download': '下载',
@@ -7843,7 +7958,7 @@ async function startGateway(): Promise<GatewayState> {
 
   const child = spawn(
     runtime.command,
-    [...runtime.args, '--port', String(port), '--bind', '127.0.0.1', '--config', desktopConfigPath()],
+    [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
     {
       cwd: runtime.cwd,
       env: childEnv,
@@ -7970,7 +8085,7 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
 }
 
 async function loadControlUi(window: BrowserWindow, gatewayUrl: string): Promise<void> {
-  const url = `${gatewayUrl}/control/chat`
+  const url = `${gatewayUrl}/control/chat/new`
   let lastError: Error | null = null
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     try {
@@ -8048,6 +8163,63 @@ async function createMainWindow(): Promise<BrowserWindow> {
     () => nativeWorkbenchSurfaces.refreshBounds(window),
   )
   installEditingContextMenu(window)
+
+  const rendererConsoleLogLimiter = new RendererConsoleLogLimiter()
+  let rendererUnresponsiveAt: number | null = null
+  const flushRendererConsoleSuppression = (): void => {
+    for (const entry of rendererConsoleLogLimiter.flush()) {
+      desktopLog(entry.event, entry.detail)
+    }
+  }
+
+  // Forward renderer console errors to desktop.log. The Control UI runs
+  // in the renderer, so a purely front-end failure (a thrown error, an unhandled
+  // rejection) otherwise leaves no trace: it
+  // never reaches the gateway log, and DevTools is disabled on Windows. Persisting
+  // error messages makes those front-end problems diagnosable from a user's log
+  // folder without a reproduction. Only the trusted main frame is accepted: an
+  // artifact or other child frame must not be able to write to the lifecycle log.
+  window.webContents.on('console-message', (details) => {
+    if (details.frame !== window.webContents.mainFrame) return
+    const entry = buildRendererConsoleLogEntry({
+      level: details.level,
+      message: details.message,
+      sourceId: details.sourceId,
+      lineNumber: details.lineNumber,
+    }, { homeDir: app.getPath('home') })
+    if (!entry) return
+    for (const accepted of rendererConsoleLogLimiter.accept(entry)) {
+      desktopLog(accepted.event, accepted.detail)
+    }
+  })
+
+  // Record renderer crashes. A gone render process is the most opaque
+  // failure of all — the whole UI freezes with nothing in any log — so stamping
+  // the reason and exit code gives a first, always-present breadcrumb.
+  window.webContents.on('render-process-gone', (_event, details) => {
+    flushRendererConsoleSuppression()
+    const entry = buildRendererGoneLogEntry({
+      reason: details.reason,
+      exitCode: details.exitCode,
+    })
+    desktopLog(entry.event, entry.detail)
+  })
+
+  window.webContents.on('unresponsive', () => {
+    flushRendererConsoleSuppression()
+    if (rendererUnresponsiveAt !== null) return
+    rendererUnresponsiveAt = Date.now()
+    const entry = buildRendererStateLogEntry('unresponsive')
+    desktopLog(entry.event, entry.detail)
+  })
+
+  window.webContents.on('responsive', () => {
+    if (rendererUnresponsiveAt === null) return
+    const durationMs = Date.now() - rendererUnresponsiveAt
+    rendererUnresponsiveAt = null
+    const entry = buildRendererStateLogEntry('responsive', durationMs)
+    desktopLog(entry.event, entry.detail)
+  })
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     // Forward real outbound links to the system browser; deny everything else.
@@ -10208,6 +10380,12 @@ ipcMain.handle('desktop:preferences:get', (event) => {
 ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPreferencesPayload) => {
   if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
   return await saveDesktopPreferences(payload)
+})
+ipcMain.handle('desktop:sandbox:unavailable', async (event, payload: unknown) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    throw new Error('Untrusted sandbox availability report.')
+  }
+  return await reportSandboxUnavailable(payload)
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {

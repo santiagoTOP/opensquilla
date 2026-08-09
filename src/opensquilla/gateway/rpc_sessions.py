@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
+import weakref
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -82,21 +85,28 @@ from opensquilla.provider.types import (
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
-from opensquilla.sandbox.run_context import (
-    RUN_CONTEXT_ORIGIN_KEY,
-    RunContext,
-    run_context_from_origin_payload,
-)
-from opensquilla.sandbox.run_mode import (
+from opensquilla.run_mode import (
     RunMode,
     config_run_mode,
     normalize_run_mode,
     project_default_run_mode,
 )
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileBoundaryError,
+    GuestProfileFactory,
+)
+from opensquilla.sandbox.mode_resolver import ModeResolutionError, ResolvedMode, resolve_mode
+from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
+    RunContext,
+    run_context_from_origin_payload,
+)
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
+    principal_has_host_execute,
     run_mode_allowed_for_principal,
 )
+from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
 from opensquilla.session.compaction import (
     arm_compaction_deadline,
     await_compaction_phase,
@@ -125,6 +135,7 @@ from opensquilla.session.keys import canonicalize_session_key, normalize_agent_i
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
+    MetaControlIntent,
     PlanRevisionRecord,
     PlanRunRecord,
     SessionStatus,
@@ -136,6 +147,7 @@ from opensquilla.session.naming import (
 )
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
+    MetaControlIntentConflictError,
     PlanImplementationSessionBusyError,
     SessionStorage,
     StaleEpochError,
@@ -177,6 +189,16 @@ _MAX_TEXT_ATTACHMENT_BYTES = _attachment_ingest.TEXT_ATTACHMENT_BYTES
 _MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
 _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
+
+
+def _coerce_positive_int(value: object, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _accepts_keyword_arg(func: Any, name: str) -> bool:
@@ -236,6 +258,254 @@ async def _branch_with_session_mutation_lock(
     # not yet expose the mutation-context seam.
     async with lock:
         return await branch(parent_key, child_key, **kwargs)
+
+
+_FORK_TITLE_SUFFIX_RE = re.compile(r"^(?P<base>.+) \((?P<number>[2-9][0-9]*)\)$")
+_FORK_TITLE_SCAN_PAGE_SIZE = 500
+_FORK_TITLE_ALLOCATOR_GUARD = threading.Lock()
+_FORK_TITLE_ALLOCATOR_LOCKS: weakref.WeakValueDictionary[
+    tuple[int, int, str, str],
+    asyncio.Lock,
+] = weakref.WeakValueDictionary()
+
+
+def _fork_title_family(title: str) -> tuple[str, int]:
+    """Parse a possible copy suffix without deciding whether it is system-owned."""
+
+    match = _FORK_TITLE_SUFFIX_RE.fullmatch(title)
+    if match is None:
+        return title, 1
+    try:
+        number = int(match.group("number"))
+    except ValueError:
+        return title, 1
+    return match.group("base"), number
+
+
+def _session_fork_title_family(
+    session: Any,
+    *,
+    titles_by_key: dict[str, str],
+    sessions_by_key: dict[str, Any],
+    memo: dict[str, tuple[str, int]],
+    visiting: set[str],
+) -> tuple[str, int]:
+    """Resolve a title family only when fork lineage proves the suffix is generated."""
+
+    session_key = str(getattr(session, "session_key", "") or "")
+    title = titles_by_key.get(session_key, "")
+    cached = memo.get(session_key)
+    if cached is not None:
+        return cached
+    literal = (title, 1)
+    if not session_key or session_key in visiting:
+        return literal
+    if not getattr(session, "forked_from_parent", False):
+        memo[session_key] = literal
+        return literal
+    parent_key = str(getattr(session, "parent_session_key", "") or "")
+    parent = sessions_by_key.get(parent_key)
+    parsed_base, parsed_number = _fork_title_family(title)
+    if parent is None or parsed_number == 1:
+        memo[session_key] = literal
+        return literal
+
+    visiting.add(session_key)
+    try:
+        parent_base, parent_number = _session_fork_title_family(
+            parent,
+            titles_by_key=titles_by_key,
+            sessions_by_key=sessions_by_key,
+            memo=memo,
+            visiting=visiting,
+        )
+    finally:
+        visiting.discard(session_key)
+    resolved = (
+        (parsed_base, parsed_number)
+        if parsed_base == parent_base and parsed_number > parent_number
+        else literal
+    )
+    memo[session_key] = resolved
+    return resolved
+
+
+def _fork_title_allocator_lock(
+    storage: Any,
+    *,
+    agent_id: str,
+    base_title: str,
+) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = (id(loop), id(storage), agent_id, base_title)
+    with _FORK_TITLE_ALLOCATOR_GUARD:
+        lock = _FORK_TITLE_ALLOCATOR_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _FORK_TITLE_ALLOCATOR_LOCKS[key] = lock
+        return lock
+
+
+def _session_sidebar_title(
+    session: Any,
+    *,
+    transcript_title: str,
+    channel_types: dict[str, str],
+) -> str:
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=int(time.time() * 1000),
+        transcript_title=transcript_title,
+        channel_types=channel_types,
+    )
+    return str(view.get("title") or "")
+
+
+async def _fork_title_state(
+    ctx: RpcContext,
+    storage: Any,
+    parent: Any,
+) -> tuple[str, int]:
+    """Return the lineage-aware title family and current highest copy number."""
+
+    parent_key = str(getattr(parent, "session_key", "") or "")
+    agent_id = _effective_agent_id_for_session(parent, parent_key)
+    sessions: list[Any] = []
+    offset = 0
+    while True:
+        page = await storage.list_sessions(
+            agent_id=agent_id,
+            limit=_FORK_TITLE_SCAN_PAGE_SIZE,
+            offset=offset,
+        )
+        sessions.extend(page)
+        if len(page) < _FORK_TITLE_SCAN_PAGE_SIZE:
+            break
+        offset += len(page)
+
+    if all(getattr(session, "session_key", None) != parent.session_key for session in sessions):
+        sessions.append(parent)
+
+    transcript_titles = await _list_transcript_titles(storage, sessions)
+    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    sessions_by_key = {
+        str(getattr(session, "session_key", "") or ""): session for session in sessions
+    }
+    titles_by_key = {
+        str(getattr(session, "session_key", "") or ""): _session_sidebar_title(
+            session,
+            transcript_title=transcript_titles.get(getattr(session, "session_id", ""), ""),
+            channel_types=channel_types,
+        )
+        for session in sessions
+    }
+    memo: dict[str, tuple[str, int]] = {}
+    base_title, parent_number = _session_fork_title_family(
+        parent,
+        titles_by_key=titles_by_key,
+        sessions_by_key=sessions_by_key,
+        memo=memo,
+        visiting=set(),
+    )
+    highest_number = parent_number
+    for candidate in sessions:
+        candidate_base, candidate_number = _session_fork_title_family(
+            candidate,
+            titles_by_key=titles_by_key,
+            sessions_by_key=sessions_by_key,
+            memo=memo,
+            visiting=set(),
+        )
+        if candidate_base == base_title:
+            highest_number = max(highest_number, candidate_number)
+    return base_title, highest_number
+
+
+async def _next_fork_display_name(ctx: RpcContext, storage: Any, parent: Any) -> str:
+    """Allocate the next copy-style title using the same title contract as sessions.list."""
+
+    base_title, highest_number = await _fork_title_state(ctx, storage, parent)
+    return f"{base_title} ({highest_number + 1})"
+
+
+@contextlib.asynccontextmanager
+async def _fork_title_allocation_context(
+    ctx: RpcContext,
+    storage: Any,
+    parent: Any,
+):
+    """Serialize one title family while holding the source session mutation lock."""
+
+    parent_key = str(getattr(parent, "session_key", "") or "")
+    parent_lock = get_session_lock(ctx.turn_runner, parent_key)
+
+    @contextlib.asynccontextmanager
+    async def allocation_locked():
+        current_parent = await storage.get_session(parent_key)
+        if current_parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        base_title, _highest_number = await _fork_title_state(ctx, storage, current_parent)
+        agent_id = _effective_agent_id_for_session(current_parent, parent_key)
+        allocator_lock = _fork_title_allocator_lock(
+            storage,
+            agent_id=agent_id,
+            base_title=base_title,
+        )
+        async with allocator_lock:
+            yield
+
+    if parent_lock is None:
+        async with allocation_locked():
+            yield
+        return
+    async with parent_lock:
+        async with allocation_locked():
+            yield
+
+
+async def _fork_with_numbered_title(
+    ctx: RpcContext,
+    storage: Any,
+    parent_key: str,
+    child_key: str,
+    *,
+    explicit_title: str | None,
+    **branch_kwargs: Any,
+) -> Any:
+    """Create and title a fork while holding the parent's mutation lock when available."""
+
+    async def create_with_display_name(display_name: str) -> Any:
+        return await ctx.session_manager.branch(
+            parent_key,
+            child_key,
+            display_name=display_name,
+            **branch_kwargs,
+        )
+
+    async def create_explicit_locked() -> Any:
+        parent = await storage.get_session(parent_key)
+        if parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        assert explicit_title is not None
+        return await create_with_display_name(explicit_title)
+
+    parent = await storage.get_session(parent_key)
+    if parent is None:
+        raise KeyError(f"Session not found: {parent_key}")
+    if explicit_title:
+        lock = get_session_lock(ctx.turn_runner, parent_key)
+        if lock is None:
+            return await create_explicit_locked()
+        async with lock:
+            return await create_explicit_locked()
+    async with _fork_title_allocation_context(ctx, storage, parent):
+        current_parent = await storage.get_session(parent_key)
+        if current_parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        display_name = await _next_fork_display_name(ctx, storage, current_parent)
+        return await create_with_display_name(display_name)
 
 
 def _clean_cancel_source(value: Any, default: str) -> str:
@@ -339,10 +609,13 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
             run_mode = normalize_run_mode(value)
         except ValueError:
             return None
+        if run_mode == RunMode.FULL and not principal_has_host_execute(ctx.principal):
+            raise RpcHandlerError(
+                "HOST_CAPABILITY_REQUIRED",
+                "Full access requires a valid token with host execution permission.",
+            )
         if run_mode_allowed_for_principal(run_mode, ctx.principal):
             return run_mode
-        if run_mode == RunMode.FULL and not ctx.principal.is_owner:
-            return RunMode.TRUSTED
         return None
 
     elevated = source_hint.get("elevated")
@@ -351,10 +624,46 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
     if not ctx.principal.is_owner:
         return None
     if elevated in _TRUSTED_ELEVATED_ALIASES:
-        return RunMode.TRUSTED
+        return RunMode.SAFE
     if elevated == "full":
         return RunMode.FULL
     return None
+
+
+def _guest_profile_for_principal(
+    principal: Any,
+    task_id: str,
+    *,
+    state_dir: str | Path,
+):
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    if has_capability("guest.safe") and not principal_has_host_execute(principal):
+        runtime_roots: tuple[Path, ...] = ()
+        runtime_path: tuple[Path, ...] = ()
+        if os.name != "nt":
+            from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+            resolver = bundled_runtime_resolver()
+            runtime_roots = resolver.runtime_roots() if resolver is not None else ()
+            runtime_path = resolver.bundled_path() if resolver is not None else ()
+        return GuestProfileFactory.create(
+            task_id,
+            state_dir=state_dir,
+            runtime_roots=runtime_roots,
+            runtime_path=runtime_path,
+        )
+    return None
+
+
+def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
+    # Source hints are client-controlled presentation metadata.  They must not
+    # weaken the server-computed authority of an unauthenticated guest.
+    del source_hint
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    return bool(
+        has_capability("guest.safe")
+        and not principal_has_host_execute(principal)
+    )
 
 
 def _apply_run_context_route_metadata(
@@ -803,6 +1112,32 @@ def _optional_string_param(params: dict | None, *names: str) -> str | None:
         value = value.strip()
         return value or None
     return None
+
+
+def _optional_aliased_non_empty_string_param(
+    params: dict | None,
+    *names: str,
+) -> str | None:
+    """Resolve aliases without allowing a present alias to erase another value."""
+
+    if not isinstance(params, dict):
+        return None
+    present = [(name, params[name]) for name in names if name in params]
+    if not present:
+        return None
+    normalized: list[tuple[str, str]] = []
+    for name, value in present:
+        if not isinstance(value, str):
+            raise ValueError(f"params.{name} must be a string")
+        value = value.strip()
+        if not value:
+            raise ValueError(f"params.{name} must not be empty")
+        normalized.append((name, value))
+    distinct = {value for _, value in normalized}
+    if len(distinct) != 1:
+        joined = " and ".join(f"params.{name}" for name, _ in normalized)
+        raise ValueError(f"{joined} must match when both aliases are provided")
+    return normalized[0][1]
 
 
 def _effective_agent_id_for_session(session: Any | None, session_key: str) -> str:
@@ -1518,7 +1853,23 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         return {"sessions": [], "count": 0, "ts": now_ms}
 
     limit = (params or {}).get("limit", 50)
-    sessions = await storage.list_sessions(limit=limit)
+    from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
+
+    if GuestRpcPolicy.is_guest(ctx):
+        owner_id = getattr(ctx.principal, "guest_owner_id", None)
+        try:
+            guest_limit = int(limit)
+        except (TypeError, ValueError):
+            guest_limit = 50
+        limit = max(1, min(guest_limit, 100))
+        sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
+        sessions = [
+            session
+            for session in sessions
+            if guest_owns_session_key(owner_id, getattr(session, "session_key", None))
+        ]
+    else:
+        sessions = await storage.list_sessions(limit=limit)
     task_rows_by_session = await _list_task_rows_by_session(
         ctx,
         storage,
@@ -1863,9 +2214,14 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     return result
 
 
-@_d.method("sessions.fork", scope="operator.write")
-async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
-    """Fork a session into a new webchat-routable child with a copied transcript."""
+async def _fork_session_impl(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    require_through_turn: bool,
+) -> dict:
+    """Fork a session using the legacy or capability-safe through-turn contract."""
+
     key = _require_key(params)
     assert isinstance(params, dict)
     title = params.get("title")
@@ -1876,6 +2232,18 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
         "beforeMessageId",
         "before_message_id",
     )
+    through_turn_id = _optional_aliased_non_empty_string_param(
+        params,
+        "throughTurnId",
+        "through_turn_id",
+    )
+    if require_through_turn:
+        if any(name in params for name in ("beforeMessageId", "before_message_id")):
+            raise ValueError("sessions.forkThroughTurn does not accept beforeMessageId")
+        if through_turn_id is None:
+            raise ValueError("params.throughTurnId is required")
+    if before_message_id and through_turn_id:
+        raise ValueError("beforeMessageId and throughTurnId are mutually exclusive")
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -1889,19 +2257,17 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
 
     agent_id = _effective_agent_id_for_session(parent, key)
     child_key = _create_session_key(agent_id, "webchat")
-    child = await _branch_with_session_mutation_lock(
-        ctx.session_manager,
-        ctx.turn_runner,
+    child = await _fork_with_numbered_title(
+        ctx,
+        storage,
         key,
         child_key,
+        explicit_title=title,
         fork_transcript=True,
         status=SessionStatus.DONE,
         fork_before_message_id=before_message_id,
+        fork_through_turn_id=through_turn_id,
     )
-
-    display_name = title or getattr(parent, "display_name", None)
-    if display_name:
-        await ctx.session_manager.update(child.session_key, display_name=display_name)
 
     await _emit_to_subscribers(
         ctx,
@@ -1910,7 +2276,29 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
         build_sessions_changed_payload(child.session_key, "forked", run_status="idle"),
     )
 
-    return {"key": child.session_key, "parentKey": key}
+    result = {"key": child.session_key, "parentKey": key}
+    if through_turn_id is not None:
+        result.update(
+            {
+                "forkMode": "through_turn",
+                "throughTurnId": through_turn_id,
+            }
+        )
+    return result
+
+
+@_d.method("sessions.fork", scope="operator.write")
+async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
+    """Fork a session using the backwards-compatible full/prefix contract."""
+
+    return await _fork_session_impl(params, ctx, require_through_turn=False)
+
+
+@_d.method("sessions.forkThroughTurn", scope="operator.write")
+async def _handle_sessions_fork_through_turn(params: dict | None, ctx: RpcContext) -> dict:
+    """Fork through one terminal turn without a silent full-fork fallback."""
+
+    return await _fork_session_impl(params, ctx, require_through_turn=True)
 
 
 async def _should_auto_title(
@@ -2235,7 +2623,9 @@ async def _handle_sessions_send(
         source_scope=_turn_source_scope(source_hint, ctx),
         fingerprint_params=fingerprint_params,
     )
-    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
+    get_ingress_receipt = getattr(storage, "replay_turn_ingress_receipt", None)
+    if not callable(get_ingress_receipt):
+        get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
     if callable(get_ingress_receipt):
         previous_acceptance = await get_ingress_receipt(
             source_scope=ingress_identity.source_scope,
@@ -2332,7 +2722,7 @@ async def _handle_sessions_send(
         mode = project_default_run_mode(ctx.config)
         mode_source = (
             "project_default"
-            if mode is RunMode.STANDARD and config_run_mode(ctx.config) is RunMode.FULL
+            if mode is RunMode.SAFE and config_run_mode(ctx.config) is RunMode.FULL
             else "operator_default"
         )
         create_kwargs["workspace_id"] = selected_workspace.workspace_id
@@ -2406,7 +2796,6 @@ async def _handle_sessions_send(
 
     if fork_before_message_id is not None:
         parent_key = key
-        parent_display_name = getattr(session, "display_name", None)
         agent_id = _effective_agent_id_for_session(session, parent_key)
         child_key = _create_session_key(agent_id, "webchat")
         prepare_prefix_branch = getattr(ctx.session_manager, "prepare_prefix_branch", None)
@@ -2433,18 +2822,17 @@ async def _handle_sessions_send(
             session = atomic_intent_plan.node
             key = child_key
         else:
-            session = await _branch_with_session_mutation_lock(
-                ctx.session_manager,
-                ctx.turn_runner,
+            session = await _fork_with_numbered_title(
+                ctx,
+                storage,
                 parent_key,
                 child_key,
+                explicit_title=None,
                 fork_transcript=True,
                 status=SessionStatus.DONE,
                 fork_before_message_id=fork_before_message_id,
             )
             key = child_key
-            if parent_display_name:
-                session = await ctx.session_manager.update(key, display_name=parent_display_name)
             await _emit_to_subscribers(
                 ctx,
                 key,
@@ -2642,6 +3030,81 @@ async def _handle_sessions_send(
         if stripped_message is not None:
             provider_message_text = stripped_message.strip()
 
+    durable_meta_control: MetaControlIntent | None = None
+    durable_meta_control_payload: dict[str, Any] | None = None
+    parsed_control: dict[str, str] | None = None
+    get_meta_control = getattr(storage, "get_meta_control_intent", None)
+    if callable(get_meta_control):
+        from opensquilla.engine.steps.meta_command import parse_meta_control_sentinel
+
+        parsed_control = parse_meta_control_sentinel(
+            provider_message_text,
+            semantic_message_text,
+            client_request_id=ingress_identity.client_request_id,
+        )
+        if parsed_control is not None:
+            candidate = await get_meta_control(
+                session_key=key,
+                control_kind=parsed_control["kind"],
+                correlation_id=parsed_control["correlation_id"],
+            )
+            if (
+                isinstance(candidate, MetaControlIntent)
+                and candidate.status == "staged"
+                and (
+                    candidate.control_kind != "manual"
+                    or candidate.meta_skill_name == parsed_control.get("name")
+                )
+            ):
+                durable_meta_control = candidate
+                durable_meta_control_payload = {
+                    "version": 1,
+                    "intent_id": candidate.intent_id,
+                    "kind": candidate.control_kind,
+                    "name": candidate.meta_skill_name,
+                    "correlation_id": candidate.correlation_id,
+                }
+                if candidate.control_kind == "replay":
+                    durable_meta_control_payload.update({
+                        "run_id": candidate.replay_run_id,
+                        "mode": candidate.replay_mode,
+                    })
+        explicit_request_id = any(
+            field in params for field in ("clientRequestId", "client_request_id")
+        )
+        if (
+            parsed_control is not None
+            and durable_meta_control is None
+            and explicit_request_id
+        ):
+            legacy_match = False
+            if parsed_control["kind"] == "manual":
+                from opensquilla.engine.steps.meta_command import pending_meta_launch_peek
+
+                pending_name = pending_meta_launch_peek(
+                    key,
+                    client_request_id=ingress_identity.client_request_id,
+                )
+                legacy_match = pending_name == parsed_control.get("name")
+            if not legacy_match:
+                raise RpcHandlerError(
+                    "META_CONTROL_NOT_STAGED",
+                    "This MetaSkill control is missing, expired, or already belongs to "
+                    "another accepted turn. Start it again from the MetaSkill action.",
+                    retryable=False,
+                    accepted=False,
+                )
+
+    def _promote_pending_meta_launch() -> str | None:
+        from opensquilla.engine.steps.meta_command import pending_meta_launch_promote
+
+        return pending_meta_launch_promote(
+            key,
+            client_request_id=ingress_identity.client_request_id,
+            message=provider_message_text,
+            semantic_message=semantic_message_text,
+        )
+
     from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.gateway.routing import (
         build_cli_route_envelope,
@@ -2652,17 +3115,45 @@ async def _handle_sessions_send(
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
     configured_workspace_dir = str(workspace_path) if workspace_path is not None else None
     workspace_dir = configured_workspace_dir
+    turn_id = uuid.uuid4().hex
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
-    try:
-        run_context, authoritative_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=workspace_dir,
-        )
-    except ProjectWorkspaceStateError as exc:
-        raise _project_workspace_error(exc) from exc
+    guest_profile = None
+    guest_safe = _is_remote_web_guest(ctx.principal, source_hint)
+    capability_report = None
+    if guest_safe:
+        capability_report = await current_sandbox_capability_report(ctx.config)
+        try:
+            resolve_mode(RunMode.SAFE, ctx.principal, capability_report)
+        except ModeResolutionError as exc:
+            raise RpcHandlerError(
+                "SANDBOX_UNAVAILABLE",
+                "Safe mode is unavailable for this unauthenticated request.",
+                details={"reason": exc.code, **capability_report.to_payload()},
+            ) from exc
+        try:
+            guest_profile = _guest_profile_for_principal(
+                ctx.principal,
+                turn_id,
+                state_dir=ctx.config.state_dir,
+            )
+        except GuestProfileBoundaryError as exc:
+            raise RpcHandlerError(
+                exc.code,
+                "The managed Web guest workspace is unavailable.",
+            ) from exc
+        run_context = guest_profile.run_context()
+        authoritative_guard = None
+    else:
+        try:
+            run_context, authoritative_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=workspace_dir,
+            )
+        except ProjectWorkspaceStateError as exc:
+            raise _project_workspace_error(exc) from exc
     if authoritative_guard is not None:
         workspace_guard = authoritative_guard
     run_context = replace(
@@ -2693,7 +3184,43 @@ async def _handle_sessions_send(
                     key,
                     origin=accepted_run_mode_origin,
                 )
+    if run_context.run_mode is RunMode.FULL:
+        mode_resolution = ResolvedMode(
+            desired_mode=RunMode.FULL,
+            effective_mode=RunMode.FULL,
+        )
+    else:
+        if capability_report is None:
+            capability_report = await current_sandbox_capability_report(ctx.config)
+        try:
+            mode_resolution = resolve_mode(
+                run_context.run_mode,
+                ctx.principal,
+                capability_report,
+            )
+        except ModeResolutionError as exc:
+            raise RpcHandlerError(
+                "SANDBOX_MODE_UNAVAILABLE",
+                "The requested execution mode is unavailable.",
+                details={"reason": exc.code, **capability_report.to_payload()},
+            ) from exc
+
+    def _cleanup_rejected_guest_profile() -> None:
+        if guest_profile is not None:
+            guest_profile.cleanup()
+
+    if mode_resolution.effective_mode is not run_context.run_mode:
+        accepted_run_mode_override = AcceptedRunModeOverride(
+            run_mode=mode_resolution.effective_mode,
+            run_mode_source=run_context.run_mode_source,
+            source="capability_fallback",
+        )
+        run_context = apply_accepted_run_mode_override(
+            run_context,
+            accepted_run_mode_override,
+        )
     workspace_dir = run_context.workspace or workspace_dir
+    host_execute_allowed = principal_has_host_execute(ctx.principal)
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
         route_envelope = build_cli_route_envelope(
             session_key=key,
@@ -2703,6 +3230,7 @@ async def _handle_sessions_send(
             sender_id=source_hint.get("sender_id"),
             session_id=getattr(session, "session_id", None),
             principal_is_owner=ctx.principal.is_owner,
+            principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
         )
     else:
@@ -2716,12 +3244,28 @@ async def _handle_sessions_send(
             tool_source_kind=source_hint.get("source_kind"),
             session_id=getattr(session, "session_id", None),
             principal_is_owner=ctx.principal.is_owner,
+            principal_host_execute=host_execute_allowed,
         )
     _apply_run_context_route_metadata(
         route_envelope,
         run_context,
         principal_is_owner=ctx.principal.is_owner,
     )
+    route_envelope.metadata["sandbox_mode_resolution"] = mode_resolution.to_payload()
+    if guest_profile is not None:
+        route_envelope.metadata["guest_safe"] = True
+        route_envelope.metadata["guest_profile_root"] = str(guest_profile.root)
+        route_envelope.metadata["guest_managed_root"] = str(guest_profile.managed_root)
+        route_envelope.metadata["guest_environment"] = dict(
+            guest_profile.environment
+        )
+        route_envelope.runtime_services["guest_profile_factory"] = (
+            lambda task_id: _guest_profile_for_principal(
+                ctx.principal,
+                task_id,
+                state_dir=ctx.config.state_dir,
+            )
+        )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
@@ -2744,7 +3288,6 @@ async def _handle_sessions_send(
     # Allocate the durable causal identity before persistence.  The same id is
     # handed to TaskRuntime, live events, bootstrap history, and every transcript
     # row produced by this turn.
-    turn_id = uuid.uuid4().hex
     client_message_id = requested_client_message_id or uuid.uuid4().hex
     surface_id = (
         requested_surface_id
@@ -2755,10 +3298,16 @@ async def _handle_sessions_send(
         route_envelope,
         metadata={
             **route_envelope.metadata,
+            "client_request_id": ingress_identity.client_request_id,
             "client_message_id": client_message_id,
             "surface_id": surface_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
+            **(
+                {"meta_control": durable_meta_control_payload}
+                if durable_meta_control_payload is not None
+                else {}
+            ),
             **(
                 {
                     "plan_run_id": plan_run.run_id,
@@ -2792,13 +3341,20 @@ async def _handle_sessions_send(
             ),
         },
     )
-    ingress_turn_context = {
+    ingress_turn_context: dict[str, Any] = {
         "turn_id": turn_id,
+        "client_request_id": ingress_identity.client_request_id,
         "client_message_id": client_message_id,
         "surface_id": surface_id,
         "intent": "send",
         "disposition": "queued" if getattr(ctx, "task_runtime", None) is not None else "applied",
         "revision": 1,
+        **(
+            {"meta_control": durable_meta_control_payload}
+            if durable_meta_control_payload is not None
+            else {}
+        ),
+        "sandbox_mode_resolution": mode_resolution.to_payload(),
     }
     fresh_user_session = False
     user_message_id: str | None = None
@@ -2872,16 +3428,20 @@ async def _handle_sessions_send(
             execution_session = await storage.get_session(key)
             if execution_session is None:
                 raise KeyError(f"Session not found: {key}")
-            (
-                execution_run_context,
-                _execution_workspace_guard,
-            ) = await authoritative_project_run_context(
-                storage=storage,
-                session_manager=ctx.session_manager,
-                session=execution_session,
-                config=ctx.config,
-                default_workspace=configured_workspace_dir,
-            )
+            if guest_profile is not None:
+                execution_run_context = guest_profile.run_context()
+                _execution_workspace_guard = None
+            else:
+                (
+                    execution_run_context,
+                    _execution_workspace_guard,
+                ) = await authoritative_project_run_context(
+                    storage=storage,
+                    session_manager=ctx.session_manager,
+                    session=execution_session,
+                    config=ctx.config,
+                    default_workspace=configured_workspace_dir,
+                )
             execution_run_context = apply_accepted_run_mode_override(
                 execution_run_context,
                 accepted_run_mode_override,
@@ -2900,10 +3460,14 @@ async def _handle_sessions_send(
             tool_ctx = tool_context_from_envelope(
                 route_envelope,
                 is_owner=ctx.principal.is_owner,
+                host_execute_allowed=host_execute_allowed,
                 workspace_dir=execution_workspace_dir,
                 workspace_strict=workspace_strict,
                 default_elevated=configured_default_elevated(ctx.config),
             )
+            from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+            pin_sandbox_policy(tool_ctx, ctx.config)
             raw_stream = ctx.turn_runner.run(
                 provider_message_text,
                 key,
@@ -3016,6 +3580,8 @@ async def _handle_sessions_send(
                 {"message": error_message, "code": event_code},
             )
         finally:
+            if guest_profile is not None:
+                guest_profile.cleanup()
             if "turn_scope" in locals():
                 turn_scope.__exit__(None, None, None)
             if not _terminal_emitted:
@@ -3044,6 +3610,11 @@ async def _handle_sessions_send(
         )
         _emit_steer_metric("legacy_interrupt_requested", session_key=key)
     runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
+    if durable_meta_control is not None:
+        # A control must begin a fresh pipeline turn and must not interrupt
+        # another accepted control. Collect could lose the pipeline marker;
+        # steer/interrupt could make recovered controls cancel one another.
+        runtime_mode = "followup"
     if atomic_intent_plan is not None and atomic_intent_plan.action == "reset":
         # A reset rotates the session identity. Any old-key task must be stopped
         # only after that rotation commits so it cannot append into the new epoch.
@@ -3072,6 +3643,14 @@ async def _handle_sessions_send(
     if initial_collaboration_mode is not None and not atomic_runtime_acceptance:
         raise RpcUnavailableError(
             "Initial collaboration mode requires atomic TaskRuntime acceptance"
+        )
+
+    if durable_meta_control is not None and not atomic_runtime_acceptance:
+        raise RpcHandlerError(
+            "META_CONTROL_DURABILITY_UNAVAILABLE",
+            "This MetaSkill control requires durable task ingress; retry after Gateway recovery",
+            retryable=True,
+            accepted=False,
         )
 
     if prepared_acceptance:
@@ -3110,6 +3689,25 @@ async def _handle_sessions_send(
         ):
             message_text = persisted_entry.content
 
+    async def _accept_turn_with_fork_title(
+        *args: Any,
+        **kwargs: Any,
+    ) -> TurnAcceptanceResult:
+        """Persist a prefix edit and its numbered title in one allocation window."""
+
+        if atomic_intent_plan is None or atomic_intent_plan.action != "fork":
+            return await storage.accept_turn(*args, **kwargs)
+        title_parent = atomic_intent_plan.previous_node
+        if title_parent is None:
+            raise RuntimeError("Fork acceptance is missing its parent session")
+        async with _fork_title_allocation_context(ctx, storage, title_parent):
+            atomic_intent_plan.node.display_name = await _next_fork_display_name(
+                ctx,
+                storage,
+                title_parent,
+            )
+            return await storage.accept_turn(*args, **kwargs)
+
     if atomic_runtime_acceptance:
         assert task_runtime is not None
         assert atomic_intent_plan is not None
@@ -3118,11 +3716,14 @@ async def _handle_sessions_send(
 
         from opensquilla.gateway.task_runtime import TaskQueueFullError
 
+        meta_launch_promotion: str | None = None
+
         async def _accept_task_record(
             task_record: AgentTaskRecord,
             *,
             merge_into_task: bool = False,
         ) -> TurnAcceptanceResult:
+            nonlocal meta_launch_promotion
             reset_archive_writer = None
             if atomic_intent_plan.action == "reset":
                 write_session_archive = getattr(
@@ -3163,7 +3764,7 @@ async def _handle_sessions_send(
                 accepted_session_updates["collaboration_mode"] = (
                     required_collaboration_mode
                 )
-            return await storage.accept_turn(
+            acceptance = await _accept_turn_with_fork_title(
                 persisted_entry,
                 expected_epoch=expected_epoch,
                 updated_at=int(time.time() * 1000),
@@ -3195,6 +3796,11 @@ async def _handle_sessions_send(
                 # now stop a queued implementation before it begins.
                 plan_run=accepted_plan_run,
                 merge_into_task=merge_into_task,
+                meta_control_intent_id=(
+                    durable_meta_control.intent_id
+                    if durable_meta_control is not None
+                    else None
+                ),
                 workspace_guard=workspace_guard,
                 expected_collaboration_revision=expected_collaboration_revision,
                 expected_active_plan_revision_id=expected_active_plan_revision_id,
@@ -3202,6 +3808,14 @@ async def _handle_sessions_send(
                     require_idle_for_current_plan_implementation
                 ),
             )
+            if not acceptance.replayed and not merge_into_task:
+                # This synchronous in-memory transition sits strictly after
+                # the durable commit and before reserve activation, so the
+                # turn can never execute while its exact marker is still
+                # expirable staging state. A prompt merged into an older
+                # collect task is not a distinct matching launch turn.
+                meta_launch_promotion = _promote_pending_meta_launch()
+            return acceptance
 
         async def _commit_and_activate() -> TurnAcceptanceResult:
             if runtime_mode == "collect" and atomic_intent_plan.action == "continue":
@@ -3216,7 +3830,11 @@ async def _handle_sessions_send(
                         "target_turn_id": handle.task_id,
                         "revision": max(
                             2,
-                            int(ingress_turn_context.get("revision", 1)) + 1,
+                            _coerce_positive_int(
+                                ingress_turn_context.get("revision"),
+                                default=1,
+                            )
+                            + 1,
                         ),
                     }
                     persisted_entry.turn_context = collected_context
@@ -3307,6 +3925,15 @@ async def _handle_sessions_send(
                             task_id=acceptance.receipt.task_id,
                         )
                 if not reservation.activated:
+                    if meta_launch_promotion == "promoted":
+                        from opensquilla.engine.steps.meta_command import (
+                            pending_meta_launch_cancel_accepted,
+                        )
+
+                        pending_meta_launch_cancel_accepted(
+                            key,
+                            client_request_id=ingress_identity.client_request_id,
+                        )
                     try:
                         await atomic_task_runtime.abort_reservation(reservation)
                     except Exception:  # noqa: BLE001 - preserve accepted response.
@@ -3332,6 +3959,7 @@ async def _handle_sessions_send(
             acceptance = await complete_durable_ingress(_commit_with_session_admission())
         except TaskQueueFullError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "QUEUE_FULL",
                 "The session task queue is full. Try again after queued work completes.",
@@ -3344,6 +3972,7 @@ async def _handle_sessions_send(
             ) from exc
         except StorageBusyError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "STORAGE_BUSY",
                 "Session storage is temporarily busy. Retry this send.",
@@ -3357,6 +3986,7 @@ async def _handle_sessions_send(
             ) from exc
         except StaleEpochError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "SESSION_CHANGED",
                 "The session changed while this turn was being accepted. Retry the send.",
@@ -3365,17 +3995,28 @@ async def _handle_sessions_send(
             ) from exc
         except TurnIngressConflictError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "IDEMPOTENCY_CONFLICT",
                 str(exc),
                 retryable=False,
                 accepted=False,
             ) from exc
+        except MetaControlIntentConflictError as exc:
+            _consumed_file_uuids = []
+            raise RpcHandlerError(
+                "META_CONTROL_CONFLICT",
+                str(exc),
+                retryable=False,
+                accepted=False,
+            ) from exc
         except ProjectWorkspaceStateError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise _project_workspace_error(exc) from exc
         except TaskCollectionUnavailableError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "COLLECT_RACE",
                 "The queued task started before this message could be collected. Retry it.",
@@ -3469,14 +4110,19 @@ async def _handle_sessions_send(
             ) from exc
         except sqlite3.IntegrityError as exc:
             if atomic_intent_plan.action != "create" or "sessions.session_key" not in str(exc):
+                _cleanup_rejected_guest_profile()
                 raise
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "SESSION_CONFLICT",
                 "Another request created this session first. Start a new chat and retry.",
                 retryable=False,
                 accepted=False,
             ) from exc
+        except BaseException:
+            _cleanup_rejected_guest_profile()
+            raise
 
         if not acceptance.replayed:
             notify_message_appended = getattr(ctx.session_manager, "notify_message_appended", None)
@@ -3605,7 +4251,7 @@ async def _handle_sessions_send(
 
         async def _commit_and_schedule_direct() -> TurnAcceptanceResult:
             nonlocal fresh_user_session, user_message_id
-            acceptance = await storage.accept_turn(
+            acceptance = await _accept_turn_with_fork_title(
                 persisted_entry,
                 expected_epoch=expected_epoch,
                 updated_at=int(time.time() * 1000),
@@ -3866,6 +4512,11 @@ async def _handle_sessions_send(
             async with _persist_lock:
                 await _persist_user_message()
 
+    # Compatibility managers without atomic acceptance still persist the user
+    # row before runtime enqueue. Promote now, while no task has been admitted,
+    # and restage if a clean queue rejection rolls the row back below.
+    legacy_meta_launch_promotion = _promote_pending_meta_launch()
+
     task_runtime = task_runtime_candidate
     if task_runtime is None:
         direct_registry = get_agent_task_registry()
@@ -3975,10 +4626,20 @@ async def _handle_sessions_send(
             # path. The locked semantic mandates that any rejection /
             # rollback / queue-full leaves the uuid alive until TTL so
             # the user can retry against the same uuid.
-            _consumed_file_uuids = []  # noqa: F841 — explicit no-evict marker
+            _consumed_file_uuids = []  # noqa: F841 – explicit no-evict marker
+            _cleanup_rejected_guest_profile()
             from opensquilla.gateway.task_runtime import TaskQueueFullError
 
             if not isinstance(exc, TaskQueueFullError):
+                if legacy_meta_launch_promotion == "promoted":
+                    from opensquilla.engine.steps.meta_command import (
+                        pending_meta_launch_restage,
+                    )
+
+                    pending_meta_launch_restage(
+                        key,
+                        client_request_id=ingress_identity.client_request_id,
+                    )
                 raise
 
             # Roll back the just-appended user turn so a retry doesn't leave
@@ -3989,6 +4650,15 @@ async def _handle_sessions_send(
             orphan_id, rollback_ok = await _rollback_persisted_user_message("queue_full")
 
             if rollback_ok:
+                if legacy_meta_launch_promotion == "promoted":
+                    from opensquilla.engine.steps.meta_command import (
+                        pending_meta_launch_restage,
+                    )
+
+                    pending_meta_launch_restage(
+                        key,
+                        client_request_id=ingress_identity.client_request_id,
+                    )
                 raise RpcHandlerError(
                     "QUEUE_FULL",
                     "The session task queue is full. Try again after queued work completes.",
@@ -4000,6 +4670,15 @@ async def _handle_sessions_send(
                     retryable=True,
                     accepted=False,
                 ) from exc
+            if legacy_meta_launch_promotion == "promoted":
+                from opensquilla.engine.steps.meta_command import (
+                    pending_meta_launch_cancel_accepted,
+                )
+
+                pending_meta_launch_cancel_accepted(
+                    key,
+                    client_request_id=ingress_identity.client_request_id,
+                )
             raise RpcHandlerError(
                 "QUEUE_FULL_DIRTY",
                 (
@@ -4018,6 +4697,15 @@ async def _handle_sessions_send(
                 accepted=True,
             ) from exc
         if handle.task_id != turn_id:
+            if legacy_meta_launch_promotion == "promoted":
+                from opensquilla.engine.steps.meta_command import (
+                    pending_meta_launch_restage,
+                )
+
+                pending_meta_launch_restage(
+                    key,
+                    client_request_id=ingress_identity.client_request_id,
+                )
             # ``collect`` coalesces this durable prompt into an already queued
             # runtime turn. TaskRuntime has rebound the stored row; project and
             # return that same canonical identity instead of the unused
@@ -4027,7 +4715,14 @@ async def _handle_sessions_send(
                 **ingress_turn_context,
                 "turn_id": turn_id,
                 "target_turn_id": turn_id,
-                "revision": max(2, int(ingress_turn_context.get("revision", 1)) + 1),
+                "revision": max(
+                    2,
+                    _coerce_positive_int(
+                        ingress_turn_context.get("revision"),
+                        default=1,
+                    )
+                    + 1,
+                ),
             }
         # Eviction hook: turn was accepted into the runtime,
         # post-resolution + post-engine-acceptance. Evict consumed uuids
@@ -5313,18 +6008,24 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     lock = get_session_lock(ctx.turn_runner, key) if deployment_patch else None
     if lock is not None:
         async with lock:
-            return await _apply_sessions_patch(
+            result = await _apply_sessions_patch(
                 params,
                 ctx,
                 key=key,
                 storage=storage,
             )
-    return await _apply_sessions_patch(
-        params,
-        ctx,
-        key=key,
-        storage=storage,
-    )
+    else:
+        result = await _apply_sessions_patch(
+            params,
+            ctx,
+            key=key,
+            storage=storage,
+        )
+    if deployment_patch:
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            keepalive_service.refresh_required(key, "session_deployment_changed")
+    return result
 
 
 @_d.method("sessions.reset", scope="operator.write")
@@ -5591,9 +6292,14 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
             return await _run_locked()
 
     if lock is None:
-        return await _run_accounted()
-    async with lock:
-        return await _run_accounted()
+        result = await _run_accounted()
+    else:
+        async with lock:
+            result = await _run_accounted()
+    keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+    if keepalive_service is not None:
+        await keepalive_service.invalidate(key)
+    return result
 
 
 async def _ensure_and_emit_reset_epoch(
@@ -5739,6 +6445,9 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            await keepalive_service.invalidate(canonical_key)
 
         evict_runtime_state = getattr(
             ctx.session_manager,
@@ -7749,42 +8458,55 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     agent_id = _effective_agent_id_for_session(session, session_key)
     agent_identity = await _bootstrap_agent_identity(ctx, agent_id)
     effective_model = _session_turn_model(ctx, session, agent_id)
-    from opensquilla.agents.scope import resolve_agent_workspace_dir
+    guest_safe = _is_remote_web_guest(ctx.principal, {})
+    workspace: str | None = None
+    project_snapshot: dict[str, Any] | None = None
+    if not guest_safe:
+        from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-    workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    default_workspace = str(workspace_path) if workspace_path is not None else None
-    project_snapshot = await project_workspace_snapshot(storage, session)
-    try:
-        bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=default_workspace,
-        )
-        workspace: str | None = bootstrap_run_context.workspace or default_workspace
-    except ProjectWorkspaceStateError:
-        snapshot_path = project_snapshot.get("path") if project_snapshot is not None else None
-        workspace = str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+        workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
+        default_workspace = str(workspace_path) if workspace_path is not None else None
+        project_snapshot = await project_workspace_snapshot(storage, session)
+        try:
+            bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=default_workspace,
+            )
+            workspace = bootstrap_run_context.workspace or default_workspace
+        except ProjectWorkspaceStateError:
+            snapshot_path = (
+                project_snapshot.get("path") if project_snapshot is not None else None
+            )
+            workspace = (
+                str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+            )
     from opensquilla.gateway.model_routing import model_routing_snapshot
 
-    metadata = {
+    metadata: dict[str, Any] = {
         "session_key": session_key,
         "session_id": session.session_id,
         "status": session.status,
         "agent_id": session.agent_id,
         "model": getattr(session, "model", None),
         "effective_model": effective_model,
-        "workspace": workspace,
-        "workspace_id": getattr(session, "workspace_id", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspace": project_snapshot,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),
         "queue_mode": getattr(session, "queue_mode", None),
         **_derive_source_metadata(session),
     }
+    if not guest_safe:
+        metadata.update(
+            {
+                "workspace": workspace,
+                "workspace_id": getattr(session, "workspace_id", None),
+                "workspaceId": getattr(session, "workspace_id", None),
+                "projectWorkspace": project_snapshot,
+            }
+        )
     get_current_plan = getattr(storage, "get_current_plan_revision", None)
     get_active_run = getattr(storage, "get_active_plan_run", None)
     current_plan = (

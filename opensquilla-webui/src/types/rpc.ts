@@ -193,6 +193,9 @@ export interface SessionsSearchResponse {
 export interface ArtifactPayload {
   id?: string
   key?: string
+  kind?: string
+  sha256?: string
+  session_id?: string
   session_key?: string
   sessionKey?: string
   epoch?: number
@@ -200,9 +203,31 @@ export interface ArtifactPayload {
   name?: string
   mime?: string
   size?: number | string
+  source?: string
+  created_at?: string
+  createdAt?: string
+  store?: string
   download_url?: string
   thumbnail_url?: string
   [key: string]: unknown
+}
+
+export interface ArtifactsListResponse {
+  artifacts?: ArtifactPayload[]
+  has_more?: boolean
+  hasMore?: boolean
+  oldest_cursor?: string | null
+  oldestCursor?: string | null
+  newest_cursor?: string | null
+  newestCursor?: string | null
+  total_count?: number
+  totalCount?: number
+  page_size?: number
+  pageSize?: number
+}
+
+export interface ArtifactsGetResponse {
+  artifact?: ArtifactPayload | null
 }
 
 export interface StreamEventEnvelope {
@@ -365,12 +390,12 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   activeTaskGroupIds?: string[]
   run_mode_lock?: {
     locked?: boolean
-    runMode?: 'standard' | 'trusted' | 'full'
+    runMode?: 'safe' | 'full'
     source?: string
   }
   runModeLock?: {
     locked?: boolean
-    runMode?: 'standard' | 'trusted' | 'full'
+    runMode?: 'safe' | 'full'
     source?: string
   }
   workspaceId?: string
@@ -399,7 +424,7 @@ export interface ChatSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
-  _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
   workspaceId?: string
   collaborationMode?: import('./plans').CollaborationMode
@@ -427,6 +452,29 @@ export interface ChatSendResponse {
   reason?: string
 }
 
+/** Server-owned recovery record for one unaccepted manual MetaSkill launch. */
+export interface MetaLaunchDraftPayload {
+  sessionKey: string
+  clientRequestId: string
+  name: string
+  launchText: string
+  createdAt: number
+  expiresAt: number
+  sessionExists: boolean
+}
+
+export interface MetaDraftsListResponse {
+  ok: boolean
+  durable: boolean
+  drafts: MetaLaunchDraftPayload[]
+}
+
+export interface MetaDraftDiscardResponse {
+  ok: boolean
+  discarded: boolean
+  accepted?: boolean
+}
+
 export interface SessionSteerV2Params {
   key: string
   message: string
@@ -434,7 +482,7 @@ export interface SessionSteerV2Params {
   client_request_id: string
   client_message_id: string
   surface_id?: string
-  _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
 }
 
 export interface SessionSteerV2Response {

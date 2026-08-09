@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import logging
 import os
 import threading
@@ -83,6 +84,38 @@ class AuthConfig(BaseSettings):
     trusted_proxy: str | None = None
     token_scopes: list[str] = Field(default_factory=lambda: ["operator.admin"])
     allowed_roles: list[str] = Field(default_factory=lambda: ["operator", "node"])
+    # Empty means the built-in loopback/RFC1918/ULA set.  Custom values may
+    # narrow that set but can never widen it to public address space.
+    allowed_client_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_client_cidrs")
+    @classmethod
+    def _validate_allowed_client_cidrs(cls, values: list[str]) -> list[str]:
+        private_v4 = tuple(
+            ipaddress.IPv4Network(value)
+            for value in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+        )
+        private_v6 = tuple(
+            ipaddress.IPv6Network(value)
+            for value in ("::1/128", "fc00::/7")
+        )
+        normalized: list[str] = []
+        for raw in values:
+            network = ipaddress.ip_network(str(raw).strip(), strict=False)
+            allowed = (
+                any(network.subnet_of(parent) for parent in private_v4)
+                if isinstance(network, ipaddress.IPv4Network)
+                else any(network.subnet_of(parent) for parent in private_v6)
+            )
+            if not allowed:
+                raise ValueError(
+                    "auth.allowed_client_cidrs may only narrow loopback, "
+                    "RFC1918, or IPv6 ULA networks"
+                )
+            text = network.with_prefixlen
+            if text not in normalized:
+                normalized.append(text)
+        return normalized
 
 
 class CorsConfig(BaseSettings):
@@ -277,7 +310,7 @@ class PermissionsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    default_mode: Literal["off", "on", "bypass", "full"] = "bypass"
+    default_mode: Literal["off", "on", "bypass", "full"] = "off"
 
 
 class TaskRuntimeConfig(BaseModel):
@@ -519,6 +552,14 @@ class LlmEnsembleConfig(BaseSettings):
     # boundary.
     proposer_tools: bool = False
     min_successful_proposers: int = Field(default=1, ge=1)
+    # Optional quality target above the minimum floor. When set, proposer
+    # collection keeps waiting for this many successful drafts; if the target
+    # becomes unreachable, the turn may still aggregate once the minimum
+    # floor is satisfied.
+    target_successful_proposers: int | None = Field(default=None, ge=1)
+    # Number of in-place retries after the initial proposer request. Zero
+    # preserves the historical single-attempt behavior.
+    proposer_max_retries: int = Field(default=0, ge=0, le=10)
     all_failed_policy: Literal["fallback_single", "error"] = "fallback_single"
     model_options: list[str] = Field(default_factory=_default_llm_ensemble_model_options)
     candidates: list[LlmEnsembleCandidateConfig] = Field(default_factory=list)
@@ -539,6 +580,28 @@ class LlmEnsembleConfig(BaseSettings):
             seen_options.add(normalized)
             model_options.append(normalized)
         self.model_options = model_options
+        return self
+
+    @model_validator(mode="after")
+    def _validate_success_targets(self) -> LlmEnsembleConfig:
+        if (
+            self.target_successful_proposers is not None
+            and self.target_successful_proposers < self.min_successful_proposers
+        ):
+            raise ValueError(
+                "llm_ensemble.target_successful_proposers cannot be lower than "
+                "llm_ensemble.min_successful_proposers"
+            )
+        if (
+            self.selection_mode
+            in {"static_openrouter_b5", "static_tokenrhythm_b5"}
+            and self.target_successful_proposers is not None
+            and self.target_successful_proposers > 4
+        ):
+            raise ValueError(
+                "llm_ensemble.target_successful_proposers cannot exceed the "
+                "static B5 proposer count (4)"
+            )
         return self
 
     @model_validator(mode="after")
@@ -589,6 +652,14 @@ class LlmEnsembleConfig(BaseSettings):
         if self.min_successful_proposers > len(proposers):
             raise ValueError(
                 "llm_ensemble.min_successful_proposers cannot exceed the "
+                f"custom_b5 proposer count ({len(proposers)})"
+            )
+        if (
+            self.target_successful_proposers is not None
+            and self.target_successful_proposers > len(proposers)
+        ):
+            raise ValueError(
+                "llm_ensemble.target_successful_proposers cannot exceed the "
                 f"custom_b5 proposer count ({len(proposers)})"
             )
         return self
@@ -2257,7 +2328,7 @@ class GatewayConfig(BaseSettings):
     def effective_run_mode(self) -> str:
         """Return the canonical sandbox run mode for this validated config."""
 
-        from opensquilla.sandbox.run_mode import config_run_mode
+        from opensquilla.run_mode import config_run_mode
 
         return config_run_mode(self).value
 
